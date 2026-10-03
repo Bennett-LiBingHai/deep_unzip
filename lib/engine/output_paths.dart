@@ -1,0 +1,160 @@
+/// 输出路径的推导（需求 1 的「输出目录树与源目录对称」）。
+///
+/// 拆成两层是刻意的：
+///
+/// - [deriveOutputName] 是**纯函数**：只做字符串变换，不看文件系统。
+/// - [resolveOutputDir] 才碰文件系统（用注入的 [dirExists] 而不是直接
+///   `Directory.existsSync`，测试里就能喂一张假表）。
+///
+/// 规则：`A/B/c.zip` → `A/B/c/` —— 同级兄弟，剥掉**整个**压缩后缀。
+/// 天真的 `substring(0, lastIndexOf('.'))` 在这三种情况上都会错：
+///
+/// | 输入 | 天真做法 | 这里 |
+/// |---|---|---|
+/// | `c.tar.gz` | `c.tar` | `c` |
+/// | `x.zip.001` | `x.zip` | `x` |
+/// | `backup.part01.rar` | `backup.part01` | `backup` |
+library;
+
+import 'dart:io';
+
+import 'package:path/path.dart' as p;
+
+/// 会被剥掉的压缩后缀（都是**单段**）。
+///
+/// 必须逐个比对完整的段，不能是任意后缀 —— 否则 `报告.2026.zip` 会把
+/// `.2026` 也一起吃掉。
+const Set<String> _archiveExtensions = {
+  'zip', 'zipx', '7z', 'rar', 'tar',
+  'gz', 'tgz', 'bz2', 'tbz', 'tbz2',
+  'xz', 'txz', 'zst', 'tzst',
+  'cab', 'lzh', 'lha', 'arj', 'cpio',
+  'cbz', 'cbr', 'cb7',
+};
+
+/// `x.zip.001` 末尾那种**卷号**：`001` / `z01` / `r00`。
+///
+/// 只认这两种形态，**不**认任意数字 —— 见 [deriveOutputName] 里为什么
+/// 「任意数字」是错的。
+bool _isVolumeSegment(String seg) {
+  if (seg.isEmpty) return false;
+  if (_allDigits(seg)) return true;
+
+  // `z01`（Info-ZIP 跨卷）与 `r00`（RAR3 旧式卷）都是 1 个字母 + 数字。
+  if (seg.length >= 2) {
+    final head = seg[0];
+    if ((head == 'z' || head == 'r') && _allDigits(seg.substring(1))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/// `backup.part01.rar` 里的 `part01`。
+///
+/// 和卷号分开处理：卷号一定在**最末尾**，`partNN` 则夹在中间
+/// （后面永远跟着真正的格式后缀），所以剥离时机不同。
+bool _isPartSegment(String seg) =>
+    seg.length > 4 && seg.startsWith('part') && _allDigits(seg.substring(4));
+
+bool _allDigits(String s) {
+  for (var i = 0; i < s.length; i++) {
+    final c = s.codeUnitAt(i);
+    if (c < 0x30 || c > 0x39) return false;
+  }
+  return true;
+}
+
+/// 路径一律先归一成 `/`，再用 **posix** 上下文做 dirname/join/basename。
+///
+/// 为什么不用 `p.dirname` 而用 `p.posix.dirname`：`package:path` 的默认
+/// 上下文是**当前平台**的。本 app 只在 Android 上跑，但单测跑在 Windows
+/// 宿主机上 —— 宿主的 `p.join('/sdcard', 'c')` 会给出 `/sdcard\c`。
+/// 「函数行为随宿主机而变」是不能接受的：同一条路径在不同机器上算出不同
+/// 结果，而它还要被写进 journal、当作下次续传的依据。
+///
+/// 归一化之后 posix 规则对两种输入都成立：Android 的 `/a/b.zip` 原样，
+/// Windows 的 `C:\a\b.zip` → `C:/a/b.zip` → dirname 得 `C:/a`（`Directory`
+/// 在 Windows 上照样认 `C:/a/b`）。于是 `tool/engine_cli.dart` 那类桌面
+/// harness 也能用同一份代码。
+String _toPosix(String path) => path.replaceAll('\\', '/');
+
+/// 末尾那一段（小写）；没有可剥的段时返回 null。
+///
+/// `dot <= 0` 覆盖两种情况：没有点，以及**点在开头** —— `.gitignore`、
+/// `.zip` 这类隐藏文件没有「扩展名」，整个名字就是它的名字。
+/// 这个判据必须和 [_stripLastSegment] 完全一致，否则会出现
+/// 「说能剥、真去剥却拿到 null」的 `null!` 崩溃。
+String? _lastSegment(String stem) {
+  final dot = stem.lastIndexOf('.');
+  if (dot <= 0 || dot == stem.length - 1) return null;
+  return stem.substring(dot + 1).toLowerCase();
+}
+
+/// 剥掉末尾一段；调用方须先确认 [_lastSegment] 非 null。
+String _stripLastSegment(String stem) =>
+    stem.substring(0, stem.lastIndexOf('.'));
+
+/// 从一个压缩包路径推出输出目录的**名字**（不含父目录）。
+///
+/// 三个阶段，**顺序不能换**（每一步的判据依赖前一步的结果）：
+///
+/// 1. 剥末尾的卷号 —— 只有它一定在最末，所以必须先剥。`x.zip.001` → `x.zip`
+/// 2. 剥压缩后缀，可连剥（`tar.gz` 是两层）。`x.zip` → `x`
+/// 3. 剥 `partNN` —— 到这里它才暴露成末段。`backup.part01` → `backup`
+///
+/// 若把 1 和 2 反过来，`backup.2026.zip` 会在剥掉 `.zip` 之后把 `.2026`
+/// 当卷号剥掉，得到 `backup` —— 而那是文件的真实名字的一部分。
+///
+/// 全剥空时回退到 `extracted`，**绝不返回空串**：空串会让
+/// `p.join(parent, '')` 得到父目录自身，那就把内容直接解进源目录了。
+String deriveOutputName(String archivePath) {
+  var stem = p.posix.basename(_toPosix(archivePath));
+  if (stem.isEmpty) return 'extracted';
+
+  // 阶段 1：末尾卷号，最多两层（`x.tar.gz.001` 只会在末位有一个）。
+  for (var i = 0; i < 2; i++) {
+    final seg = _lastSegment(stem);
+    if (seg == null || !_isVolumeSegment(seg)) break;
+    stem = _stripLastSegment(stem);
+  }
+
+  // 阶段 2：压缩后缀，最多 3 层（`a.tar.bz2` / `a.tar.gz` 是两层，
+  // 留一层余量；上限是为了防 `foo.zip.zip.zip…` 把名字剥空）。
+  for (var i = 0; i < 3; i++) {
+    final seg = _lastSegment(stem);
+    if (seg == null || !_archiveExtensions.contains(seg)) break;
+    stem = _stripLastSegment(stem);
+  }
+
+  // 阶段 3：`partNN`。
+  final seg = _lastSegment(stem);
+  if (seg != null && _isPartSegment(seg)) {
+    stem = _stripLastSegment(stem);
+  }
+
+  return stem.isEmpty ? 'extracted' : stem;
+}
+
+/// 算出最终输出目录：`<源目录>/<名字>`，重名时追加 `_1`、`_2`…
+///
+/// [dirExists] 可注入，默认查真实文件系统。注入它有两个理由：单测不必碰
+/// 磁盘；以及**一次任务内**同一基名可能出现多次而目录还没建出来 ——
+/// 那时调用方传的是「本次已占用的路径」，而不是磁盘状态。
+String resolveOutputDir(
+  String archivePath, {
+  bool Function(String path)? dirExists,
+}) {
+  final normalized = _toPosix(archivePath);
+  final parent = p.posix.dirname(normalized);
+  final base = deriveOutputName(normalized);
+  final exists = dirExists ?? (String d) => Directory(d).existsSync();
+
+  var candidate = p.posix.join(parent, base);
+  var n = 1;
+  while (exists(candidate)) {
+    candidate = p.posix.join(parent, '${base}_$n');
+    n++;
+  }
+  return candidate;
+}

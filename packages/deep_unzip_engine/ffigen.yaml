@@ -1,0 +1,38 @@
+# Run with `dart run ffigen --config ffigen.yaml`.
+#
+# 入口是 src/duz_engine.h —— 那是**唯一**的 ABI 契约，也是 ffigen 唯一的输入。
+# 刻意不让它去看 third_party/7zip 下的任何头：那边有上千个 C++ 头，ffigen 既
+# 解析不了（模板、重载、COM 宏），我们也一点都不想生成绑定。C ABI 的薄正是
+# 为了让这一步成立。
+name: DeepUnzipEngineBindings
+description: |
+  Bindings for `src/duz_engine.h`.
+
+  Regenerate bindings with `dart run ffigen --config ffigen.yaml`.
+output: 'lib/deep_unzip_engine_bindings_generated.dart'
+# ffigen 靠 libclang 解析 C，而它默认走 `clang -print-file-name=libclang.dll`
+# 去猜路径 —— 本机 PATH 上没有 clang，NDK 也只带 clang.exe、不带 C API 那份
+# dll，所以必须显式指路。
+#
+# 这份 libclang.dll 来自 PyPI 的 `libclang` wheel（18.1.1，解出来 84MB）。
+# 取它而不是装整套 LLVM：装 LLVM 要 ~1GB，我们只要这一个 dll 跑 ffigen。
+# 重装命令（wheel 就是 zip，不需要 Python）：
+#   curl -o lc.whl https://pypi.tuna.tsinghua.edu.cn/packages/0b/2d/3f480b1e1d31eb3d6de5e3ef641954e5c67430d5ac93b7fa7e07589576c7/libclang-18.1.1-py2.py3-none-win_amd64.whl
+#   unzip -j lc.whl "libclang-18.1.1.data/platlib/clang/native/libclang.dll" -d /d/MySoftware/libclang/
+#
+# 这是**本机路径**，换机器要改（或把该目录加进 PATH 后删掉这一项）。
+# ffigen 只在改了 src/duz_engine.h 之后才需要跑，日常构建完全不经过它。
+llvm-path:
+  - 'D:\MySoftware\libclang\libclang.dll'
+headers:
+  entry-points:
+    - 'src/duz_engine.h'
+  include-directives:
+    - 'src/duz_engine.h'
+# 头文件里的中文注释是这套 ABI 最准确的说明，原样搬进生成的绑定里 ——
+# 读绑定的人不该为了看懂参数含义再跳回 .h。
+comments:
+  style: any
+  length: full
+# 让生成结果在两次运行之间保持稳定，便于 code review 时看清真实改动。
+sort: true
