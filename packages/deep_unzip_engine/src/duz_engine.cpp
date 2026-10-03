@@ -147,6 +147,7 @@ int32_t duz_version(char* buf, int32_t bufLen) {
 #include "Common/MyString.h"
 #include "Common/StringConvert.h"
 
+#include "Windows/FileDir.h"
 #include "Windows/FileFind.h"
 #include "Windows/PropVariant.h"
 #include "Windows/PropVariantConv.h"
@@ -181,6 +182,13 @@ std::string UToUtf8(const UString& u) {
   return std::string(a.Ptr(), a.Len());
 }
 FString Utf8ToFs(const char* s) { return us2fs(Utf8ToU(s)); }
+
+// FString -> UTF-8。与 UToUtf8 的区别只在于入口已经是文件系统形态：
+// Android 上 FString 就是 UTF-8 字节串（见上面那段注释），所以不需要再转码，
+// 直接按 Len() 取字节。单独写一个是为了不在调用处散落 `std::string(p, n)`。
+std::string FToUtf8(const FString& f) {
+  return f.Ptr() ? std::string(f.Ptr(), f.Len()) : std::string();
+}
 
 // ---- 进程级 CCodecs 单例 ----
 // CCodecs::Load() 只是把静态注册表（各 handler 的 REGISTER_ARC_* 产生的
@@ -263,6 +271,15 @@ class DuzExtractCallback final : public IFolderArchiveExtractCallback,
   bool Cancelled;
   std::string FirstError;  // UTF-8
 
+  // 7-Zip 那个真正的落盘回调。条目失败时要靠它问出「刚写的那个文件在哪」——
+  // 见 ArchiveExtractCallback.h 里 Get_DiskFilePath 的说明。由 duz_extract_all
+  // 在两边都构造完之后接上，所以这里给 nullptr 兜底。
+  CArchiveExtractCallback* Ecs = nullptr;
+
+  // 失败清理的战果，用于如实汇报（见 duz_extract_all 结尾）。
+  UInt32 RemovedCount = 0;        // 删掉的损坏文件数
+  UInt32 RemoveFailedCount = 0;   // 想删但没删掉的（不是文件不存在）
+
   // 只给日志用：7-Zip 报进度的频率可以很高，全量打会把 logcat 淹掉、也拖慢
   // 解压。但**开头几条必须全留** —— 卡死的位置几乎总在最前面。
   unsigned long long ReportCalls;
@@ -276,6 +293,18 @@ class DuzExtractCallback final : public IFolderArchiveExtractCallback,
         SawWrongPassword(false),
         Cancelled(false),
         ReportCalls(0) {}
+
+  /// 条目失败之后，把已经写下去的那份**残档**删掉。
+  ///
+  /// 为什么非删不可：7-Zip 是「先写文件、再比 CRC」，所以校验失败的那一刻，
+  /// 一个**内容错误、长度正确**的文件已经躺在输出目录里了。真机验收时
+  /// `broken.zip` 就是这么留了个坏 `ok.txt` 下来的 —— 文件名、大小、时间戳
+  /// 全都正常，用户没有任何办法看出它是坏的。**静默给出错误数据比解压失败
+  /// 严重得多**，所以宁可目录里什么都没有。
+  ///
+  /// 只删**这一个文件**，不碰同批解出来的好文件：一个 4GB 的包里有 1 个坏
+  /// 条目，把其余全删掉是另一种伤害。
+  void RemoveFailedOutput();
 
   HRESULT Report(UInt64 done) {
     if (!Progress) return S_OK;
@@ -406,7 +435,34 @@ Z7_COM7F_IMF(DuzExtractCallback::SetOperationResult(Int32 opRes, Int32 encrypted
         break;
     }
   }
+
+  // 到这里这个条目的输出已经在盘上了（7-Zip 在调用我们之前跑过
+  // CloseReparseAndFile），而它已经被判为坏的 —— 清掉。
+  RemoveFailedOutput();
   return S_OK;
+}
+
+void DuzExtractCallback::RemoveFailedOutput() {
+  if (!Ecs) return;
+
+  // 必须是 7-Zip 记的那份磁盘路径，不能用条目名自己拼 —— 两者在名字需要
+  // 清洗时不一致（见 Get_DiskFilePath 的说明）。
+  const FString& path = Ecs->Get_DiskFilePath();
+  if (path.IsEmpty()) return;  // 还没定下落盘位置（目录条目、流模式等）
+
+  // 先看有没有：方法不受支持、或加密条目根本没解出内容时，7-Zip 压根没建
+  // 文件，这时**不是**清理失败，不该计进 RemoveFailedCount 去吓用户。
+  if (!NFind::DoesFileExist_Raw(path)) return;
+
+  if (NDir::DeleteFileAlways(path)) {
+    ++RemovedCount;
+    DUZ_LOG("已删除损坏输出 %s", FToUtf8(path).c_str());
+  } else {
+    // 立刻取错误码：后面任何一次系统调用都会把它冲掉。
+    const unsigned long err = (unsigned long)GetLastError();
+    ++RemoveFailedCount;
+    DUZ_LOG("删不掉损坏输出 %s 错误码=%lu", FToUtf8(path).c_str(), err);
+  }
 }
 
 // ---- IFolderArchiveExtractCallback2 ----
@@ -711,6 +767,9 @@ int32_t duz_extract_all(duz_ctx* ctx, const char* outDir, duz_progress_cb cb,
   CArchiveExtractCallback* ecs = new CArchiveExtractCallback;
   CMyComPtr<IArchiveExtractCallback> ecRef = ecs;
 
+  // 接上落盘回调：条目失败时要靠它问出真实磁盘路径（见 RemoveFailedOutput）。
+  spec->Ecs = ecs;
+
   // kCurPaths：条目名按「相对输出目录」处理，配合 Correct_FsPath 的清洗，
   // zip-slip（../、绝对路径、盘符）在这一层就被拦掉。
   ecs->InitForMulti(false, NExtract::NPathMode::kCurPaths,
@@ -760,23 +819,35 @@ int32_t duz_extract_all(duz_ctx* ctx, const char* outDir, duz_progress_cb cb,
   if (res == S_OK) res = res2;
 
   int32_t code = DUZ_OK;
+  std::string msg;
   if (spec->Cancelled) {
     code = DUZ_ERR_EXTRACT;
-    SetOpenError(code, "已取消");
+    msg = "已取消";
   } else if (res == E_ABORT) {
     code = DUZ_ERR_EXTRACT;
-    SetOpenError(code, "已取消");
+    msg = "已取消";
   } else if (spec->SawWrongPassword) {
     code = DUZ_ERR_PASSWORD;
-    SetOpenError(code, "密码错误");
+    msg = "密码错误";
   } else if (spec->FailedCount > 0) {
     code = DUZ_ERR_EXTRACT;
-    SetOpenError(code, spec->FirstError.empty() ? "解压过程中有条目失败"
-                                                : spec->FirstError.c_str());
+    msg = spec->FirstError.empty() ? "解压过程中有条目失败" : spec->FirstError;
   } else if (res != S_OK) {
     code = DUZ_ERR_EXTRACT;
-    SetOpenError(code, "解压失败");
+    msg = "解压失败";
   }
+
+  // 接上失败清理的战果。**必须如实说**：文案在讲「失败了」，可目录里到底还剩
+  // 什么、坏的那份清掉没有，只有这几句能告诉用户 —— 他没有任何别的渠道看出来。
+  if (spec->RemovedCount > 0) {
+    msg += "，已删除 " + std::to_string(spec->RemovedCount) + " 个损坏文件";
+  }
+  if (spec->RemoveFailedCount > 0) {
+    msg += "，另有 " + std::to_string(spec->RemoveFailedCount) +
+           " 个损坏文件未能删除，请手动清理输出目录";
+  }
+
+  if (code != DUZ_OK) SetOpenError(code, msg.c_str());
   DUZ_LOG("== duz_extract_all 退出 code=%d Report回调=%llu 失败条目=%u",
           (int)code, (unsigned long long)spec->ReportCalls,
           (unsigned)spec->FailedCount);

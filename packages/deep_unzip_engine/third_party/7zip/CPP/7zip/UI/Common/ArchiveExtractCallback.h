@@ -478,6 +478,20 @@ public:
   HRESULT SendMessageError2(HRESULT errorCode, const char *message, const FString &path1, const FString &path2) const;
   HRESULT SendMessageError2_with_LastError(const char *message, const FString &path1, const FString &path2) const;
 
+  // ===== DeepUnzip 追加，非上游代码。7-Zip 升级时要保留（见 PATCHES.md）=====
+  //
+  // 刚处理完的那个条目**真正落到磁盘上的路径**（`_diskFilePath`）。
+  //
+  // 为什么必须开这个口子：条目在归档里叫 `name`，在磁盘上却叫
+  // `Correct_FsPath(join(前缀, name))`，两者在「名字里带 `..`、绝对路径、
+  // 盘符、控制字符」时并不相同 —— 而这套清洗逻辑是安全关键代码，7-Zip 之外
+  // 再抄一份只会抄歪。失败清理要删的必须是**磁盘上的那一个**，所以只能问它。
+  //
+  // 时机：`PrepareOperation` 开头会被 Empty()，随后由 GetFilePath 赋值，
+  // 因此在本类的 `SetOperationResult` 里读到的就是**刚刚那个**条目的路径，
+  // 且此时 `CloseReparseAndFile()` 已经跑过 —— 文件已关闭、确实在盘上。
+  const FString& Get_DiskFilePath() const { return _diskFilePath; }
+
 #if defined(_WIN32) && !defined(UNDER_CE) && !defined(Z7_SFX)
   NExtract::NZoneIdMode::EEnum ZoneMode;
   CByteBuffer ZoneBuf;
