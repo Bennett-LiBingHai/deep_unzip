@@ -870,6 +870,97 @@ void main() {
     });
   });
 
+  /// 「这批用掉了」这道闸门。
+  ///
+  /// 它和 [AppState.completed] 是两件事：`completed` 说的是「全部成功」，
+  /// 有任何一个包失败它就是 false。而重跑的危害与成败无关 —— 输出目录重名会
+  /// 追加 `_1`/`_2`（见 output_paths.dart），再点一次不是「重新解一遍」而是
+  /// 往磁盘里撒重复目录。所以闸门必须挂在「跑过」而不是「成功」上。
+  group('批次用尽（batchRun）', () {
+    t('跑完一批 → batchRun 为真、completed 为真', () async {
+      final root = tempRoot('as_batchrun_ok');
+      put(root, 'a.zip', realZip({'x': 'y'}));
+
+      final engine = FakeEngine();
+      final state = AppState(engine: engine);
+      addTearDown(state.dispose);
+
+      await state.selectFolderPath(root.path);
+      expect(state.batchRun, isFalse, reason: '刚扫完还没跑，按钮该是「开始智能解压」');
+
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(state.completed, isTrue);
+      expect(state.batchRun, isTrue);
+    });
+
+    t('整批都失败也是「用掉了」—— 闸门不能挂在 completed 上', () async {
+      final root = tempRoot('as_batchrun_fail');
+      put(root, 'a.zip', realZip({'x': 'y'}));
+
+      final engine = FakeEngine()
+        ..behavior = (e, outDir) async {
+          throw const EngineException('坏了', code: DuzErrorCode.extract);
+        };
+      final state = AppState(engine: engine);
+      addTearDown(state.dispose);
+
+      await state.selectFolderPath(root.path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(state.completed, isFalse, reason: '有失败时 completed 就是 false');
+      expect(state.batchRun, isTrue,
+          reason: '失败了也重跑不得：_1/_2 照样会撒出来');
+    });
+
+    t('跑过之后 startExtract 直接拒绝，不再惊动引擎', () async {
+      final root = tempRoot('as_batchrun_guard');
+      put(root, 'a.zip', realZip({'x': 'y'}));
+
+      final engine = FakeEngine();
+      final state = AppState(engine: engine);
+      addTearDown(state.dispose);
+
+      await state.selectFolderPath(root.path);
+      state.startExtract();
+      await drainExtract(state);
+      expect(engine.rounds, 1);
+
+      state.startExtract();
+      await settle();
+
+      expect(engine.rounds, 1, reason: '同一个队列不该被重排一遍');
+      expect(state.toastType, 'warn');
+      expect(state.toastMsg, contains('换个文件夹'));
+    });
+
+    t('重新选目录 → 闸门放开（新快照，可以再跑）', () async {
+      final root = tempRoot('as_batchrun_reset');
+      put(root, 'a.zip', realZip({'x': 'y'}));
+
+      final engine = FakeEngine();
+      final state = AppState(engine: engine);
+      addTearDown(state.dispose);
+
+      await state.selectFolderPath(root.path);
+      state.startExtract();
+      await drainExtract(state);
+      expect(state.batchRun, isTrue);
+
+      // selectFolderPath 会走 _resetExtractState + 重新扫描。
+      await state.selectFolderPath(root.path);
+
+      expect(state.batchRun, isFalse);
+      expect(state.completed, isFalse);
+
+      state.startExtract();
+      await drainExtract(state);
+      expect(engine.rounds, 2, reason: '新快照要能真的再跑一次');
+    });
+  });
+
   group('释放', () {
     t('dispose 之后重复 dispose 不炸', () {
       final state = AppState(engine: EngineController());

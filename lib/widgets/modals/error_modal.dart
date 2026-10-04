@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import '../../theme/app_theme.dart';
 import 'bottom_modal.dart';
+import 'modal_button.dart';
 
 /// 解压错误弹窗 —— 暂停 / 跳过
 class ErrorModal extends StatelessWidget {
@@ -89,7 +90,7 @@ class ErrorModal extends StatelessWidget {
           Row(
             children: [
               Expanded(
-                child: _ModalBtn(
+                child: ModalButton(
                   label: '暂停任务',
                   color: AppTheme.neonOrange,
                   onTap: () {
@@ -100,7 +101,7 @@ class ErrorModal extends StatelessWidget {
               ),
               const SizedBox(width: 10),
               Expanded(
-                child: _ModalBtn(
+                child: ModalButton(
                   label: '跳过继续',
                   gradient: AppTheme.primaryGradient,
                   onTap: () {
@@ -112,42 +113,6 @@ class ErrorModal extends StatelessWidget {
             ],
           ),
         ],
-      ),
-    );
-  }
-}
-
-class _ModalBtn extends StatelessWidget {
-  final String label;
-  final Color? color;
-  final Gradient? gradient;
-  final VoidCallback onTap;
-  const _ModalBtn(
-      {required this.label, this.color, this.gradient, required this.onTap});
-
-  @override
-  Widget build(BuildContext context) {
-    return GestureDetector(
-      onTap: onTap,
-      child: Container(
-        padding: const EdgeInsets.symmetric(vertical: 14),
-        decoration: BoxDecoration(
-          color: gradient == null ? color!.withOpacity(0.12) : null,
-          gradient: gradient,
-          borderRadius: BorderRadius.circular(12),
-          border: gradient == null
-              ? Border.all(color: color!.withOpacity(0.3))
-              : null,
-        ),
-        alignment: Alignment.center,
-        child: Text(
-          label,
-          style: TextStyle(
-            fontSize: 14,
-            fontWeight: FontWeight.w700,
-            color: gradient != null ? AppTheme.bgDeep : color,
-          ),
-        ),
       ),
     );
   }

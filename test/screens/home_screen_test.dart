@@ -3,14 +3,23 @@ import 'dart:io';
 import 'package:deep_unzip/engine/controller.dart';
 import 'package:deep_unzip/providers/app_state.dart';
 import 'package:deep_unzip/screens/home_screen.dart';
+import 'package:deep_unzip/services/file_manager_bridge.dart';
 import 'package:deep_unzip/theme/app_theme.dart';
 import 'package:deep_unzip/widgets/custom_button.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
 
 import '../engine/zip_fixtures.dart';
 import '../support/fake_engine.dart';
+
+/// 给 [FileManagerBridge] 注入用的私有通道名。
+///
+/// 用独立的名字而不是生产那个 `com.example.deep_unzip/native`：生产名一旦被
+/// 哪个测试钉上 mock 处理器却又忘了摘，会影响同文件里别的用例，而且看名字
+/// 分不清这是真通道还是假的。
+const MethodChannel _bridgeChannel = MethodChannel('deep_unzip_test/bridge');
 
 /// 这组测试盯两件事：删掉的假弹窗真的没再出现，以及主按钮如实跟着引擎状态走
 /// —— 静态分析查不出「点了之后不该弹的弹窗真的没弹」。
@@ -33,9 +42,9 @@ void main() {
   // 「点了之后没有假弹窗」在压根没点到的前提下通过。改成致命。
   setUpAll(() => WidgetController.hitTestWarningShouldBeFatal = true);
 
-  Widget app(AppState state) => MaterialApp(
+  Widget app(AppState state, {FileManagerBridge? bridge}) => MaterialApp(
         theme: AppTheme.dark,
-        home: Scaffold(body: HomeScreen(state: state)),
+        home: Scaffold(body: HomeScreen(state: state, bridge: bridge)),
       );
 
   /// 挂载首页。
@@ -47,10 +56,11 @@ void main() {
   /// 宽度保持默认的 800 不动：窄到手机宽度时头部那行等宽副标题会溢出，
   /// 但 `flutter test` 用的是固定宽度测试字体，比真机字体宽，溢出的 80px
   /// 大概率是这个假象而非真机问题 —— 拿不准的事不改 UI。
-  Future<void> pumpHome(WidgetTester tester, AppState state) async {
+  Future<void> pumpHome(WidgetTester tester, AppState state,
+      {FileManagerBridge? bridge}) async {
     await tester.binding.setSurfaceSize(const Size(800, 1400));
     addTearDown(() => tester.binding.setSurfaceSize(null));
-    await tester.pumpWidget(app(state));
+    await tester.pumpWidget(app(state, bridge: bridge));
   }
 
   /// `showToast` 会挂一个 2 秒定时器。在测试体里（FakeAsync 区）产生的
@@ -90,6 +100,7 @@ void main() {
 
   group('已扫描', () {
     late AppState state;
+    late FakeEngine engine;
     late Directory root;
 
     setUp(() async {
@@ -97,7 +108,8 @@ void main() {
       File(p.join(root.path, 'a.zip')).writeAsBytesSync(realZip({'x': 'y'}));
       File(p.join(root.path, 'b.zip')).writeAsBytesSync(realZip({'x': 'y'}));
 
-      state = AppState(engine: FakeEngine());
+      engine = FakeEngine();
+      state = AppState(engine: engine);
       await state.selectFolderPath(root.path);
     });
 
@@ -120,12 +132,29 @@ void main() {
       await drainTimers(tester);
     });
 
-    testWidgets('点「开始智能解压」真的走引擎：没有假弹窗，按钮如实跟着状态走',
-        (tester) async {
+    /// 走一遍「点主按钮 → 确认弹窗 → 整批跑完」。
+    Future<void> runBatch(WidgetTester tester) async {
+      await tester.tap(find.byType(PrimaryButton));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('确认解压'));
+      await tester.pumpAndSettle();
+    }
+
+    testWidgets('点「开始智能解压」先弹确认，确认后才真的走引擎', (tester) async {
       await pumpHome(tester, state);
 
       await tester.tap(find.byType(PrimaryButton));
-      await tester.pump();
+      await tester.pumpAndSettle();
+
+      // 解压会真往磁盘写目录，重名时追加 `_1`/`_2` 而不是覆盖 —— 点错一次
+      // 留下一堆重复目录只能人工删。所以写之前先让用户看一眼。
+      expect(find.text('待解压'), findsOneWidget);
+      expect(find.text('2 个压缩包'), findsNWidgets(2),
+          reason: '扫描结果卡片里一个，确认弹窗里一个');
+      expect(state.extracting, isFalse, reason: '确认之前不该开工');
+
+      await tester.tap(find.text('确认解压'));
+      await tester.pumpAndSettle();
 
       // 老实现是 2/5/8 秒后分别弹密码 / 格式 / 错误三个弹窗。
       // 把它们的时间点全走一遍，一个都不该出现。
@@ -135,14 +164,166 @@ void main() {
       }
 
       // P1 之后这里不再是「什么都没发生」：引擎真的被驱动了，整批跑完，
-      // 按钮回到待启动态，完成横幅亮出来。这一条同时锁住了「收尾不漏状态」。
+      // 完成横幅亮出来。这一条同时锁住了「收尾不漏状态」。
       expect(state.extracting, isFalse);
       expect(state.completed, isTrue);
       expect(state.logs.first.name, anyOf('a.zip', 'b.zip'));
 
+      // 跑过一轮之后主按钮换成「换个文件夹」。**不能再是「开始智能解压」**：
+      // 再点一次不是重解，而是把同一个队列重排一遍，输出目录重名会撒出
+      // `_1`/`_2` 的重复目录（见 output_paths.dart）。
+      final button = tester.widget<PrimaryButton>(find.byType(PrimaryButton));
+      expect(button.label, '换个文件夹');
+      expect(button.disabled, isFalse, reason: '换文件夹是脱困路径，不能禁用');
+
+      await drainTimers(tester);
+    });
+
+    testWidgets('确认弹窗点取消 → 不起任务，主按钮原样留着', (tester) async {
+      await pumpHome(tester, state);
+
+      await tester.tap(find.byType(PrimaryButton));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('取消'));
+      await tester.pumpAndSettle();
+
+      expect(state.extracting, isFalse);
+      expect(state.completed, isFalse);
+      expect(state.batchRun, isFalse, reason: '取消不算「这批用掉了」');
+
       final button = tester.widget<PrimaryButton>(find.byType(PrimaryButton));
       expect(button.label, '开始智能解压');
-      expect(button.disabled, isFalse, reason: '跑完了还能再点一次');
+
+      await drainTimers(tester);
+    });
+
+    testWidgets('跑完一批后主按钮改成「换个文件夹」，且再点不会重排队列',
+        (tester) async {
+      await pumpHome(tester, state);
+      await runBatch(tester);
+
+      expect(state.batchRun, isTrue);
+
+      final rounds = engine.rounds;
+
+      // 「换个文件夹」会走 FilePicker + 权限通道，无设备环境下拿不到，所以
+      // 这里只钉住「按下去不会重新解一遍」这条 —— 那才是这次改动要堵的洞。
+      await tester.tap(find.byType(PrimaryButton));
+      await tester.pumpAndSettle();
+
+      expect(engine.rounds, rounds, reason: '重排队列会往磁盘撒 _1/_2 重复目录');
+
+      await drainTimers(tester);
+    });
+  });
+
+  group('打开输出目录', () {
+    late AppState state;
+    late Directory root;
+    late List<MethodCall> calls;
+
+    setUp(() async {
+      root = makeTempDir('home_open');
+      File(p.join(root.path, 'a.zip')).writeAsBytesSync(realZip({'x': 'y'}));
+
+      state = AppState(engine: FakeEngine());
+      await state.selectFolderPath(root.path);
+      calls = [];
+    });
+
+    tearDown(() {
+      state.dispose();
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(_bridgeChannel, null);
+      if (root.existsSync()) root.deleteSync(recursive: true);
+    });
+
+    /// 让原生通道回一个指定的结果码。
+    void stubNative(String? code) {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(_bridgeChannel, (call) async {
+        calls.add(call);
+        return code;
+      });
+    }
+
+    Future<void> pumpAndRun(WidgetTester tester, {bool isAndroid = true}) async {
+      await pumpHome(
+        tester,
+        state,
+        bridge: FileManagerBridge(channel: _bridgeChannel, isAndroid: isAndroid),
+      );
+      await tester.tap(find.byType(PrimaryButton));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('确认解压'));
+      await tester.pumpAndSettle();
+      expect(find.text('打开输出目录'), findsOneWidget);
+    }
+
+    testWidgets('opened → 只回 toast，不弹兜底弹窗', (tester) async {
+      stubNative('opened');
+      await pumpAndRun(tester);
+
+      await tester.tap(find.text('打开输出目录'));
+      await tester.pumpAndSettle();
+
+      expect(calls.single.method, 'openFolderInFileManager');
+      expect(calls.single.arguments['path'], root.path,
+          reason: '要打开的是用户选的那个根目录');
+      expect(state.toastType, 'ok');
+      expect(find.byType(BottomSheet), findsNothing,
+          reason: '真的打开了就别再拿路径烦用户');
+
+      await drainTimers(tester);
+    });
+
+    testWidgets('opened_generic → 弹兜底弹窗，把路径原样交给用户', (tester) async {
+      // 国产 ROM 上的常态：文件管理器开了，但没跳到目标目录。
+      // 这时候假装成功，用户就会对着一个不相干的目录找半天。
+      stubNative('opened_generic');
+      await pumpAndRun(tester);
+
+      await tester.tap(find.text('打开输出目录'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('没能定位到目录'), findsOneWidget);
+      // 用 SelectableText 而不是 `find.text(路径)`：路径在头部那张文件夹卡里
+      // 也有一份（而且 SelectableText 自己会渲染成两个 widget），按文本找会
+      // 命中一堆。直接看弹窗里那份的内容才是想验的事。
+      expect(tester.widget<SelectableText>(find.byType(SelectableText)).data,
+          root.path,
+          reason: '路径要原样摆出来，能选中、能复制');
+      expect(find.text('复制路径'), findsOneWidget);
+
+      await drainTimers(tester);
+    });
+
+    testWidgets('no_handler → 同样给路径，不说「已打开」', (tester) async {
+      stubNative('no_handler');
+      await pumpAndRun(tester);
+
+      await tester.tap(find.text('打开输出目录'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('没有可用的文件管理器'), findsOneWidget);
+      expect(tester.widget<SelectableText>(find.byType(SelectableText)).data,
+          root.path);
+
+      await drainTimers(tester);
+    });
+
+    testWidgets('通道不可用（unavailable）→ 也不静默失败', (tester) async {
+      // 用「非 Android 平台」来构造 unavailable，而不是「通道没注册」——
+      // 后者在 widget 测试里取决于 messenger 对无 handler 通道的处理，
+      // 断起来不稳；平台分支是确定的，而且它和真机上的缺席走同一条出口。
+      // `MissingPluginException` 那条路由 `file_manager_bridge_test.dart` 兜。
+      await pumpAndRun(tester, isAndroid: false);
+
+      await tester.tap(find.text('打开输出目录'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('当前环境不支持'), findsOneWidget);
+      expect(calls, isEmpty, reason: '平台不支持就不该去惊动原生');
 
       await drainTimers(tester);
     });

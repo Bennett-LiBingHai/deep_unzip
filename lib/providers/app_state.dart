@@ -105,6 +105,15 @@ class AppState extends ChangeNotifier {
   bool _completed = false;
   String _completeDetail = '';
 
+  /// 当前这份扫描结果**已经被解压过一轮了**（成功、失败、取消都算）。
+  ///
+  /// 和 [_completed] 是两件事，别合并：`_completed` 说的是「全部成功」，
+  /// 有任何一个包失败它就是 false；而这里说的是「这份快照用掉了」。
+  /// 界面要靠它决定主按钮该不该还是「开始智能解压」—— 一旦这批跑过，
+  /// 再点就等于把同一个队列重排一遍，而输出目录重名会追加 `_1`/`_2`
+  /// （见 output_paths.dart），结果不是「重新解一遍」而是往磁盘里撒重复目录。
+  bool _batchRun = false;
+
   // 解压批次（一次 startExtract 覆盖的一整批包）
   //
   // 这几个都是**批次级**而不是「当前包」级的：进度条要在整批的尺度上单调
@@ -132,6 +141,10 @@ class AppState extends ChangeNotifier {
   String get eta => _eta;
   bool get completed => _completed;
   String get completeDetail => _completeDetail;
+
+  /// 这批扫描结果已经解压过了（无论成败）。为真时主按钮应换成「换个文件夹」，
+  /// 不能再是「开始智能解压」—— 理由见 [_batchRun]。
+  bool get batchRun => _batchRun;
 
   /// 暂停中。区别于 [extracting]：暂停时 `extracting` 为 false 但任务还在。
   bool get paused => _paused;
@@ -460,6 +473,7 @@ class AppState extends ChangeNotifier {
     _eta = '--';
     _completed = false;
     _completeDetail = '';
+    _batchRun = false;
   }
 
   /// 开始把扫描到的压缩包逐个解开。
@@ -470,6 +484,14 @@ class AppState extends ChangeNotifier {
     if (_extracting || _paused) return;
     if (_archives.isEmpty) {
       showToast('先选择一个文件夹并完成扫描', type: 'warn');
+      return;
+    }
+    // 这份快照已经跑过一轮了。**这道闸门是必须的，不能只靠界面上把按钮改个
+    // 名字** —— 重跑不会「再解一遍」，而是把同一个队列重排一次，输出目录
+    // 重名时会追加 `_1`/`_2`，等于往磁盘里撒重复目录（见 output_paths.dart）。
+    // 想再来一遍就重新选一次目录，那会重新扫描，拿到的是新快照。
+    if (_batchRun) {
+      showToast('这批已经解压过了，换个文件夹再试', type: 'warn');
       return;
     }
     unawaited(_runExtractBatch());
@@ -658,6 +680,9 @@ class AppState extends ChangeNotifier {
       // 嵌套包也是这一批的活儿，只算开头那 8 个的话，收尾会出现
       // 「已解 12 个 / 共 8 个」这种自相矛盾的文案。
       _completed = !cancelled && failed < _batchTotal;
+      // 无论成败，这份扫描快照都用掉了 —— 界面据此把主按钮换成「换个文件夹」，
+      // 而不是留着「开始智能解压」等着被再点一次（见 [_batchRun]）。
+      _batchRun = true;
       final elapsed = _batchStart == null
           ? Duration.zero
           : DateTime.now().difference(_batchStart!);

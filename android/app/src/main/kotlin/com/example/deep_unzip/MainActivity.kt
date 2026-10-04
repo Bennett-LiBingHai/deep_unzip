@@ -1,5 +1,242 @@
 package com.example.deep_unzip
 
+import android.content.ActivityNotFoundException
+import android.content.ComponentName
+import android.content.Intent
+import android.net.Uri
+import android.os.Environment
+import android.provider.DocumentsContract
 import io.flutter.embedding.android.FlutterActivity
+import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.MethodChannel
+import java.io.File
 
-class MainActivity : FlutterActivity()
+/**
+ * 宿主 Activity。除了启动 Flutter 之外只做一件事：**让系统文件管理器打开
+ * 解压出来的那个目录**。
+ *
+ * ## 为什么这件事得在原生做
+ *
+ * Android 没有「打开这个文件夹」的标准 Intent。往上能搜到的写法里有两类是坑：
+ *
+ * - `ACTION_VIEW` + `file://`：targetSdk ≥ 24 的 app 把 `file://` 交给别的 app 会抛
+ *   `FileUriExposedException`，**直接崩**。网上大量示例还在这么写，因为那都是
+ *   targetSdk 23 时代留下的。
+ * - `FileProvider`：它只服务单个文件，不实现 `queryChildDocuments`，把**目录**
+ *   交给别的 app 是列不出来的。别浪费时间去加 `file_paths.xml`。
+ *
+ * 能走通的是第三条：用系统自带的 `ExternalStorageProvider`，把路径翻成
+ * `content://com.android.externalstorage.documents/document/<volumeId>:<相对路径>`，
+ * 再把这份 `content://` URI 交给文件管理器。接收方不需要认识我们。
+ *
+ * ## 为什么结果有这么多档
+ *
+ * 因为「打开成功」有好几档含义。真正认识那个 URI 的是 AOSP 的 DocumentsUI，
+ * 而**国产 ROM 经常把它换掉或包一层**；换掉之后就只剩「随便开一个文件管理器」
+ * 这条兜底 —— 那也是「成功」，但用户眼前的界面根本没定位到目标目录。
+ * 把这两种情况压成一个 `true`，界面就只能假装成功。所以往上如实回结果码，
+ * 由 Dart 侧（见 `lib/services/file_manager_bridge.dart`）决定怎么跟用户说。
+ *
+ * ## 不要加 `<queries>`
+ *
+ * `startActivity` **不受**包可见性过滤，只有 `query*` 系列 API 才受。所以这里
+ * 一律「直接试、捕 `ActivityNotFoundException`」，不用 `resolveActivity` ——
+ * 后者在 API 30+ 会因为看不到而误报「没人能处理」。同理也不需要给 Manifest
+ * 加任何东西。
+ */
+class MainActivity : FlutterActivity() {
+
+    private companion object {
+        /** 方法通道名。**必须与 `file_manager_bridge.dart` 里的逐字一致。** */
+        const val CHANNEL = "com.example.deep_unzip/native"
+
+        /** 系统 ExternalStorageProvider 的 authority。 */
+        const val EXTERNAL_STORAGE_AUTHORITY = "com.android.externalstorage.documents"
+
+        /** AOSP DocumentsUI 的主界面，兜底时点名用。 */
+        const val DOCUMENTSUI_PACKAGE = "com.android.documentsui"
+        const val DOCUMENTSUI_ACTIVITY = "com.android.documentsui.files.FilesActivity"
+
+        /** 主存储卷的 docId 前缀。`StorageVolume.getUuid()` 对主卷返回 null。 */
+        const val PRIMARY_VOLUME_ID = "primary"
+
+        // ===== 结果码 =====
+        // **Dart 侧 `FileManagerBridge._parse` 认的就是这几个字面量。改这里必须同步改那边。**
+
+        /** 精确打开到了目标目录。 */
+        const val R_OPENED = "opened"
+
+        /** 只打开了某个文件管理器，没定位到目标目录。 */
+        const val R_OPENED_GENERIC = "opened_generic"
+
+        /** 路径不在任何外部存储卷上（或不存在），系统 provider 表达不了它。 */
+        const val R_UNSUPPORTED_PATH = "unsupported_path"
+
+        /** 设备上没有能处理它的文件管理器。 */
+        const val R_NO_HANDLER = "no_handler"
+    }
+
+    override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+        super.configureFlutterEngine(flutterEngine)
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    // 弹窗和 startActivity 都要主线程，方法通道默认就在主线程回调。
+                    "openFolderInFileManager" ->
+                        result.success(openFolderInFileManager(call.argument<String>("path")))
+                    else -> result.notImplemented()
+                }
+            }
+    }
+
+    /**
+     * 打开 [path] 所在的目录，返回上面那组结果码之一。
+     *
+     * 不抛异常：所有失败都折进返回值，调用方按字符串分支。
+     */
+    private fun openFolderInFileManager(path: String?): String {
+        if (path.isNullOrEmpty()) return R_UNSUPPORTED_PATH
+
+        val uri = documentUriFor(path) ?: return R_UNSUPPORTED_PATH
+
+        // 三道精确方案，从最标准到最具体。只要有一道被系统接受就算成功 ——
+        // 注意「被接受」只说明有 app 接了这个 Intent，不代表它乖乖跳到了
+        // 目标目录（那是它的事，我们查不了）。所以下面还有 generic 一档。
+        if (tryStart(preciseIntent(uri))) return R_OPENED
+        if (tryStart(bareIntent(uri))) return R_OPENED
+        if (tryStart(explicitDocumentsUi(uri))) return R_OPENED
+
+        // 最后一档：不指定目录，只要能开出一个文件管理器。
+        // 如实回 opened_generic，界面会把路径摆给用户让他自己点进去。
+        if (tryStart(genericFilesIntent())) return R_OPENED_GENERIC
+
+        return R_NO_HANDLER
+    }
+
+    /**
+     * 「这是一份目录」—— 正规写法，带 MIME type，支持的文件管理器会直接跳进去。
+     */
+    private fun preciseIntent(uri: Uri): Intent =
+        Intent(Intent.ACTION_VIEW)
+            .setDataAndType(uri, DocumentsContract.Document.MIME_TYPE_DIR)
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+
+    /**
+     * 有些文件管理器只按 data 匹配、完全不看 type，带上 `vnd.android.document/directory`
+     * 反而不匹配。去掉 type 再试一次。
+     */
+    private fun bareIntent(uri: Uri): Intent =
+        Intent(Intent.ACTION_VIEW)
+            .setData(uri)
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+
+    /**
+     * 点名 AOSP DocumentsUI。有些 ROM 上它没声明 `directory` 的 MIME 过滤器，
+     * 隐式 Intent 匹配不到，但点名组件能起。
+     *
+     * 显式 Intent 打别的 app 的组件可能吃 `SecurityException`（没导出），
+     * [tryStart] 一并当「没找到」处理。
+     */
+    private fun explicitDocumentsUi(uri: Uri): Intent =
+        Intent(Intent.ACTION_VIEW)
+            .setDataAndType(uri, DocumentsContract.Document.MIME_TYPE_DIR)
+            .setComponent(
+                ComponentName(DOCUMENTSUI_PACKAGE, DOCUMENTSUI_ACTIVITY)
+            )
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+
+    /**
+     * 「随便开个文件管理器」。不带目标目录 —— 这一档的用户体验就是「界面开了，
+     * 但停在别处」，所以它是 [R_OPENED_GENERIC] 而不是 [R_OPENED]。
+     *
+     * `CATEGORY_APP_FILES` 是 API 29 才加的常量，但它是编译期内联的字符串，
+     * 在 minSdk 24 的设备上引用不会炸；匹配不到就是 `ActivityNotFoundException`，
+     * 由 [tryStart] 吃掉。
+     */
+    private fun genericFilesIntent(): Intent =
+        Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_APP_FILES)
+
+    /**
+     * 起一个 Intent，只回答「有没有 app 接受它」。
+     *
+     * **不要换成 `resolveActivity`**：包可见性规则下（API 30+ 默认收紧）它会因为
+     * 看不见对方的 `<queries>` 而返回 null，把能用的路径误判成不能用。
+     * 「直接试、捕异常」是官方推荐的替代写法。
+     */
+    private fun tryStart(intent: Intent): Boolean = try {
+        startActivity(intent)
+        true
+    } catch (e: ActivityNotFoundException) {
+        false
+    } catch (e: SecurityException) {
+        // 显式点名了别的 app 没导出的组件。当没找到处理者。
+        false
+    }
+
+    /**
+     * 文件系统路径 → `ExternalStorageProvider` 的 document URI。
+     *
+     * 返回 null 表示系统 provider 表达不了这个路径（不在任何已挂载的外部存储卷上、
+     * 或者不是目录）。
+     *
+     * **绝不允许手工拼 URI 字符串。** docId 里的 `:`、`/` 以及路径本身的中文和空格
+     * 都要编码，手拼出来的在 `/sdcard/我的 下载/` 这类路径上必然坏，而且坏得很难查。
+     * `DocumentsContract.buildDocumentUri` 就是干这件事的。
+     */
+    private fun documentUriFor(path: String): Uri? {
+        val target = try {
+            File(path).canonicalFile
+        } catch (e: Exception) {
+            // canonicalFile 在极端路径上会抛 IOException。
+            return null
+        }
+        // 注意：这里没权限时会把「没权限」误判成「不存在」。可以接受 ——
+        // 没有存储权限的话扫描阶段就跑不出结果，也走不到这个按钮。
+        if (!target.isDirectory) return null
+
+        val targetPath = target.path
+        for ((volumeId, root) in externalVolumeRoots()) {
+            val rootPath = root.path
+            val relative = when {
+                targetPath == rootPath -> ""
+                targetPath.startsWith("$rootPath/") -> targetPath.substring(rootPath.length + 1)
+                else -> continue
+            }
+            // 卷根自己的 docId 是 `primary:`（appendPath 会编码成 `primary%3A`）。
+            val docId = "$volumeId:$relative"
+            return DocumentsContract.buildDocumentUri(EXTERNAL_STORAGE_AUTHORITY, docId)
+        }
+        return null
+    }
+
+    /**
+     * 已挂载的外部存储卷 → (volumeId, 卷根目录)。
+     *
+     * 主卷的 id 是字面量 `primary`；可移动卷用自己的 UUID（形如 `1234-5678`）。
+     * `ExternalStorageProvider` 的 docId 前缀认这两个。
+     *
+     * 可移动卷的**卷根是从 `getExternalFilesDirs` 反推的** —— API 24–29 上没有
+     * 公开 API 能直接拿卷根（`StorageVolume.getDirectory()` 要 API 30），而
+     * `getExternalFilesDirs` 返回的路径形如
+     * `/storage/1234-5678/Android/data/<pkg>/files`，砍掉 `/Android/` 之后就是卷根。
+     */
+    private fun externalVolumeRoots(): List<Pair<String, File>> {
+        val roots = LinkedHashMap<String, File>()
+
+        Environment.getExternalStorageDirectory()?.let {
+            roots[PRIMARY_VOLUME_ID] = it
+        }
+
+        getExternalFilesDirs(null)?.forEach { dir ->
+            val full = dir?.canonicalPath ?: return@forEach
+            val idx = full.indexOf("/Android/")
+            if (idx <= 0) return@forEach
+            val rootPath = full.substring(0, idx)
+            // 主卷也会从这条路冒出来（rootPath == /storage/emulated/0），去重。
+            if (roots.values.any { it.path == rootPath }) return@forEach
+            roots[rootPath.substringAfterLast('/')] = File(rootPath)
+        }
+
+        return roots.entries.map { it.key to it.value }
+    }
+}
