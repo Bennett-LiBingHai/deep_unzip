@@ -209,7 +209,16 @@ void main() {
       expect(log.tags, ['1 项']);
     });
 
-    test('伪装后缀的包不挂「后缀篡改」—— 那是扫描期的标记，日志里不重复', () {
+    test('伪装后缀的包挂「伪后缀」—— 日志是唯一的留痕', () {
+      // 这条**推翻了**原来的断言（原来期望 `['1 项']`，理由是「扫描期的标记，
+      // 日志里不重复」）。那个理由不成立：`buildScanLog` 的 tag 只有
+      // 「N 个压缩包 / 忽略 N 个容器 / N 个不可读」三个**聚合**数，没有逐文件
+      // 的 flag。伪后缀只出现在首页那个列表上，而列表下次扫描就被清掉 ——
+      // 解完 `fake.pdf` 再来翻日志，只有一个「1 项」，看不出它被当成什么解了。
+      //
+      // 而且它不是唯一一个被漏掉的：`ArchiveFlag` 四个值，日志里原来只映射了
+      // 三个（分片 / 嵌套 / 加密）。一个枚举映射了三个值，第四个的缺席看不出
+      // 是「有意不记」还是「忘了写」—— 事实上就是忘了。
       final log = buildExtractLog(
         item: item(flags: {ArchiveFlag.fakeExtension}),
         outcome: const ExtractOutcome(
@@ -221,7 +230,34 @@ void main() {
         now: now,
       );
 
-      expect(log.tags, ['1 项']);
+      expect(log.tags, ['伪后缀', '1 项']);
+    });
+
+    test('四个 flag 全挂上时四个 tag 都在，且顺序就是源码里的顺序', () {
+      // 上一条只验了「漏掉的那个补上了」。这一条验的是**再也没有第五个能被
+      // 漏掉**：`ArchiveFlag` 有几个值，这里就该有几个 tag。
+      final log = buildExtractLog(
+        item: item(
+          flags: {
+            ArchiveFlag.nested,
+            ArchiveFlag.encrypted,
+            ArchiveFlag.fakeExtension,
+          },
+          // 「分片 ×N」读的是 `item.isSplit`（即 `split != null`），
+          // **不是** `flags` 里那个同名 flag —— 只挂 flag 不会让这一项出现。
+          split: true,
+          parts: const ['/sdcard/a.zip.001', '/sdcard/a.zip.002'],
+        ),
+        outcome: const ExtractOutcome(
+          outDir: '/sdcard/a',
+          entryCount: 3,
+          unpackedBytes: 3,
+          elapsed: Duration.zero,
+        ),
+        now: now,
+      );
+
+      expect(log.tags, ['分片 ×2', '嵌套', '加密', '伪后缀', '3 项']);
     });
   });
 

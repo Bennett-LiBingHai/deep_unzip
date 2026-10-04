@@ -23,7 +23,7 @@ import '../models/archive_file.dart';
 import '../models/extractor.dart';
 import '../models/log_entry.dart';
 import '../models/password_entry.dart';
-import '../services/blocked_prompt.dart';
+import '../services/prompts.dart';
 import '../services/disk_space.dart';
 
 /// 全局应用状态。
@@ -54,6 +54,8 @@ class AppState extends ChangeNotifier {
     EngineController? engine,
     DiskSpaceProbe? diskSpace,
     ArchiveBlockedPrompt? blockedPrompt,
+    ArchiveErrorPrompt? errorPrompt,
+    FormatDetectPrompt? formatPrompt,
     // 参数名与字段名（`_store`）**不止差一个下划线** —— 与上面那条同因：
     // 叫 `store` 会换来一条 Dart 根本没法照做的假警告。
     PersistStore? persistStore,
@@ -61,6 +63,8 @@ class AppState extends ChangeNotifier {
   })  : _injectedEngine = engine,
         _diskSpace = diskSpace ?? DiskSpaceProbe(),
         _onBlocked = blockedPrompt,
+        _onError = errorPrompt,
+        _onFormatDetect = formatPrompt,
         _store = persistStore {
     // 出厂值在字段初始化时就位了（见下方 `_settings` 等），这里把磁盘上读回来
     // 的那份盖上去。**在构造函数体里做而不是让调用方改**，是为了让「读到的
@@ -91,9 +95,20 @@ class AppState extends ChangeNotifier {
   /// 单元测试默认就是这一档 —— 真弹窗要 `MaterialApp` 挂上 `AppNavigator.key`，
   /// 那是 widget 测试的事（见 `test/services/dialog_bridge_test.dart`）。
   ///
-  /// 类型是纯 Dart 的（见 `services/blocked_prompt.dart`），所以这一层不必
+  /// 类型是纯 Dart 的（见 `services/prompts.dart`），所以这一层不必
   /// import 任何 widget，`app_state.dart:43` 那条边界不破。
   final ArchiveBlockedPrompt? _onBlocked;
+
+  /// 解压出错时问用户「暂停 / 跳过」（需求 3）。同上，为 null 时退回
+  /// 「记一条失败日志、接着解下一个」。
+  ///
+  /// 与 [_onBlocked] 分家的理由见 `prompts.dart` 开头那张表：这两档的另一边
+  /// 一个停得回来、一个停不回来，共用一个回调迟早会有人接错那根线。
+  final ArchiveErrorPrompt? _onError;
+
+  /// 后缀被篡改时问用户「按真实格式解吗」（需求 5）。同上，为 null 时
+  /// 静默按真实格式解 —— 那正是加这个弹窗之前的行为。
+  final FormatDetectPrompt? _onFormatDetect;
 
   // 文件夹
   bool _folderSelected = false;
@@ -725,6 +740,10 @@ class AppState extends ChangeNotifier {
     // 活的 `_limits` —— 用户在解压途中去设置页换个档，同一批里前半个包按
     // 旧阈值、后半个按新阈值，日志上会显得同样的包有的过有的被拦。
     final limits = _limits;
+    // 「解不开时问不问」同样锁定。这条尤其不能读活的：这个开关自己就会在
+    // 弹窗来回的过程中被用户改（比如他想「先关掉别问了」），读到一半变了的话，
+    // 同一批里会出现「问了三个、第四个开始不问了」这种没法解释的序列。
+    final pauseOnError = setting('errorPause');
 
     _extracting = true;
     _paused = false;
@@ -792,6 +811,35 @@ class AppState extends ChangeNotifier {
           }
         }
 
+        // 后缀被篡改（需求 5）：先问一句再解。
+        //
+        // 触发条件读的是扫描时就算好的 `flags`，**不**在这里重算
+        // `isExtensionSpoofed` 并重读设置：那一份是这批任务共用的快照
+        // （见 `_scanOptions`），用户在解压途中去设置页关掉检测，不该让同一批
+        // 里前半个包问、后半个包不问。
+        //
+        // 位置刻意在自引用判定**之后**：马上要被跳过的包不值得再弹一次窗。
+        final askFormat = _onFormatDetect;
+        if (askFormat != null &&
+            item.flags.contains(ArchiveFlag.fakeExtension)) {
+          final confirmed = await askFormat(FormatDetectInfo.fromItem(item));
+          // **只有明确按了取消**（false）才跳过。null 是「弹窗没弹成」
+          // （拿不到 context），那不是什么都没发生 —— 用户什么都没看见就把
+          // 包从批次里抹掉，比多解一个包糟得多，所以按原样解。
+          if (confirmed == false) {
+            skipped++;
+            _doneCount++;
+            _addLog(buildExtractLog(
+              item: item,
+              skippedReason: '用户取消',
+              now: DateTime.now(),
+            ));
+            showToast('${item.fileName}：按你的选择跳过', type: 'warn');
+            _notify();
+            continue;
+          }
+        }
+
         // 后缀是假的（需求 5）时要把那段假后缀剥掉，否则输出目录会跟源文件
         // 同名 —— 见 deriveOutputName 里那段说明，真机上就是这么整包失败的。
         final outDir = resolveOutputDir(
@@ -849,23 +897,44 @@ class AppState extends ChangeNotifier {
             now: DateTime.now(),
           ));
 
-          // **只有被闸门拦下的才问**（炸弹 / 装不下）。普通损坏、密码不匹配
-          // 这些没有第二选择，弹一次窗只是多要用户点一下。
           final breach = e.breach;
-          final ask = _onBlocked;
           // 弹窗真的弹出来了就不再补 toast —— 那句话用户刚在弹窗里看过。
           var shown = false;
-          if (breach != null && ask != null) {
-            final decision = await ask(item.fileName, breach);
-            if (decision == BlockedDecision.stop) {
-              // 复用 `_cancelRequested`：收尾那块已经按它算 `cancelled`，
-              // 于是文案换成「已中止」，而且**不消费**这批快照（见 finally）
-              // —— 剩下的包还等着解，主按钮必须能再点。
-              _cancelRequested = true;
-              break;
+
+          if (breach != null) {
+            // **被闸门拦下永远问**，与 `errorPause` 无关。那是「我们主动放弃
+            // 了一个其实可能解得开的包」，用户有权当场知道并决定；而且它给出
+            // 的两个选项里有一个是**不可恢复**的停止，更不该由我们替他选。
+            final ask = _onBlocked;
+            if (ask != null) {
+              final decision = await ask(item.fileName, breach);
+              if (decision == BlockedDecision.stop) {
+                // 复用 `_cancelRequested`：收尾那块已经按它算 `cancelled`，
+                // 于是文案换成「已中止」，而且**不消费**这批快照（见 finally）
+                // —— 剩下的包还等着解，主按钮必须能再点。
+                _cancelRequested = true;
+                break;
+              }
+              // null = 弹窗没弹成（拿不到 BuildContext）。那不是用户的决定，
+              // 用户什么都没看到，得补一条 toast 兜底。
+              shown = decision != null;
             }
-            // null = 弹窗没弹成（拿不到 BuildContext）。那不是用户的决定，
-            // 用户什么都没看到，得补一条 toast 兜底。
+          } else if (pauseOnError && _onError != null) {
+            // 需求 3：解不开时让用户选「暂停 / 跳过」。
+            //
+            // 走这条路的是「解了但没成」—— 包损坏、密码不匹配、格式不认。
+            // 与上面那档的关键区别在「暂停」这两个字：这里暂停的是**队列**，
+            // 用的是 `pauseExtract` 那道闸门，队列原封不动、「继续解压」接得
+            // 回来。所以**绝不能**复用 `_cancelRequested`，那条路会把剩下的
+            // 包全丢掉（见 finally 里 `_batchRun = !cancelled` 那段）。
+            //
+            // 失败的这个包本身不重试 —— 暂停是关于整批的，不是「留着这个包
+            // 等下再试」，它已经记了一条失败日志。
+            final decision = await _onError(item.fileName, e.message);
+            if (decision == ExtractErrorDecision.pause && !_paused) {
+              _paused = true;
+              showToast('已暂停，处理完后点「继续解压」');
+            }
             shown = decision != null;
           }
           if (!shown) {

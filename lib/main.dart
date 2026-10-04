@@ -76,15 +76,19 @@ class MainShell extends StatefulWidget {
 }
 
 class _MainShellState extends State<MainShell> {
-  // `blockedPrompt` 是「被炸弹/空间闸门拦下时弹窗问用户」的那条线。不接的话
-  // 行为退回成只记日志 + toast —— 引擎照跑，但用户看不到选择（见 app_state 里
-  // _onBlocked 为 null 的分支）。AppState 本身不 import material，
-  // 实现放在 dialog_bridge 里，这条注入就是那道边界的接缝。
+  // 三个弹窗回调全在这一处注入。每一个不接的后果都是**静默降级**而不是报错
+  // （见 `prompts.dart` 里各自的说明），所以这里漏掉一个不会有任何提示，
+  // 只会表现成「那个弹窗从来不出现」—— 三行必须整整齐齐地在一起。
+  //
+  // AppState 本身不 import material，实现放在 dialog_bridge 里，
+  // 这条注入就是那道边界的接缝。
   //
   // `late` 而非直接初始化：它要读 `widget`，而字段初始化器跑在 `widget` 就位
   // 之前。`late` 把它推迟到 `initState` 里第一次访问时，那里两者都在了。
   late final AppState _state = AppState(
     blockedPrompt: const DialogBridge().askArchiveBlocked,
+    errorPrompt: const DialogBridge().askExtractError,
+    formatPrompt: const DialogBridge().askFormatDetect,
     persistStore: widget.store,
     restore: widget.snapshot,
   );

@@ -1,6 +1,6 @@
 import 'package:deep_unzip/app_navigator.dart';
 import 'package:deep_unzip/engine/limits.dart';
-import 'package:deep_unzip/services/blocked_prompt.dart';
+import 'package:deep_unzip/services/prompts.dart';
 import 'package:deep_unzip/services/dialog_bridge.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -88,5 +88,140 @@ void main() {
     expect(decision, isNull,
         reason: 'null = 没弹。调用方据此补 toast，而不是当成用户选了某一项');
     expect(find.text('跳过继续'), findsNothing);
+  });
+
+  // -------------------------------------------------------------------------
+  // 解压出错（需求 3）。与上面那个共用 ErrorModal，只有左边那颗的字不一样，
+  // 而那个区别正是全部要害：「暂停任务」停得回来，「停止这批」停不回来。
+  // -------------------------------------------------------------------------
+
+  Future<Future<ExtractErrorDecision?>> askErrorAndSettle(
+    WidgetTester tester,
+  ) async {
+    final decision =
+        const DialogBridge().askExtractError('broken.zip', '文件损坏，读不出来');
+    await tester.pumpAndSettle();
+    return decision;
+  }
+
+  testWidgets('出错弹窗：左边那颗是「暂停任务」，且点了真的回 pause', (tester) async {
+    await mount(tester);
+    final future = await askErrorAndSettle(tester);
+
+    expect(find.text('broken.zip'), findsOneWidget, reason: '要说清是哪个包');
+    expect(find.text('文件损坏，读不出来'), findsOneWidget);
+    expect(find.text('暂停任务'), findsOneWidget);
+    // 这一档的暂停是**可恢复**的（复用 pauseExtract 那道闸门），所以绝不能
+    // 复用闸门弹窗那颗「停止这批」—— 那两个弹窗长得一模一样，只有字不一样。
+    expect(find.text('停止这批'), findsNothing);
+
+    await tester.tap(find.text('暂停任务'));
+    await tester.pumpAndSettle();
+
+    expect(await future, ExtractErrorDecision.pause);
+  });
+
+  testWidgets('出错弹窗：点「跳过继续」→ skip', (tester) async {
+    await mount(tester);
+    final future = await askErrorAndSettle(tester);
+
+    await tester.tap(find.text('跳过继续'));
+    await tester.pumpAndSettle();
+
+    expect(await future, ExtractErrorDecision.skip);
+  });
+
+  testWidgets('出错弹窗：滑走 → 兜底成 pause', (tester) async {
+    await mount(tester);
+    final future = await askErrorAndSettle(tester);
+
+    await tester.tapAt(const Offset(10, 10));
+    await tester.pumpAndSettle();
+
+    expect(find.text('暂停任务'), findsNothing, reason: '前提：弹窗真的被关掉了');
+    // 与闸门弹窗**相反**的兜底，而且这不是笔误：那一档的另一边是丢了队列的
+    // 停止，误滑代价太大所以兜「继续跑」；这一档的暂停队列还在、点一下就回来，
+    // 所以兜「可恢复的那个」。判据是同一个 —— 默认挑不会丢东西的。
+    expect(await future, ExtractErrorDecision.pause);
+  });
+
+  testWidgets('出错弹窗：拿不到 context → null', (tester) async {
+    await mount(tester, withKey: false);
+
+    final decision = await (await askErrorAndSettle(tester));
+
+    expect(decision, isNull);
+    expect(find.text('暂停任务'), findsNothing);
+  });
+
+  // -------------------------------------------------------------------------
+  // 后缀被篡改（需求 5）
+  // -------------------------------------------------------------------------
+
+  const info = FormatDetectInfo(
+    fileName: 'fake.pdf',
+    fakeExt: 'pdf',
+    fileHeader: '0x504B0304',
+    realFormat: 'ZIP 压缩包',
+    action: '按 ZIP 压缩包 解压',
+    hexPreview: '50 4B 03 04 14 00 00 00',
+  );
+
+  Future<Future<bool?>> askFormatAndSettle(WidgetTester tester) async {
+    final decision = const DialogBridge().askFormatDetect(info);
+    await tester.pumpAndSettle();
+    return decision;
+  }
+
+  testWidgets('格式弹窗：把文件名和五项事实都摆出来', (tester) async {
+    await mount(tester);
+    final future = await askFormatAndSettle(tester);
+
+    // 文件名必须显示：这个弹窗在一批几十个包的途中随时会弹出来，不说是在说
+    // 哪个文件，用户不知道眼前这一下影响的是谁。
+    expect(find.text('fake.pdf'), findsOneWidget);
+    expect(find.text('pdf'), findsOneWidget);
+    expect(find.text('0x504B0304'), findsOneWidget);
+    expect(find.text('ZIP 压缩包'), findsOneWidget);
+    expect(find.text('按 ZIP 压缩包 解压'), findsOneWidget);
+    expect(find.text('50 4B 03 04 14 00 00 00'), findsOneWidget);
+
+    await tester.tap(find.text('确认解压'));
+    await tester.pumpAndSettle();
+    expect(await future, isTrue);
+  });
+
+  testWidgets('格式弹窗：点「取消」→ false（明确不要这个包了）', (tester) async {
+    await mount(tester);
+    final future = await askFormatAndSettle(tester);
+
+    await tester.tap(find.text('取消'));
+    await tester.pumpAndSettle();
+
+    expect(await future, isFalse,
+        reason: 'false 与 null 必须分得开：一个是不解，一个是没问成');
+  });
+
+  testWidgets('格式弹窗：滑走 → 兜底成 true（照原样解）', (tester) async {
+    await mount(tester);
+    final future = await askFormatAndSettle(tester);
+
+    await tester.tapAt(const Offset(10, 10));
+    await tester.pumpAndSettle();
+
+    expect(find.text('确认解压'), findsNothing, reason: '前提：弹窗真的被关掉了');
+    // 这个弹窗只是个**通报**：扫描阶段已经认定它是个压缩包、用户也选了要解。
+    // 让「手滑一下」把包从批次里抹掉太狠了，所以兜底是退回加特性之前的行为。
+    expect(await future, isTrue);
+  });
+
+  testWidgets('格式弹窗：拿不到 context → null（绝不能兜成 false）', (tester) async {
+    await mount(tester, withKey: false);
+
+    final decision = await (await askFormatAndSettle(tester));
+
+    // 这条是这组里最要紧的一个：null 兜成 false 的话，弹窗因为拿不到 context
+    // 而没能出现时，用户的压缩包会**凭空从批次里消失**，且没有任何解释。
+    expect(decision, isNull);
   });
 }

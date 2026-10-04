@@ -12,7 +12,7 @@ import 'package:deep_unzip/models/extractor.dart';
 import 'package:deep_unzip/models/log_entry.dart';
 import 'package:deep_unzip/models/password_entry.dart';
 import 'package:deep_unzip/providers/app_state.dart';
-import 'package:deep_unzip/services/blocked_prompt.dart';
+import 'package:deep_unzip/services/prompts.dart';
 import 'package:deep_unzip/services/disk_space.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
@@ -1211,8 +1211,14 @@ void main() {
           reason: '没弹成 = 用户什么都没看见，必须给一条提示');
     });
 
-    t('普通失败（没有 breach）不弹窗', () async {
-      // 损坏、密码不匹配这些没有第二选择，弹一次窗只是多要用户点一下。
+    t('普通失败（没有 breach）**不落进闸门那个弹窗**', () async {
+      // 这条原来叫「普通失败不弹窗」，理由是「损坏、密码不匹配这些没有第二
+      // 选择」。那个理由已经不作数了：需求 3 要的就是这些也问一句，由
+      // `errorPause` 管着（见「解压出错弹窗」那一组）。
+      //
+      // 现在它验的是**另一件事**：这股失败不该被喂给闸门那条线。闸门弹窗的
+      // 左边那颗是「停止这批」，会丢掉剩余队列；一个坏包触发它的话，用户
+      // 会在一件本来只影响一个包的事情上看到一颗不可恢复的按钮。
       final root = tempRoot('as_prompt_plain');
       put(root, 'a.zip', realZip({'x': 'y'}));
 
@@ -1294,6 +1300,347 @@ void main() {
       await drainExtract(state);
 
       expect(engine.availableBytesSeen, [null, null]);
+    });
+  });
+
+  group('解压出错弹窗（需求 3）', () {
+    // 这一组盯的是 `errorPause` 那个开关**真的有人读**。加这一组之前它是个
+    // 死开关：界面上写着「无法解压时弹窗询问，而非自动跳过」，而全仓库除了
+    // 默认值定义和那行 UI，没有任何地方读过它。
+    //
+    // 判据全在「暂停」两个字上：这一档的暂停复用 `pauseExtract` 那道闸门，
+    // 队列原封不动、能接着解。所以下面最重要的断言不是「弹了窗」，而是
+    // **暂停之后 `extracting` 还是 true、剩下几个包一个都没动**。
+
+    /// 只让第一个包炸，第二个照常成 —— 这样「暂停」与「跳过」才分得开。
+    FakeEngine brokenFirst() => FakeEngine()
+      ..behavior = (e, outDir) async {
+        if (e.rounds == 1) {
+          throw const EngineException('这个包坏了', code: DuzErrorCode.extract);
+        }
+      };
+
+    Directory twoPacks(String tag) {
+      final root = tempRoot(tag);
+      put(root, 'a.zip', realZip({'x': 'y'}));
+      put(root, 'b.zip', realZip({'x': 'y'}));
+      return root;
+    }
+
+    List<String> toastTrail(AppState state) {
+      final seen = <String>[];
+      state.addListener(() {
+        final msg = state.toastMsg;
+        if (msg != null && (seen.isEmpty || seen.last != msg)) seen.add(msg);
+      });
+      return seen;
+    }
+
+    t('开着 errorPause → 出错时问，选「跳过」→ 整批继续', () async {
+      final engine = brokenFirst();
+      final asked = <String>[];
+      final state = AppState(
+        engine: engine,
+        errorPrompt: (name, reason) async {
+          asked.add('$name|$reason');
+          return ExtractErrorDecision.skip;
+        },
+      );
+      addTearDown(state.dispose);
+
+      await state.selectFolderPath(twoPacks('as_err_skip').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(asked, hasLength(1));
+      expect(asked.single, startsWith('a.zip|'));
+      expect(asked.single, contains('这个包坏了'),
+          reason: '弹窗正文要用引擎给的那句话，不是我们另编一句');
+      expect(engine.rounds, 2, reason: '跳过 ≠ 停批');
+      expect(state.paused, isFalse);
+      expect(state.batchRun, isTrue, reason: '跑完的批次照常消费快照');
+    });
+
+    t('选「暂停」→ 批次挂起、剩下的包一个都没动；resume 之后接着解', () async {
+      final engine = brokenFirst();
+      final state = AppState(
+        engine: engine,
+        errorPrompt: (name, reason) async => ExtractErrorDecision.pause,
+      );
+      addTearDown(state.dispose);
+
+      await state.selectFolderPath(twoPacks('as_err_pause').path);
+      state.startExtract();
+      await settle(30);
+
+      expect(state.paused, isTrue, reason: '选了暂停，批次该挂起');
+      expect(engine.rounds, 1, reason: '挂起之后 b.zip 一个字节都不该动');
+      expect(state.extracting, isTrue,
+          reason: '暂停不是结束 —— 这一条正是它与闸门弹窗那颗「停止这批」的分水岭');
+
+      state.resumeExtract();
+      await drainExtract(state);
+
+      expect(engine.rounds, 2, reason: '继续之后剩下的包接着解');
+      expect(state.batchRun, isTrue,
+          reason: '暂停可恢复，所以这批照常算是跑过了（不消费快照的是「停止这批」那条路）');
+    });
+
+    t('关掉 errorPause → 不问了，照旧记一条失败接着跑', () async {
+      final engine = brokenFirst();
+      final asked = <String>[];
+      final state = AppState(
+        engine: engine,
+        errorPrompt: (name, reason) async {
+          asked.add(name);
+          return ExtractErrorDecision.pause;
+        },
+      );
+      addTearDown(state.dispose);
+      final toasts = toastTrail(state);
+
+      // 默认是 true，这里显式关掉。
+      state.toggleSetting('errorPause');
+
+      await state.selectFolderPath(twoPacks('as_err_off').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(asked, isEmpty, reason: '关掉了就别再打扰用户');
+      expect(state.paused, isFalse);
+      expect(engine.rounds, 2);
+      expect(toasts.join('\n'), contains('这个包坏了'),
+          reason: '不问不等于不报 —— 得有 toast 兜底');
+    });
+
+    t('没注入 errorPrompt → 与加这个特性之前一致', () async {
+      final engine = brokenFirst();
+      final state = AppState(engine: engine);
+      addTearDown(state.dispose);
+      final toasts = toastTrail(state);
+
+      await state.selectFolderPath(twoPacks('as_err_absent').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(engine.rounds, 2);
+      expect(state.paused, isFalse);
+      expect(state.batchRun, isTrue);
+      expect(toasts.join('\n'), contains('这个包坏了'));
+    });
+
+    t('弹窗没弹成（决断为 null）→ 补一条 toast，既不暂停也不当跳过', () async {
+      // DialogBridge 拿不到 BuildContext 时就是这么返回的。用户什么都没看见，
+      // 那不是他的决定 —— 当暂停会凭空停住整批，当跳过会凭空少一个包。
+      final engine = brokenFirst();
+      final state = AppState(
+        engine: engine,
+        errorPrompt: (name, reason) async => null,
+      );
+      addTearDown(state.dispose);
+      final toasts = toastTrail(state);
+
+      await state.selectFolderPath(twoPacks('as_err_null').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(state.paused, isFalse, reason: '没弹成不该被当成用户选了暂停');
+      expect(engine.rounds, 2, reason: '也不该少解一个包');
+      expect(toasts.join('\n'), contains('这个包坏了'),
+          reason: '没弹成 = 用户什么都没看见，必须给一条提示');
+    });
+
+    t('被闸门拦下时走闸门那条线，**不**落进 errorPause 这条', () async {
+      // 两档的另一边不一样（一个停得回来、一个停不回来），所以是两个回调。
+      // 这条钉的是「别把闸门的异常喂给错误弹窗」—— 那样用户会看到一颗写着
+      // 「暂停任务」的按钮，按下去整批却没了。
+      const breach = LimitBreach(
+        kind: LimitKind.entryCount,
+        tag: '条目数超限',
+        message: '条目太多，已放弃',
+      );
+      final engine = FakeEngine()
+        ..behavior = (e, outDir) async {
+          throw EngineException(breach.message, breach: breach);
+        };
+      final blockedAsked = <String>[];
+      final errorAsked = <String>[];
+      final state = AppState(
+        engine: engine,
+        blockedPrompt: (name, b) async {
+          blockedAsked.add(name);
+          return BlockedDecision.skip;
+        },
+        errorPrompt: (name, reason) async {
+          errorAsked.add(name);
+          return ExtractErrorDecision.skip;
+        },
+      );
+      addTearDown(state.dispose);
+
+      await state.selectFolderPath(twoPacks('as_err_breach').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(blockedAsked, hasLength(2));
+      expect(errorAsked, isEmpty, reason: '闸门的裁决不该落到错误弹窗上');
+    });
+  });
+
+  group('格式识别弹窗（需求 5）', () {
+    // 触发条件是扫描期就算好的 `ArchiveFlag.fakeExtension`，所以这里必须走
+    // 真的扫描器（`FakeEngine` 只换 `extract`，扫描是真的）—— 把一个真 ZIP
+    // 写成 `.pdf`，让扫描器自己把它认出来。
+
+    Directory spoofed(String tag) {
+      final root = tempRoot(tag);
+      put(root, 'fake.pdf', realZip({'x': 'y'}));
+      return root;
+    }
+
+    /// 取某个包那一条解压日志。
+    ///
+    /// **不能用 `logs.single`**：扫描结束时会先记一条 `文件夹（扫描）` 的汇总，
+    /// 它排在这条前面。用 `.single` 会抛 "Too many elements" —— 而且抛在一个
+    /// 看着毫不相干的地方（断言个数的那一行）。
+    LogEntry extractLogFor(AppState state, String fileName) =>
+        state.logs.firstWhere((l) => l.name == fileName,
+            orElse: () => fail('$fileName 没有对应的日志行'));
+
+    t('伪后缀包解压前被问一次，确认 → 照常解', () async {
+      final seen = <FormatDetectInfo>[];
+      final engine = FakeEngine();
+      final state = AppState(
+        engine: engine,
+        formatPrompt: (info) async {
+          seen.add(info);
+          return true;
+        },
+      );
+      addTearDown(state.dispose);
+
+      await state.selectFolderPath(spoofed('as_fmt_ok').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(seen, hasLength(1));
+      expect(seen.single.fileName, 'fake.pdf');
+      expect(seen.single.fakeExt, 'pdf', reason: '声明后缀，弹窗里标红的那一项');
+      expect(seen.single.realFormat, 'ZIP 压缩包');
+      expect(engine.rounds, 1);
+      // 按名字取，不能用 `logs.single` —— 扫描自己也记了一条汇总
+      // （`文件夹（扫描）`），它排在这条前面。
+      expect(extractLogFor(state, 'fake.pdf').tags, contains('伪后缀'));
+    });
+
+    t('取消 → 这个包不进引擎，记一条 skipped，整批照常收尾', () async {
+      final engine = FakeEngine();
+      final state = AppState(
+        engine: engine,
+        formatPrompt: (info) async => false,
+      );
+      addTearDown(state.dispose);
+
+      await state.selectFolderPath(spoofed('as_fmt_cancel').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(engine.rounds, 0, reason: '用户明确不要这个包了');
+      expect(extractLogFor(state, 'fake.pdf').status, LogStatus.skipped,
+          reason: '跳过不是失败 —— 记成红的会让用户以为程序坏了');
+      expect(state.batchRun, isTrue);
+    });
+
+    t('弹窗没弹成（决断为 null）→ 照原样解，绝不静默丢包', () async {
+      // 这条是整组里最要紧的：null 当成 false 的话，弹窗因为拿不到 context
+      // 而没能出现时，用户的压缩包会凭空从批次里消失，且没有任何解释。
+      final engine = FakeEngine();
+      final state = AppState(
+        engine: engine,
+        formatPrompt: (info) async => null,
+      );
+      addTearDown(state.dispose);
+
+      await state.selectFolderPath(spoofed('as_fmt_null').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(engine.rounds, 1, reason: '没问成 = 退回加这个弹窗之前的行为');
+      expect(extractLogFor(state, 'fake.pdf').status, LogStatus.success);
+    });
+
+    t('后缀没被篡改的包一次都不问', () async {
+      // 这条挡的是「一见就弹」。真机上一批 8 个包要是每个都弹一次，用户会
+      // 直接把这个功能关掉 —— 而它本该只在真有蹊跷时出现。
+      //
+      // 所以这里的夹具是**后缀与真实格式对得上**的：`.zip` 里装 ZIP。
+      // 别的都别放进来（比如 `.7z` 里装 ZIP），那种确实该被问，混进这条
+      // 只会让断言变成一句和用例名字无关的话。
+      final root = tempRoot('as_fmt_clean');
+      put(root, 'a.zip', realZip({'x': 'y'}));
+      put(root, 'b.zip', realZip({'x': 'y'}));
+
+      final seen = <String>[];
+      final state = AppState(
+        engine: FakeEngine(),
+        formatPrompt: (info) async {
+          seen.add(info.fileName);
+          return true;
+        },
+      );
+      addTearDown(state.dispose);
+
+      await state.selectFolderPath(root.path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(seen, isEmpty, reason: '两个包的后缀都与真实格式相符，没有什么可通报的');
+    });
+
+    t('FormatDetectInfo：十六进制与前置数据的文案都照格式拼', () {
+      // 弹窗上摆出来的五项里有两项是十六进制、一项带条件后缀，拼错了在界面上
+      // 看着也像对的 —— 所以钉在纯函数上测。
+      final item = ScanItem(
+        entryPath: '/sdcard/dir/fake.pdf',
+        parts: const ['/sdcard/dir/fake.pdf'],
+        sniff: const SniffResult(
+          format: SniffFormat.zip,
+          confidence: SniffConfidence.high,
+          declaredExt: 'pdf',
+          baseOffset: 4096,
+          header: [0x50, 0x4B, 0x03, 0x04],
+        ),
+        sizeBytes: 10,
+        flags: const {ArchiveFlag.fakeExtension},
+        depth: 0,
+      );
+
+      final info = FormatDetectInfo.fromItem(item);
+
+      expect(info.fileName, 'fake.pdf');
+      expect(info.fakeExt, 'pdf');
+      expect(info.fileHeader, '0x504B0304');
+      expect(info.realFormat, 'ZIP 压缩包');
+      expect(info.action, '按 ZIP 压缩包 解压（前面有 4096 字节前置数据）');
+      expect(info.hexPreview, '50 4B 03 04');
+    });
+
+    t('没有前置数据时 action 不带那半句', () {
+      final item = ScanItem(
+        entryPath: '/sdcard/fake.pdf',
+        parts: const ['/sdcard/fake.pdf'],
+        sniff: const SniffResult(
+          format: SniffFormat.zip,
+          confidence: SniffConfidence.high,
+          declaredExt: 'pdf',
+          header: [0x50, 0x4B],
+        ),
+        sizeBytes: 10,
+        flags: const {ArchiveFlag.fakeExtension},
+        depth: 0,
+      );
+
+      expect(FormatDetectInfo.fromItem(item).action, '按 ZIP 压缩包 解压');
     });
   });
 

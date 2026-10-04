@@ -116,10 +116,14 @@ LogEntry buildExtractLog({
     },
     duration: outcome != null ? formatDuration(outcome.elapsed) : '-',
     tags: switch ((outcome, error, skippedReason)) {
+      // 四个 flag 一个都不能漏。`ArchiveFlag` 那边定义了四个，这里少写一个
+      // 不会有任何提示，只会表现成「这类包在日志里看不出区别」—— 扫描页明明
+      // 给 `fake.pdf` 挂了「伪后缀」角标，日志里却与普通包长得一模一样。
       (final o, _, _) when o != null => [
           if (item.isSplit) '分片 ×${item.parts.length}',
           if (item.flags.contains(ArchiveFlag.nested)) '嵌套',
           if (item.flags.contains(ArchiveFlag.encrypted)) '加密',
+          if (item.flags.contains(ArchiveFlag.fakeExtension)) '伪后缀',
           '${o.entryCount} 项',
         ],
       // 三种失败要分得开：

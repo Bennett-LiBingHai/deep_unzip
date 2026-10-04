@@ -2,8 +2,14 @@ import 'package:flutter/material.dart';
 import '../../theme/app_theme.dart';
 import 'bottom_modal.dart';
 
-/// 智能格式识别弹窗
+/// 智能格式识别弹窗。
+///
+/// [fileName] 是**必须**显示的：这个弹窗在一批几十个包的解压途中随时可能弹
+/// 出来，只写「检测到后缀名与真实格式不符」而不说是在说哪个文件，用户根本
+/// 不知道眼前这一下影响的是谁 —— 尤其当他刚点了「开始解压」就去做了别的。
+/// 形状照 `ErrorModal` 那个红框来，只是换成青色（这个不是错误，是个通报）。
 class FormatDetectModal extends StatelessWidget {
+  final String fileName;
   final String fakeExt;
   final String fileHeader;
   final String realFormat;
@@ -14,6 +20,7 @@ class FormatDetectModal extends StatelessWidget {
 
   const FormatDetectModal({
     super.key,
+    required this.fileName,
     required this.fakeExt,
     required this.fileHeader,
     required this.realFormat,
@@ -25,6 +32,7 @@ class FormatDetectModal extends StatelessWidget {
 
   static Future<void> show({
     required BuildContext context,
+    required String fileName,
     required String fakeExt,
     required String fileHeader,
     required String realFormat,
@@ -36,6 +44,7 @@ class FormatDetectModal extends StatelessWidget {
     return showBottomModal(
       context: context,
       child: FormatDetectModal(
+        fileName: fileName,
         fakeExt: fakeExt,
         fileHeader: fileHeader,
         realFormat: realFormat,
@@ -71,7 +80,28 @@ class FormatDetectModal extends StatelessWidget {
                   fontSize: 12,
                   color: AppTheme.textDim,
                   fontFamily: 'monospace')),
-          const SizedBox(height: 18),
+          const SizedBox(height: 12),
+          // 是哪个文件。放在十六进制预览上面，比塞进「声明后缀」那一行好读
+          // —— 那一行是字段表，一行长文件名会把右侧的值挤得没法看。
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: AppTheme.neonCyan.withValues(alpha: 0.06),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(
+                color: AppTheme.neonCyan.withValues(alpha: 0.15),
+              ),
+            ),
+            child: Text(fileName,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                    fontSize: 12,
+                    fontFamily: 'monospace',
+                    color: AppTheme.neonCyan)),
+          ),
+          const SizedBox(height: 14),
           Container(
             width: double.infinity,
             padding: const EdgeInsets.all(10),
