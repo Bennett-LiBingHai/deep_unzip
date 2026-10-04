@@ -421,6 +421,31 @@ void main() {
       expect(outDir, isNot(endsWith('/fake.pdf')));
     });
 
+    t('没有后缀的包：靠占用判定退到 data_1，剥后缀那条路救不了它', () async {
+      final root = tempRoot('as_noext');
+      // 真名就叫 `data`，内容却是 ZIP。`isExtensionSpoofed` 对无后缀刻意返回
+      // false（无后缀不算「被篡改」，见 models.dart），所以阶段 1.5 不会跑，
+      // 推出来的名字还是 `data` —— 跟源文件自己同一个路径。救场的只能是
+      // 「同名**文件**也算占着」那条占用判定。
+      put(root, 'data', realZip({'x': 'y'}));
+
+      final engine = FakeEngine();
+      final state = AppState(engine: engine);
+      addTearDown(state.dispose);
+
+      await state.selectFolderPath(root.path);
+      expect(state.archives, hasLength(1),
+          reason: '前提：无后缀的文件也要靠魔术字节被认出来');
+
+      state.startExtract();
+      await drainExtract(state);
+
+      final outDir = engine.outDirs.single.replaceAll(r'\', '/');
+      expect(outDir, isNot(endsWith('/data')),
+          reason: '输出目录 = 源文件路径，后端建目录会撞上那个文件');
+      expect(outDir, endsWith('/data_1'));
+    });
+
     t('引擎报密码错 → 记失败、标密码未匹配、不中断整批', () async {
       final root = tempRoot('as_pwd');
       put(root, 'a.zip', realZip({'x': 'y'}));
