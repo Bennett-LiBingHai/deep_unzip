@@ -29,13 +29,21 @@ import '../engine/limits.dart';
 import '../models/log_entry.dart';
 import '../models/password_entry.dart';
 
-/// 出厂默认的七个开关。
+/// 出厂默认的六个开关。
 ///
 /// 从 `AppState` 搬到这里，是为了让「默认值」只有一个出处：`AppState` 的
 /// 初值和「第一次启动、磁盘上什么都没有」时必须给出同一套，否则「没存过档」
 /// 和「存过一份默认档」会跑出两种行为，最难查。
 ///
 /// **const，别改它。** 要改的是 `AppState` 里 `Map.of(...)` 出来的那一份。
+///
+/// 没有 `crcCheck`：那颗开关 2026-10 删掉了。它从原型期起就是个死开关
+/// （全仓库只有设置页在读它），但**接上它反而是错的** —— 7-Zip 逐条目比对
+/// CRC32 是解压流程的一部分、顺带算出来的，关掉省不下时间；关了唯一的
+/// 效果是坏文件静默解成乱码、日志还写 success。而且 C ABI
+/// （`duz_extract_all`）根本没有这个参数，要接得改 C++ 重编 `.so`。
+/// CRC 校验的效果一直在：对不上就是 `EngineException`，走的就是那颗
+/// 「跳过 / 停止」弹窗。
 const Map<String, bool> kDefaultToggles = {
   'recursive': true,
   'symmetricOutput': true,
@@ -43,7 +51,6 @@ const Map<String, bool> kDefaultToggles = {
   'splitMerge': true,
   'pwdAutoTry': true,
   'errorPause': true,
-  'crcCheck': true,
 };
 
 /// 深度默认「无限制」。

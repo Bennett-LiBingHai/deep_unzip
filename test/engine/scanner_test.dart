@@ -333,6 +333,10 @@ void main() {
       expect(item.flags, {ArchiveFlag.fakeExtension});
     });
 
+    // 这个开关在设置页上叫「伪后缀时暂停」，控制的只是**问不问**。
+    // 测试名字保留 `detectFakeExtension` 是因为那是字段名 —— 但它不
+    // 「关闭检测」，检测压根关不掉：扫描靠魔术字节认压缩包，关了这个
+    // `发票.pdf` 照样进列表。这条钉的就是这个区别。
     test('关掉 detectFakeExtension → 仍识别格式，但不打标记', () async {
       final root = tempRoot('fakeoff');
       put(root, '发票.pdf', realZip({'a.txt': 'hi'}));

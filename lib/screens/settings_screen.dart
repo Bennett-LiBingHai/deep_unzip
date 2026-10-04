@@ -53,11 +53,16 @@ class SettingsScreen extends StatelessWidget {
             ]),
             const SizedBox(height: 16),
             _group('智能识别', [
+              // 这一颗叫过「后缀篡改检测」，描述写的是「读取文件头魔术字节
+              // 判断真实格式」—— 两句都是原型期写歪的。魔术字节**永远**会读
+              // （扫描就是靠它认出压缩包的），关掉这颗照样认出 `fake.pdf`
+              // 是个 ZIP，只是不问用户。它真正控制的是**问不问**，所以现在
+              // 按它实际做的事命名。
               _settingItem(
                 icon: Icons.description_outlined,
                 iconColor: AppTheme.neonOrange,
-                title: '后缀篡改检测',
-                desc: '读取文件头魔术字节判断真实格式',
+                title: '伪后缀时暂停',
+                desc: '检测到后缀被篡改时先问一句，关闭则直接按真实格式解压',
                 toggle: true,
                 value: state.setting('fakeExtDetect'),
                 onToggle: () => state.toggleSetting('fakeExtDetect'),
@@ -91,15 +96,6 @@ class SettingsScreen extends StatelessWidget {
                 toggle: true,
                 value: state.setting('errorPause'),
                 onToggle: () => state.toggleSetting('errorPause'),
-              ),
-              _settingItem(
-                icon: Icons.check_circle_outline,
-                iconColor: AppTheme.neonGreen,
-                title: 'CRC 校验',
-                desc: '解压后校验文件完整性',
-                toggle: true,
-                value: state.setting('crcCheck'),
-                onToggle: () => state.toggleSetting('crcCheck'),
               ),
             ]),
             const SizedBox(height: 16),

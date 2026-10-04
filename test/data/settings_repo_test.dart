@@ -32,12 +32,12 @@ void main() {
       // 新增开关时老用户的档就长这样：没有新键。缺键即默认是这里唯一的
       // 兼容策略（见 settings_repo 的库注释），不写「版本号 + 迁移」。
       SharedPreferences.setMockInitialValues({
-        'toggle.crcCheck': false, // 只有这一个存过
+        'toggle.splitMerge': false, // 只有这一个存过
       });
 
       final data = await repo.load();
 
-      expect(data.toggles['crcCheck'], isFalse, reason: '存过的要读出来');
+      expect(data.toggles['splitMerge'], isFalse, reason: '存过的要读出来');
       expect(data.toggles['recursive'], isTrue, reason: '没存过的回出厂默认');
       expect(data.toggles.keys, kDefaultToggles.keys,
           reason: '键集必须与出厂表完全一致，不能多也不能少');
@@ -45,7 +45,7 @@ void main() {
   });
 
   group('往返', () {
-    test('七个开关 + 深度 + 自定义阈值原样回来', () async {
+    test('六个开关 + 深度 + 自定义阈值原样回来', () async {
       const saved = SettingsData(
         toggles: {
           'recursive': false,
@@ -54,7 +54,6 @@ void main() {
           'splitMerge': false,
           'pwdAutoTry': false,
           'errorPause': true,
-          'crcCheck': false,
         },
         maxDepth: 10,
         limitPreset: 3, // 3 == kLimitPresets.length，即「自定义」
@@ -153,7 +152,7 @@ void main() {
 
       final prefs = await SharedPreferences.getInstance();
       expect(prefs.getBool('toggle.recursive'), isTrue);
-      expect(prefs.getBool('toggle.crcCheck'), isTrue);
+      expect(prefs.getBool('toggle.errorPause'), isTrue);
       expect(prefs.getInt('maxDepth'), kDefaultMaxDepth);
       expect(prefs.getInt('limitPreset'), kDefaultLimitPreset);
       expect(prefs.getInt('limit.entries'), LimitThresholds.standard.maxEntries);

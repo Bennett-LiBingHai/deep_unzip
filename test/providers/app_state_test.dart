@@ -1602,6 +1602,37 @@ void main() {
       expect(extractLogFor(state, 'fake.pdf').status, LogStatus.success);
     });
 
+    t('关掉「伪后缀时暂停」→ 一次都不问，但**照样按 ZIP 解出来**', () async {
+      // 设置页上那颗开关（key 仍是 `fakeExtDetect`）控制的只是**问不问**，
+      // 不是**认不认**：魔术字节永远会读 —— 扫描就是靠它把 `fake.pdf` 认成
+      // 压缩包的。关掉之后用户要是发现那个 .pdf 压根没被解出来，才是 bug。
+      //
+      // 这条同时钉住了「关掉 = 不打扰」这条对外承诺：一次都不问，包里也没有
+      // 「伪后缀」那个角标（不提这回事），但引擎确实被喂了这一个包。
+      final engine = FakeEngine();
+      final asked = <String>[];
+      final state = AppState(
+        engine: engine,
+        formatPrompt: (info) async {
+          asked.add(info.fileName);
+          return true;
+        },
+      );
+      addTearDown(state.dispose);
+
+      state.toggleSetting('fakeExtDetect'); // true → false，即「伪后缀时暂停」关
+
+      await state.selectFolderPath(spoofed('as_fmt_off').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(asked, isEmpty, reason: '关掉了就别再打扰');
+      expect(engine.rounds, 1, reason: '不打扰 ≠ 不解 —— 它照样得被解出来');
+      expect(extractLogFor(state, 'fake.pdf').status, LogStatus.success);
+      expect(extractLogFor(state, 'fake.pdf').tags, isNot(contains('伪后缀')),
+          reason: '用户说了不要提，日志里也别挂这个角标');
+    });
+
     t('后缀没被篡改的包一次都不问', () async {
       // 这条挡的是「一见就弹」。真机上一批 8 个包要是每个都弹一次，用户会
       // 直接把这个功能关掉 —— 而它本该只在真有蹊跷时出现。
@@ -1781,8 +1812,7 @@ void main() {
               'fakeExtDetect': true,
               'splitMerge': true,
               'pwdAutoTry': true,
-              'errorPause': true,
-              'crcCheck': false,
+              'errorPause': false,
             },
             maxDepth: 10,
             limitPreset: 3,
@@ -1811,7 +1841,7 @@ void main() {
       addTearDown(state.dispose);
 
       expect(state.setting('recursive'), isFalse);
-      expect(state.setting('crcCheck'), isFalse);
+      expect(state.setting('errorPause'), isFalse);
       expect(state.setting('splitMerge'), isTrue);
       expect(state.maxDepth, 10);
       expect(state.limitPreset, 3);
@@ -1856,7 +1886,7 @@ void main() {
       addTearDown(state.dispose);
 
       expect(state.setting('recursive'), isTrue);
-      expect(state.setting('crcCheck'), isTrue);
+      expect(state.setting('errorPause'), isTrue);
     });
 
     t('没注入 store → 一切照出厂默认，不崩', () {
@@ -1907,7 +1937,8 @@ void main() {
 
       expect(store.lastSettings, isNotNull);
       expect(store.lastSettings!.toggles['recursive'], isFalse);
-      expect(store.lastSettings!.toggles['crcCheck'], isTrue, reason: '别的开关要带上');
+      expect(store.lastSettings!.toggles['errorPause'], isTrue,
+          reason: '别的开关要带上');
     });
 
     t('深度 / 档位 / 单项阈值都会落盘', () {

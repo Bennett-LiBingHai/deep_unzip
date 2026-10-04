@@ -294,7 +294,14 @@ class ScanOptions {
     this.pruneDirs = kDefaultPruneDirs,
   });
 
-  /// 是否启用后缀篡改检测（对应设置项 `fakeExtDetect`）。
+  /// 认出的伪后缀包要不要**拦下来问一句**（对应设置项 `fakeExtDetect`，
+  /// 设置页上叫「伪后缀时暂停」）。
+  ///
+  /// 名字里的 "detect" 是历史遗留：魔术字节**永远**会读 —— 扫描就是靠它把
+  /// `fake.pdf` 认成压缩包的，关掉这一项它照样进列表、照样按 ZIP 解。这一项
+  /// 只决定要不要打 [`ArchiveFlag.fakeExtension`]，而那正是解压期弹格式弹窗
+  /// 的触发条件（见 `app_state.dart` 的 `askFormat`）。所以 false = 不打扰，
+  /// 不是不认。
   final bool detectFakeExtension;
 
   /// 是否自动合并分卷（对应设置项 `splitMerge`）。
