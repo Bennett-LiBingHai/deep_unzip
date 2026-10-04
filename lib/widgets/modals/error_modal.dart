@@ -4,11 +4,20 @@ import 'bottom_modal.dart';
 import 'modal_button.dart';
 
 /// 解压错误弹窗 —— 暂停 / 跳过
+///
+/// 两个按钮的**文案可以改**（[pauseLabel] / [skipLabel]），因为同一个弹窗形状
+/// 被两种语义复用：解压途中出错时左边是「暂停任务」（暂停是真能恢复的，
+/// 见 `AppState.pauseExtract`）；而炸弹/空间闸门拦下时左边是「停止这批」
+/// —— 那一档会丢掉剩余队列、**不可恢复**（见 `dialog_bridge.dart` 里那段说明）。
+/// 两种情况共用「左边橙、右边渐变」的排布，但要说的话不一样。回调参数名
+/// 沿用 `onPause`/`onSkip` 不改：改它会牵动所有调用点，而它只描述位置。
 class ErrorModal extends StatelessWidget {
   final String fileName;
   final String reason;
   final VoidCallback onPause;
   final VoidCallback onSkip;
+  final String pauseLabel;
+  final String skipLabel;
 
   const ErrorModal({
     super.key,
@@ -16,6 +25,8 @@ class ErrorModal extends StatelessWidget {
     required this.reason,
     required this.onPause,
     required this.onSkip,
+    this.pauseLabel = '暂停任务',
+    this.skipLabel = '跳过继续',
   });
 
   static Future<void> show({
@@ -24,6 +35,8 @@ class ErrorModal extends StatelessWidget {
     required String reason,
     required VoidCallback onPause,
     required VoidCallback onSkip,
+    String pauseLabel = '暂停任务',
+    String skipLabel = '跳过继续',
   }) {
     return showBottomModal(
       context: context,
@@ -32,6 +45,8 @@ class ErrorModal extends StatelessWidget {
         reason: reason,
         onPause: onPause,
         onSkip: onSkip,
+        pauseLabel: pauseLabel,
+        skipLabel: skipLabel,
       ),
     );
   }
@@ -91,7 +106,7 @@ class ErrorModal extends StatelessWidget {
             children: [
               Expanded(
                 child: ModalButton(
-                  label: '暂停任务',
+                  label: pauseLabel,
                   color: AppTheme.neonOrange,
                   onTap: () {
                     Navigator.pop(context);
@@ -102,7 +117,7 @@ class ErrorModal extends StatelessWidget {
               const SizedBox(width: 10),
               Expanded(
                 child: ModalButton(
-                  label: '跳过继续',
+                  label: skipLabel,
                   gradient: AppTheme.primaryGradient,
                   onTap: () {
                     Navigator.pop(context);

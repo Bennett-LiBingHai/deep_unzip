@@ -48,6 +48,14 @@ class FakeEngine extends EngineController {
   /// 依次收到的 `recursive` 开关，与 [outDirs] 等长同序。
   final List<bool> recursiveSeen = [];
 
+  /// 依次收到的目标卷剩余字节数，与 [outDirs] 等长同序。
+  ///
+  /// `null` = 那一刻没量到（非 Android、通道没注册），空间检查会被跳过。
+  /// 这份记录钉的是「主 isolate 量的数真的随命令流到了引擎」——
+  /// 假引擎整个绕过 `native_backend` 的闸门，闸门那半边只能靠
+  /// `limits_test.dart` 的纯函数用例覆盖。
+  final List<int?> availableBytesSeen = [];
+
   /// 每个包要「解出」的嵌套包。key 是 `outDir`，缺省表示里面没有包。
   ///
   /// 真引擎由 worker 在解完之后扫目录得到这批条目（见 worker.dart 的
@@ -63,12 +71,14 @@ class FakeEngine extends EngineController {
     bool recursive = false,
     ScanOptions options = const ScanOptions(),
     LimitThresholds limits = LimitThresholds.standard,
+    int? availableBytes,
   }) async {
     outDirs.add(outDir);
     partsSeen.add(parts);
     depthsSeen.add(depth);
     recursiveSeen.add(recursive);
     limitsSeen.add(limits);
+    availableBytesSeen.add(availableBytes);
     rounds++;
     await behavior?.call(this, outDir);
     return ExtractOutcome(

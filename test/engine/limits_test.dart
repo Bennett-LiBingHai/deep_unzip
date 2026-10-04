@@ -8,6 +8,7 @@
 /// 而实现里写 `>` 还是 `>=` 是同一行代码的差别。
 library;
 
+import 'package:deep_unzip/engine/format.dart';
 import 'package:deep_unzip/engine/limits.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -158,6 +159,107 @@ void main() {
         )),
         isNull,
       );
+    });
+  });
+
+  group('剩余空间', () {
+    // 这一条与上面四条性质不同：它比的不是「声明值 vs 阈值」，而是
+    // 「声明值 vs 这台机器现在真的有这么多」。所以这里喂的是**剩余字节数**。
+    //
+    // 判据是 `unpackedBytes > availableBytes - kDiskSpaceReserveBytes`，
+    // 也就是「扣掉留底之后还装不装得下」。下面用 `reserve + N` 这种写法把
+    // 留底显式摆出来，免得读者以为验的是「写到一格不剩」。
+
+    test('装得下就放行', () {
+      expect(
+        checkArchiveLimits(
+          profile(unpackedBytes: 1000, largestEntryBytes: 1000),
+          availableBytes: 100 * gib,
+        ),
+        isNull,
+      );
+    });
+
+    test('刚好卡在留底上放行 —— 判据是「扣掉留底之后还有没有余量」', () {
+      // unpacked == available - reserve：写完之后正好剩下一整个留底，够。
+      // 这条与上一条的差别就在边界本身：实现里写 `>` 还是 `>=` 只差这一个字节。
+      expect(
+        checkArchiveLimits(
+          profile(unpackedBytes: 1000, largestEntryBytes: 1000),
+          availableBytes: kDiskSpaceReserveBytes + 1000,
+        ),
+        isNull,
+      );
+    });
+
+    test('再多一个字节就拦 —— 留底不能被吃掉', () {
+      final breach = checkArchiveLimits(
+        profile(unpackedBytes: 1001, largestEntryBytes: 1001),
+        availableBytes: kDiskSpaceReserveBytes + 1000,
+      );
+
+      expect(breach!.kind, LimitKind.diskSpace);
+      expect(breach.tag, '空间不足');
+      // 两头的数都要在文案里：光说「装不下」，用户不知道该删多少
+      expect(breach.message, contains('1001'));
+      expect(breach.message, contains(formatBytes(kDiskSpaceReserveBytes + 1000)));
+    });
+
+    test('availableBytes 为 null 时整条跳过，不瞎判', () {
+      // null 的语义是「量不到」（非 Android / 通道没注册 / 路径不可达），
+      // 不是「剩余 0」。搞混的话每一个包都会被判为装不下。
+      //
+      // 这个 profile 本身得是「什么都不超」的：总量压在默认上限（64 GB）之下，
+      // 否则先被总量那条拦下，就验不出「空间这条跳过了」。
+      expect(
+        checkArchiveLimits(
+          profile(
+            unpackedBytes: 32 * gib,
+            largestEntryBytes: 1,
+            compressedBytes: 32 * gib, // 比值 1:1，别让比值那条先拦
+          ),
+          availableBytes: null,
+        ),
+        isNull,
+      );
+    });
+
+    test('空格子（剩余 0）照样拦 —— 只有 null 才是「不知道」', () {
+      final breach = checkArchiveLimits(
+        profile(unpackedBytes: 1, largestEntryBytes: 1),
+        availableBytes: 0,
+      );
+
+      expect(breach!.kind, LimitKind.diskSpace);
+    });
+
+    test('与比值那条互不依赖：量不到磁盘占用时比值跳过，空间照查', () {
+      // compressedBytes == 0 让比值那条跳过，但空间这条跟它没关系 ——
+      // 它只看 unpackedBytes 与真实剩余。
+      final breach = checkArchiveLimits(
+        profile(
+          unpackedBytes: 10 * gib,
+          largestEntryBytes: 1, // 别让「单文件」那条先拦
+          compressedBytes: 0,
+        ),
+        availableBytes: 1 * gib,
+      );
+
+      expect(breach!.kind, LimitKind.diskSpace);
+    });
+
+    test('空间够但比值离谱 → 报比值（空间那条先被排除）', () {
+      final breach = checkArchiveLimits(
+        profile(
+          entryCount: 1,
+          unpackedBytes: 4 * gib,
+          largestEntryBytes: 4 * gib,
+          compressedBytes: 4 * 1024 * 1024, // 1024:1
+        ),
+        availableBytes: 100 * gib,
+      );
+
+      expect(breach!.kind, LimitKind.ratio);
     });
   });
 

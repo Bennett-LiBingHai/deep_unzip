@@ -284,6 +284,7 @@ class EngineController {
     bool recursive = false,
     ScanOptions options = const ScanOptions(),
     LimitThresholds limits = LimitThresholds.standard,
+    int? availableBytes,
   }) async {
     await _ready.future;
     // 只能在这个 await **之后**检查：dispose 可能刚好在这期间跑完。
@@ -309,6 +310,7 @@ class EngineController {
       recursive: recursive,
       options: options,
       limits: limits,
+      availableBytes: availableBytes,
     ));
 
     return c.future;

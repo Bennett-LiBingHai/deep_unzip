@@ -84,6 +84,7 @@ final class CmdExtract extends WorkerCmd {
     this.recursive = false,
     this.options = const ScanOptions(),
     this.limits = LimitThresholds.standard,
+    this.availableBytes,
   });
 
   final int jobId;
@@ -119,6 +120,16 @@ final class CmdExtract extends WorkerCmd {
   ///
   /// [LimitThresholds] 全是 int，是平凡数据，跨 isolate 送没有问题。
   final LimitThresholds limits;
+
+  /// 目标卷此刻还剩多少字节，由**主 isolate** 量好随命令带过来。
+  ///
+  /// 为什么不让 worker 自己量：`dart:io` 没有查剩余空间的 API，只能走平台通道
+  /// （见 `services/disk_space.dart`），而方法通道要从后台 isolate 调需要额外
+  /// 的 messenger 初始化。主 isolate 顺手量一次最省事。
+  ///
+  /// `null` = 量不到（非 Android、通道没注册、路径不可达）→ **跳过空间检查**，
+  /// 不是「当作 0」。量不出来的东西不能拿来当判据。
+  final int? availableBytes;
 }
 
 /// 请求中止当前任务。**没有对应参数** —— 同一时刻只有一个任务，

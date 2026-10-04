@@ -23,6 +23,7 @@
 /// | [LimitThresholds.maxEntryBytes] | 单条声明成几 GiB 的那种 |
 /// | [LimitThresholds.maxTotalBytes] | 声明总量，兜底硬顶 |
 /// | [LimitThresholds.maxRatio] | 「小得离谱却撑得极大」的形态 |
+/// | [checkArchiveLimits] 的 `availableBytes` | 目标卷真的装不下 |
 ///
 /// 前三条是**精确**的，不会有误伤：声明值就是要写出去的字节数，7-Zip 解压时
 /// 还会逐条按声明校验，对不上就报错。
@@ -32,6 +33,13 @@
 /// 包，比值 1500:1 也照样无害（最多写 300 MB），而不到 1 GiB 的东西本来就
 /// 不构成「撑爆磁盘」这个威胁。地板把误伤面收窄到「又大又空」这一种形态，
 /// 那基本就是炸弹了。
+///
+/// ## 为什么还要量剩余空间 —— 上面四条全是**估算**
+///
+/// 四条挡的都是「归档**自己声明**的大小」。声明可以低报，嵌套还能把「一个包
+/// 太大」（拦得住）变成「N 个包各自都不大」（全放行）。真正不受估算影响的
+/// 上限只有一个：**目标卷此刻还剩多少字节**。这条同时兜住嵌套、兜住批量、
+/// 兜住低报，代价只是一次平台调用。
 ///
 /// ## 这里**没有**做的一件事
 ///
@@ -258,9 +266,22 @@ enum LimitKind {
   /// 总量太大。
   totalSize,
 
+  /// 目标卷装不下。**唯一一条不是拿声明值跟自己比的判定。**
+  diskSpace,
+
   /// 比值离谱。
   ratio,
 }
+
+/// 空间检查要留的底。
+///
+/// 不留的话，判定就成了「写到一格不剩才算超」—— 而把卷写满会把整台机器拖垮
+/// （系统自己也要写日志、写缓存），而且解压本身还要临时空间。64 MiB 是随手
+/// 定的保守值：它远小于任何一次正常解压的量级，只在「刚好卡在边界」时起作用。
+///
+/// 和 [LimitThresholds.ratioFloorBytes] 一样**不放进 [LimitField]**：它是个
+/// 内部护栏，摆到设置页只会多一个没人看得懂的旋钮。
+const int kDiskSpaceReserveBytes = 64 << 20;
 
 /// 一次拒绝。没有触发时 [checkArchiveLimits] 返回 null。
 class LimitBreach {
@@ -282,10 +303,17 @@ class LimitBreach {
 /// 放行还是拦下。拦下时返回原因，放行返回 null。
 ///
 /// 判定顺序是**从便宜到贵**，也是从确定到启发式：先数条目（O(1)，调用方
-/// 早就算好了），再看单条，再看总量，最后才轮到需要量磁盘的比值。
+/// 早就算好了），再看单条，再看总量，再看目标卷装不装得下，最后才轮到
+/// 启发式的比值。
+///
+/// [availableBytes] 是目标卷此刻的剩余字节数。**`null` 表示量不到**（非
+/// Android、通道没注册、路径不可达），此时**跳过这条检查** —— 与
+/// [ArchiveProfile.compressedBytes] 为 0 时跳过比值是同一条原则：量不出来的
+/// 东西不能拿来当判据。
 LimitBreach? checkArchiveLimits(
   ArchiveProfile p, {
   LimitThresholds limits = LimitThresholds.standard,
+  int? availableBytes,
 }) {
   if (p.entryCount > limits.maxEntries) {
     return LimitBreach(
@@ -311,6 +339,23 @@ LimitBreach? checkArchiveLimits(
       tag: '炸弹防护',
       message: '解压后共 ${formatBytes(p.unpackedBytes)}，'
           '超过上限 ${formatBytes(limits.maxTotalBytes)}，已放弃',
+    );
+  }
+
+  // 剩余空间。排在这儿的理由与上面三条不同：它比的不是「声明值 vs 阈值」，
+  // 而是「声明值 vs 这台机器现在真的有这么多」。所以它**不该**被上面三条
+  // 短路 —— 一个既超了单文件上限、又装不下的包，先报「超过单文件上限」
+  // 更有指向性（那是包的问题），而「装不下」可能只是这台机器的事。
+  //
+  // 减掉 [kDiskSpaceReserveBytes] 见那个常量的说明：判据是「留够底之后还
+  // 装不装得下」，不是「能不能写到一格不剩」。
+  if (availableBytes != null &&
+      p.unpackedBytes > availableBytes - kDiskSpaceReserveBytes) {
+    return LimitBreach(
+      kind: LimitKind.diskSpace,
+      tag: '空间不足',
+      message: '解压后需要 ${formatBytes(p.unpackedBytes)}，'
+          '设备只剩 ${formatBytes(availableBytes)}，装不下，已放弃',
     );
   }
 

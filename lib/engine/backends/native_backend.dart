@@ -73,6 +73,9 @@ ArchivePeek peekArchive(List<String> parts, {String? password}) {
 /// [shouldCancel] 每次报进度时问一次，返回 true 即中止并抛 [EngineException]。
 /// **注意它同步执行在同一线程上**，所以实现必须是纯内存判断 —— 在这里 await
 /// 什么或者等另一个 isolate 回消息，会把解压卡死。
+///
+/// [availableBytes] 是目标卷的剩余字节数，由主 isolate 量好传进来（这一层
+/// 跑在 worker isolate，够不着平台通道）。`null` = 量不到 → 跳过空间检查。
 ExtractOutcome extractArchive({
   required List<String> parts,
   required String outDir,
@@ -80,6 +83,7 @@ ExtractOutcome extractArchive({
   void Function(ExtractTick tick)? onTick,
   bool Function()? shouldCancel,
   LimitThresholds limits = LimitThresholds.standard,
+  int? availableBytes,
 }) {
   // 顺序是刻意的：**先开归档、过闸门，再建输出目录**。
   //
@@ -92,6 +96,7 @@ ExtractOutcome extractArchive({
     final breach = checkArchiveLimits(
       _profileOf(a, parts),
       limits: limits,
+      availableBytes: availableBytes,
     );
     if (breach != null) {
       // 抛的是 EngineException 而不是原生码：这条判定整个住在 Dart 侧，

@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'app_navigator.dart';
 import 'theme/app_theme.dart';
 import 'providers/app_state.dart';
+import 'services/dialog_bridge.dart';
 import 'screens/home_screen.dart';
 import 'screens/vault_screen.dart';
 import 'screens/log_screen.dart';
@@ -38,7 +39,13 @@ class MainShell extends StatefulWidget {
 }
 
 class _MainShellState extends State<MainShell> {
-  final AppState _state = AppState();
+  // `blockedPrompt` 是「被炸弹/空间闸门拦下时弹窗问用户」的那条线。不接的话
+  // 行为退回成只记日志 + toast —— 引擎照跑，但用户看不到选择（见 app_state 里
+  // _onBlocked 为 null 的分支）。AppState 本身不 import material，
+  // 实现放在 dialog_bridge 里，这条注入就是那道边界的接缝。
+  final AppState _state = AppState(
+    blockedPrompt: const DialogBridge().askArchiveBlocked,
+  );
   int _currentIndex = 0;
 
   late final List<Widget> _screens;

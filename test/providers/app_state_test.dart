@@ -10,6 +10,8 @@ import 'package:deep_unzip/models/archive_file.dart';
 import 'package:deep_unzip/models/extractor.dart';
 import 'package:deep_unzip/models/log_entry.dart';
 import 'package:deep_unzip/providers/app_state.dart';
+import 'package:deep_unzip/services/blocked_prompt.dart';
+import 'package:deep_unzip/services/disk_space.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
 
@@ -1093,6 +1095,205 @@ void main() {
   /// 有任何一个包失败它就是 false。而重跑的危害与成败无关 —— 输出目录重名会
   /// 追加 `_1`/`_2`（见 output_paths.dart），再点一次不是「重新解一遍」而是
   /// 往磁盘里撒重复目录。所以闸门必须挂在「跑过」而不是「成功」上。
+  group('被拦弹窗与剩余空间', () {
+    // 这一组盯的是「闸门之后」那条新加的链：EngineException.breach → 问用户
+    // → 用户的决断怎么影响整批。闸门本身住在 native_backend 里（假引擎整个
+    // 绕过它），所以这里手动抛同形状的异常，测的是上层。
+
+    const breach = LimitBreach(
+      kind: LimitKind.diskSpace,
+      tag: '空间不足',
+      message: '解压后需要 12.0 GB，设备只剩 3.2 GB，装不下，已放弃',
+    );
+
+    /// 记下每次被问到的 (文件名, 原因)。
+    final asked = <({String name, LimitBreach breach})>[];
+
+    setUp(asked.clear);
+
+    /// 只拦第一个包，第二个照常成功 —— 这样「继续」与「停下」的差别才看得出来。
+    FakeEngine gatedEngine() => FakeEngine()
+      ..behavior = (e, outDir) async {
+        if (e.rounds == 1) {
+          throw EngineException(breach.message, breach: breach);
+        }
+      };
+
+    /// 记下这批里出现过的每一条 toast。
+    ///
+    /// **不能直接读 `state.toastMsg`**：批次收尾时那条汇总（`N 个压缩包 · 耗时
+    /// …`）会把逐包的 warn 顶掉（既有用例里已经踩过这一点）。而这里要验的
+    /// 正是那条**逐包**的兜底提示，它只在下一次 notify 之前是可见的。
+    List<String> toastTrail(AppState state) {
+      final seen = <String>[];
+      state.addListener(() {
+        final msg = state.toastMsg;
+        if (msg != null && (seen.isEmpty || seen.last != msg)) seen.add(msg);
+      });
+      return seen;
+    }
+
+    /// 两个包，够看出整批是不是还在跑。
+    Directory twoPacks(String tag) {
+      final root = tempRoot(tag);
+      put(root, 'a.zip', realZip({'x': 'y'}));
+      put(root, 'b.zip', realZip({'x': 'y'}));
+      return root;
+    }
+
+    t('跳过 → 只放弃这一个包，整批继续', () async {
+      final engine = gatedEngine();
+      final state = AppState(
+        engine: engine,
+        blockedPrompt: (name, b) async {
+          asked.add((name: name, breach: b));
+          return BlockedDecision.skip;
+        },
+      );
+      addTearDown(state.dispose);
+
+      await state.selectFolderPath(twoPacks('as_prompt_skip').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(asked.single.name, 'a.zip');
+      expect(asked.single.breach.kind, LimitKind.diskSpace,
+          reason: '弹窗要拿到完整的 breach，否则正文没法写');
+      expect(engine.rounds, 2, reason: '跳过 ≠ 停批');
+      final byName = {for (final l in state.logs) l.name: l};
+      expect(byName['a.zip']!.tags, contains('空间不足'));
+      expect(byName['b.zip']!.status, LogStatus.success);
+      expect(state.batchRun, isTrue, reason: '跑完的批次照常消费快照');
+    });
+
+    t('停下这批 → 剩余任务一个都不跑，且不消费批次闸门', () async {
+      final engine = gatedEngine();
+      final state = AppState(
+        engine: engine,
+        blockedPrompt: (name, b) async => BlockedDecision.stop,
+      );
+      addTearDown(state.dispose);
+
+      await state.selectFolderPath(twoPacks('as_prompt_stop').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(engine.rounds, 1, reason: '停了就不该接着解 b.zip');
+      expect(state.extracting, isFalse);
+      expect(state.completed, isFalse);
+      expect(state.batchRun, isFalse,
+          reason: '剩下的包还等着解，主按钮必须能再点（收尾注释里那条代价）');
+      expect(state.completeDetail, contains('已中止'));
+    });
+
+    t('弹窗没弹成（决断为 null）→ 按没问处理，整批继续', () async {
+      // DialogBridge 拿不到 BuildContext 时就是这么返回的。那不是用户的
+      // 决定，用户什么都没看见 —— 既不能当停下，也不能当跳过，得补一条 toast。
+      final engine = gatedEngine();
+      final state = AppState(
+        engine: engine,
+        blockedPrompt: (name, b) async => null,
+      );
+      addTearDown(state.dispose);
+      final toasts = toastTrail(state);
+
+      await state.selectFolderPath(twoPacks('as_prompt_null').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(engine.rounds, 2);
+      expect(state.batchRun, isTrue);
+      // 兜底 toast 用的是 breach.message（tag 是给日志用的，不在这条文案里）。
+      expect(toasts.join('\n'), contains('装不下'),
+          reason: '没弹成 = 用户什么都没看见，必须给一条提示');
+    });
+
+    t('普通失败（没有 breach）不弹窗', () async {
+      // 损坏、密码不匹配这些没有第二选择，弹一次窗只是多要用户点一下。
+      final root = tempRoot('as_prompt_plain');
+      put(root, 'a.zip', realZip({'x': 'y'}));
+
+      final engine = FakeEngine()
+        ..behavior = (e, outDir) async {
+          throw const EngineException('坏了', code: DuzErrorCode.extract);
+        };
+      final state = AppState(
+        engine: engine,
+        blockedPrompt: (name, b) async {
+          asked.add((name: name, breach: b));
+          return BlockedDecision.skip;
+        },
+      );
+      addTearDown(state.dispose);
+      final toasts = toastTrail(state);
+
+      await state.selectFolderPath(root.path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(asked, isEmpty);
+      expect(toasts.join('\n'), contains('坏了'), reason: '没弹窗就得有 toast 兜底');
+    });
+
+    t('没注入 prompt → 与没有这个特性时逐字节一致', () async {
+      final engine = gatedEngine();
+      final state = AppState(engine: engine);
+      addTearDown(state.dispose);
+      final toasts = toastTrail(state);
+
+      await state.selectFolderPath(twoPacks('as_prompt_absent').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(engine.rounds, 2, reason: '没人可问，就照旧记日志继续');
+      expect(state.batchRun, isTrue);
+      expect(toasts.join('\n'), contains('装不下'));
+    });
+
+    t('探针量到的剩余空间真的随每一条命令到了引擎', () async {
+      final engine = FakeEngine();
+      final probe = _StubProbe(12345);
+      final state = AppState(engine: engine, diskSpace: probe);
+      addTearDown(state.dispose);
+
+      await state.selectFolderPath(twoPacks('as_space_wire').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(probe.paths, everyElement(state.folderPath),
+          reason: '量的是选中根：对称输出与非对称输出都在它之下、同一个卷');
+      expect(engine.availableBytesSeen, [12345, 12345],
+          reason: '每个任务量一次 —— 空间在缩，一批里只量一次会后半程失真');
+    });
+
+    t('探针量不到 → 传 null（跳过检查），不是 0', () async {
+      final engine = FakeEngine();
+      final state = AppState(engine: engine, diskSpace: _StubProbe(null));
+      addTearDown(state.dispose);
+
+      await state.selectFolderPath(twoPacks('as_space_null').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(engine.availableBytesSeen, [null, null],
+          reason: '0 会被判成「一格不剩」，每一个包都被拒绝');
+    });
+
+    t('默认探针在非 Android 宿主上不报错，一路 null 到底', () async {
+      // flutter test 跑在 Windows 上，Platform.isAndroid 为 false，
+      // 探针直接短路返回 null，压根不发通道消息。
+      final engine = FakeEngine();
+      final state = AppState(engine: engine);
+      addTearDown(state.dispose);
+
+      await state.selectFolderPath(twoPacks('as_space_default').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(engine.availableBytesSeen, [null, null]);
+    });
+  });
+
   group('批次用尽（batchRun）', () {
     t('跑完一批 → batchRun 为真、completed 为真', () async {
       final root = tempRoot('as_batchrun_ok');
@@ -1189,4 +1390,25 @@ void main() {
 
 // 假引擎定义在 `test/support/fake_engine.dart` —— 首页那组 widget 测试也要用，
 // 所以不能是本文件的私有类。
+
+/// 固定返回一个数的空间探针，顺带记下被问过哪些路径。
+///
+/// 继承而不是走真通道：`DiskSpaceProbe` 的默认实现依赖 `Platform.isAndroid`
+/// 与 `MethodChannel`，前者在 Windows 宿主上是 false、后者要
+/// `TestDefaultBinaryMessengerBinding` 才有响应。这里要验的是「AppState 把这
+/// 个数原样交给引擎」，通道那头另有 `disk_space_test.dart` 管。
+class _StubProbe extends DiskSpaceProbe {
+  _StubProbe(this.answer);
+
+  /// 要返回的数；`null` 表示量不到。
+  final int? answer;
+
+  final List<String> paths = [];
+
+  @override
+  Future<int?> availableBytes(String path) async {
+    paths.add(path);
+    return answer;
+  }
+}
 

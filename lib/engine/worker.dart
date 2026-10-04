@@ -153,6 +153,7 @@ class _WorkerState {
         outDir: cmd.outDir,
         password: cmd.password,
         limits: cmd.limits,
+        availableBytes: cmd.availableBytes,
         onTick: (tick) {
           if (!merger.shouldEmit(clock.elapsed)) return;
           toMain.send(EvExtractTick(jobId: cmd.jobId, tick: tick));

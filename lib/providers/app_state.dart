@@ -22,6 +22,8 @@ import '../models/archive_file.dart';
 import '../models/extractor.dart';
 import '../models/log_entry.dart';
 import '../models/password_entry.dart';
+import '../services/blocked_prompt.dart';
+import '../services/disk_space.dart';
 
 /// 全局应用状态。
 ///
@@ -43,10 +45,35 @@ import '../models/password_entry.dart';
 /// - `engine/` 里没有 `package:flutter`，所以引擎能跑在 isolate 里；
 ///   这一层是唯一允许把两者接起来的地方。
 class AppState extends ChangeNotifier {
-  AppState({EngineController? engine}) : _injectedEngine = engine;
+  // 参数名故意与字段名（`_onBlocked`）**不止差一个下划线**：Dart 不允许私有
+  // 具名参数，所以 `this._onBlocked` 这种初始化形参在这里根本写不出来，
+  // 而 `prefer_initializing_formals` 只比对「去掉下划线之后是否同名」——
+  // 叫 `onBlocked` 会换来一条改不掉的假警告。叫 `blockedPrompt` 就绕开了。
+  AppState({
+    EngineController? engine,
+    DiskSpaceProbe? diskSpace,
+    ArchiveBlockedPrompt? blockedPrompt,
+  })  : _injectedEngine = engine,
+        _diskSpace = diskSpace ?? DiskSpaceProbe(),
+        _onBlocked = blockedPrompt;
 
   final EngineController? _injectedEngine;
   EngineController? _engine;
+
+  /// 量目标卷剩余空间。走平台通道，所以要**在主 isolate** 上调用 ——
+  /// `extractArchive` 跑在 worker isolate 里，够不着通道（见 `protocol.dart`
+  /// 的 `CmdExtract.availableBytes`）。
+  final DiskSpaceProbe _diskSpace;
+
+  /// 被炸弹/空间闸门拦下时问用户一句话。
+  ///
+  /// 为 null 时行为与没有这个特性时**逐字节一致**：只记日志 + toast，不弹窗。
+  /// 单元测试默认就是这一档 —— 真弹窗要 `MaterialApp` 挂上 `AppNavigator.key`，
+  /// 那是 widget 测试的事（见 `test/services/dialog_bridge_test.dart`）。
+  ///
+  /// 类型是纯 Dart 的（见 `services/blocked_prompt.dart`），所以这一层不必
+  /// import 任何 widget，`app_state.dart:43` 那条边界不破。
+  final ArchiveBlockedPrompt? _onBlocked;
 
   // 文件夹
   bool _folderSelected = false;
@@ -680,6 +707,20 @@ class AppState extends ChangeNotifier {
           item.entryPath,
           spoofedExtension: item.sniff.isExtensionSpoofed,
         );
+
+        // 剩余空间只能在这层量（主 isolate）—— worker 那边够不着平台通道，
+        // 所以量好随命令带过去，见 `CmdExtract.availableBytes`。
+        //
+        // **每个任务量一次**而不是每批一次：空间在缩，一批几百个包的时候，
+        // 开头那个数到后半程早就作废了，会放行一个其实装不下的包。
+        //
+        // 量的是选中根目录。对称输出写回源目录旁、非对称写进
+        // `<root>/_extracted/`，两者都在根之下、同一个卷，量根就够。
+        //
+        // 量不到（null）时 worker 会跳过这条检查 —— 不当成 0。见
+        // `disk_space.dart` 里为什么这两者绝不能混。
+        final availableBytes = await _diskSpace.availableBytes(_folderPath);
+
         try {
           final outcome = await engine.extract(
             parts: item.parts,
@@ -688,6 +729,7 @@ class AppState extends ChangeNotifier {
             recursive: recursive,
             options: options,
             limits: limits,
+            availableBytes: availableBytes,
           );
           _doneCount++;
           _addLog(buildExtractLog(
@@ -708,14 +750,36 @@ class AppState extends ChangeNotifier {
         } on EngineException catch (e) {
           failed++;
           _doneCount++;
-          // 走到这里说明这个包整个没解开。P3 会在这里弹「暂停/跳过」，
-          // 现在先如实记一条失败并继续下一个 —— 一个坏包不该让整批停下。
+          // 走到这里说明这个包整个没解开。一个坏包不该让整批停下 ——
+          // 先如实记一条失败，再决定要不要问用户。
           _addLog(buildExtractLog(
             item: item,
             error: e,
             now: DateTime.now(),
           ));
-          showToast('${item.fileName}：${e.message}', type: 'warn');
+
+          // **只有被闸门拦下的才问**（炸弹 / 装不下）。普通损坏、密码不匹配
+          // 这些没有第二选择，弹一次窗只是多要用户点一下。
+          final breach = e.breach;
+          final ask = _onBlocked;
+          // 弹窗真的弹出来了就不再补 toast —— 那句话用户刚在弹窗里看过。
+          var shown = false;
+          if (breach != null && ask != null) {
+            final decision = await ask(item.fileName, breach);
+            if (decision == BlockedDecision.stop) {
+              // 复用 `_cancelRequested`：收尾那块已经按它算 `cancelled`，
+              // 于是文案换成「已中止」，而且**不消费**这批快照（见 finally）
+              // —— 剩下的包还等着解，主按钮必须能再点。
+              _cancelRequested = true;
+              break;
+            }
+            // null = 弹窗没弹成（拿不到 BuildContext）。那不是用户的决定，
+            // 用户什么都没看到，得补一条 toast 兜底。
+            shown = decision != null;
+          }
+          if (!shown) {
+            showToast('${item.fileName}：${e.message}', type: 'warn');
+          }
         }
         _notify();
       }
@@ -735,9 +799,17 @@ class AppState extends ChangeNotifier {
       // 嵌套包也是这一批的活儿，只算开头那 8 个的话，收尾会出现
       // 「已解 12 个 / 共 8 个」这种自相矛盾的文案。
       _completed = !cancelled && failed < _batchTotal;
-      // 无论成败，这份扫描快照都用掉了 —— 界面据此把主按钮换成「换个文件夹」，
-      // 而不是留着「开始智能解压」等着被再点一次（见 [_batchRun]）。
-      _batchRun = true;
+      // 跑完的（无论成败）都算这份快照用掉了 —— 界面据此把主按钮换成
+      // 「换个文件夹」，而不是留着「开始智能解压」等着被再点一次（见
+      // [_batchRun]）。
+      //
+      // **中止是例外**：用户在半路按了「停止这批」，队列里剩下的包一个都
+      // 没解。这时候还锁住快照，就等于把人困在「剩下的包解不了、也重跑不了」
+      // 的死角里。放开它，主按钮回到「开始智能解压」。
+      //
+      // 代价要说清楚：重跑会把**已经解好的**再解一遍，输出目录重名时撒出
+      // `_1`/`_2` 的重复目录。真正的续传要等 journal（条目 3）。
+      _batchRun = !cancelled;
       final elapsed = _batchStart == null
           ? Duration.zero
           : DateTime.now().difference(_batchStart!);

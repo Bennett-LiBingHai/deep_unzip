@@ -5,6 +5,7 @@ import android.content.ComponentName
 import android.content.Intent
 import android.net.Uri
 import android.os.Environment
+import android.os.StatFs
 import android.provider.DocumentsContract
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -109,6 +110,8 @@ class MainActivity : FlutterActivity() {
                     // 弹窗和 startActivity 都要主线程，方法通道默认就在主线程回调。
                     "openFolderInFileManager" ->
                         result.success(openFolderInFileManager(call.argument<String>("path")))
+                    "freeSpace" ->
+                        result.success(freeSpace(call.argument<String>("path")))
                     else -> result.notImplemented()
                 }
             }
@@ -246,6 +249,43 @@ class MainActivity : FlutterActivity() {
             return DocumentsContract.buildDocumentUri(EXTERNAL_STORAGE_AUTHORITY, docId)
         }
         return null
+    }
+
+    /**
+     * [path] 所在卷还剩多少字节；量不到回 null。
+     *
+     * ## 为什么路径可能还不存在
+     *
+     * 调用它的是炸弹/空间闸门，那道闸门**刻意排在建输出目录之前** —— 被拒的包
+     * 不该在磁盘上留下一个空目录。所以 [path] 经常是个还不存在的路径，
+     * `StatFs` 对它要么抛异常要么给出垃圾。这里向上找**最近的已存在祖先**再量：
+     * 同一个卷，答案一样。
+     *
+     * 也不能退回 `getExternalStorageDirectory()` 了事 —— 那在可移动卷上会
+     * 量错卷，而「还剩 60 GB」和「还剩 0 GB」是两个相反的结论。
+     *
+     * 回 null 而不是 0：Dart 侧把 null 当「不知道」并跳过检查，把 0 当
+     * 「一格不剩」并拒绝每一个包。这两者搞混是灾难性的。
+     */
+    private fun freeSpace(path: String?): Long? {
+        if (path.isNullOrEmpty()) return null
+
+        // 向上找到第一个真实存在的祖先。循环上限 64 层，防「路径本身就是坏的」
+        // 时一路爬到根 —— 正常路径三四层就到了。
+        var probe: File? = File(path)
+        var hops = 0
+        while (probe != null && !probe.exists() && hops < 64) {
+            probe = probe.parentFile
+            hops++
+        }
+        val target = probe ?: return null
+
+        return try {
+            StatFs(target.path).availableBytes
+        } catch (e: IllegalArgumentException) {
+            // 路径不是文件系统上的真实位置（比如空串、或某些 ROM 上的怪路径）。
+            null
+        }
     }
 
     /**
