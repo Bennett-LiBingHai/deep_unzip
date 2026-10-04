@@ -152,6 +152,7 @@ class _WorkerState {
         parts: cmd.parts,
         outDir: cmd.outDir,
         password: cmd.password,
+        limits: cmd.limits,
         onTick: (tick) {
           if (!merger.shouldEmit(clock.elapsed)) return;
           toMain.send(EvExtractTick(jobId: cmd.jobId, tick: tick));
@@ -184,6 +185,8 @@ class _WorkerState {
         message: '解压失败：${_describe(e)}',
         detail: st.toString(),
         code: e is EngineException ? e.code : null,
+        // 炸弹裁决也跨过去：主 isolate 要凭它区分「包坏了」和「是炸弹」。
+        breach: e is EngineException ? e.breach : null,
       ));
     } finally {
       _busy = false;

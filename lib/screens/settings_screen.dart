@@ -2,10 +2,12 @@ import 'package:flutter/material.dart';
 
 import '../theme/app_theme.dart';
 import '../providers/app_state.dart';
+import '../engine/limits.dart';
 import '../models/extractor.dart';
 import '../widgets/glass_card.dart';
 import '../widgets/custom_button.dart';
 import '../widgets/modals/add_extractor_modal.dart';
+import '../widgets/modals/limit_value_modal.dart';
 
 /// 设置页面
 class SettingsScreen extends StatelessWidget {
@@ -100,6 +102,8 @@ class SettingsScreen extends StatelessWidget {
                 onToggle: () => state.toggleSetting('crcCheck'),
               ),
             ]),
+            const SizedBox(height: 16),
+            _buildLimitsSection(context),
             const SizedBox(height: 16),
             _buildExtractorSection(context),
             const SizedBox(height: 20),
@@ -225,27 +229,115 @@ class SettingsScreen extends StatelessWidget {
   }
 
   Widget _depthSelector() {
+    // `indexOf` 给出 -1 时（读回来的值不在表里）会取到 `opts[-1]` 直接抛异常
+    // 把设置页打崩 —— 收口在这里，与计划里那条「加载时把 maxDepth 收敛到
+    // {0,5,10,20}」是同一件事的两道防线。
     const opts = ['∞ 无限制', '5 层', '10 层', '20 层'];
     final idx = [0, 5, 10, 20].indexOf(state.maxDepth);
-    return GestureDetector(
+    return _cyclerChip(
+      label: opts[idx < 0 ? 0 : idx],
+      color: AppTheme.neonCyan,
       onTap: () => state.cycleMaxDepth(),
+    );
+  }
+
+  /// 点一下切下一档的 chip。深度和炸弹防护档位共用，免得两处样式各走各的。
+  Widget _cyclerChip({
+    required String label,
+    required Color color,
+    required VoidCallback onTap,
+  }) {
+    return GestureDetector(
+      onTap: onTap,
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
         decoration: BoxDecoration(
-          color: AppTheme.neonCyan.withValues(alpha: 0.08),
+          color: color.withValues(alpha: 0.08),
           borderRadius: BorderRadius.circular(6),
-          border: Border.all(color: AppTheme.neonCyan.withValues(alpha: 0.15)),
+          border: Border.all(color: color.withValues(alpha: 0.15)),
         ),
         child: Text(
-          opts[idx],
-          style: const TextStyle(
+          label,
+          style: TextStyle(
             fontSize: 12,
             fontFamily: 'monospace',
-            color: AppTheme.neonCyan,
+            color: color,
           ),
         ),
       ),
     );
+  }
+
+  /// 炸弹防护。一个 chip 选档位，选到「自定义」才展开成逐项数值。
+  ///
+  /// 展开与否只认 [AppState.limitsCustom]（即 chip 停在「自定义」那一档），
+  /// **不**去看「当前值是不是等于某个预设」—— 后者会让用户在编辑途中被
+  /// 弹出编辑器（把某项改回预设值的一瞬间四行就收起来了）。
+  Widget _buildLimitsSection(BuildContext context) {
+    return _group('炸弹防护', [
+      _settingItem(
+        icon: Icons.shield_outlined,
+        iconColor: AppTheme.neonPurple,
+        title: '解压上限',
+        desc: '超限就放弃这个包，避免压缩炸弹撑爆磁盘',
+        trailing: _cyclerChip(
+          label: state.limitPresetLabel,
+          color: AppTheme.neonPurple,
+          onTap: () => state.cycleLimitPreset(),
+        ),
+      ),
+      if (state.limitsCustom)
+        for (final field in LimitField.values) _limitRow(context, field),
+    ]);
+  }
+
+  /// 「自定义」里的一行：左边名字，右边当前值，点开改。
+  Widget _limitRow(BuildContext context, LimitField field) {
+    return GestureDetector(
+      onTap: () => _editLimit(context, field),
+      child: Container(
+        // 缩进一格，视觉上挂在「解压上限」那一项底下。
+        padding: const EdgeInsets.fromLTRB(60, 11, 16, 11),
+        decoration: BoxDecoration(
+          color: AppTheme.glass,
+          border: Border(
+            bottom: BorderSide(color: Colors.white.withValues(alpha: 0.03)),
+          ),
+        ),
+        child: Row(
+          children: [
+            Expanded(
+              child: Text(
+                field.label,
+                style: const TextStyle(
+                  fontSize: 12,
+                  color: AppTheme.textSecondary,
+                ),
+              ),
+            ),
+            Text(
+              field.display(state.limits),
+              style: const TextStyle(
+                fontSize: 12,
+                fontFamily: 'monospace',
+                color: AppTheme.neonPurple,
+              ),
+            ),
+            const SizedBox(width: 6),
+            const Icon(Icons.edit_outlined, size: 12, color: AppTheme.textDim),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _editLimit(BuildContext context, LimitField field) async {
+    final value = await LimitValueModal.show(
+      context: context,
+      field: field,
+      current: state.limits,
+    );
+    if (value != null) state.setLimit(field, value);
   }
 
   Widget _buildExtractorSection(BuildContext context) {

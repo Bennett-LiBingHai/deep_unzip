@@ -36,6 +36,58 @@ String formatBytes(int bytes) {
   return '$text ${_kUnits[u]}';
 }
 
+/// [formatBytes] 的逆运算：`8GB` / `8 GB` / `512mb` / `1.5 TB` → 字节数。
+///
+/// **裸数字按字节算**（`1024` → 1024）。这是个刻意的选择：设置页输入框预填的
+/// 就是 `formatBytes` 的输出（`8 GB`），用户改的是数字、单位原样留着，所以
+/// 「只敲数字」只会发生在真的想给字节数的时候。输入框旁边有实时预览把解析结果
+/// 回显出来（`= 8.00 GB`），歧义当场可见。
+///
+/// 认不出来就返回 **null**，不猜、不兜底。调用方据此把「确定」置灰 —— 一个
+/// 悄悄兜成默认值的解析器，会让用户以为自己改成功了。
+///
+/// **0 也算不合法**（与 [parseCount] 一致）：阈值是「允许到多少」，填 0 等于
+/// 什么都不许解，那不可能是用户的本意。
+int? parseSize(String text) {
+  final m = RegExp(r'^(\d+(?:\.\d+)?)\s*(b|kb|mb|gb|tb|pb)?$')
+      .firstMatch(_normalizeNumber(text));
+  if (m == null) return null;
+
+  final n = double.tryParse(m.group(1)!);
+  if (n == null || n < 0) return null;
+
+  // `_kUnits` 是大写的，而上面把输入统一成了小写 —— 比之前转回去。
+  final idx = _kUnits.indexOf((m.group(2) ?? 'b').toUpperCase());
+  if (idx < 0) return null;
+
+  final bytes = (n * _pow1024(idx)).round();
+  // 溢出或大到失真就当作无效：`9e18` 这种值填进去只会让所有包都被拦。
+  // 0 同样无效（见上面的说明），两者一并在这里挡掉。
+  if (bytes < 1 || bytes >= 8.0e18) return null;
+  return bytes;
+}
+
+/// 只接受十进制整数（允许千分位逗号）。同 [parseSize]：认不出来返回 null。
+int? parseCount(String text) {
+  final s = _normalizeNumber(text);
+  if (!RegExp(r'^\d+$').hasMatch(s)) return null;
+  final v = int.tryParse(s);
+  if (v == null || v < 1) return null;
+  return v;
+}
+
+/// 去掉空白与千分位逗号，并转小写。
+String _normalizeNumber(String text) =>
+    text.replaceAll(RegExp(r'[\s,]'), '').toLowerCase();
+
+double _pow1024(int exp) {
+  var v = 1.0;
+  for (var i = 0; i < exp; i++) {
+    v *= 1024;
+  }
+  return v;
+}
+
 /// `12.8s` / `1m23s` / `2h05m`；传 null 得 `-`（与 mock 里那条跳过记录的写法一致）。
 String formatDuration(Duration? d) {
   if (d == null || d.isNegative) return '-';

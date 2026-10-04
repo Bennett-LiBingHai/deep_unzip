@@ -23,6 +23,7 @@ library;
 
 import 'dart:isolate';
 
+import 'limits.dart';
 import 'models.dart';
 import 'scanner.dart';
 
@@ -82,6 +83,7 @@ final class CmdExtract extends WorkerCmd {
     this.depth = 0,
     this.recursive = false,
     this.options = const ScanOptions(),
+    this.limits = LimitThresholds.standard,
   });
 
   final int jobId;
@@ -110,6 +112,13 @@ final class CmdExtract extends WorkerCmd {
   /// 嵌套扫描用的扫描参数。与顶层扫描**同一份快照**，否则用户在设置里
   /// 关掉的开关（`splitMerge` / `fakeExtDetect`）在嵌套这一层会悄悄复活。
   final ScanOptions options;
+
+  /// 炸弹防护阈值。跟着命令一起过来，而不是让 worker 自己去读设置 ——
+  /// 那是同一个理由：**这批任务全程用同一份快照**。用户在解压途中改了阈值，
+  /// 不该让同一批里前半个包用旧值、后半个包用新值。
+  ///
+  /// [LimitThresholds] 全是 int，是平凡数据，跨 isolate 送没有问题。
+  final LimitThresholds limits;
 }
 
 /// 请求中止当前任务。**没有对应参数** —— 同一时刻只有一个任务，
@@ -193,6 +202,7 @@ final class EvFailed extends WorkerEvent {
     required this.message,
     this.detail,
     this.code,
+    this.breach,
   });
 
   /// 0 表示「不属于任何任务」（例如协议本身出错）。
@@ -206,6 +216,12 @@ final class EvFailed extends WorkerEvent {
   /// 「换个候选密码重试」还是「放弃这个包」，而从文案里猜是不行的。
   /// 非原生失败（如协议错误）为 null。
   final int? code;
+
+  /// 炸弹防护的裁决，有就带上。理由同 [code]：主 isolate 要区分「包坏了 →
+  /// 跳过」和「是炸弹 → 问用户」，从文案里猜是不行的。
+  ///
+  /// [LimitBreach] 全是 `enum` + `String`，是平凡数据，可以跨 isolate 送。
+  final LimitBreach? breach;
 }
 
 // ---------------------------------------------------------------------------
@@ -243,7 +259,7 @@ abstract final class DuzErrorCode {
 
 /// 引擎侧失败，由 `EngineController` 的 Future 抛出。
 class EngineException implements Exception {
-  const EngineException(this.message, {this.detail, this.code});
+  const EngineException(this.message, {this.detail, this.code, this.breach});
 
   final String message;
   final String? detail;
@@ -254,6 +270,17 @@ class EngineException implements Exception {
   /// 类型是 int 而不是插件里的枚举，是为了让本文件（以及整个 `engine/`）
   /// 不必 import 插件包 —— 换后端时这里的签名不动。
   final int? code;
+
+  /// 被炸弹防护拦下时的详情。**刻意不走 [code]**。
+  ///
+  /// [code] 的契约是「原生 `DUZ_ERR_*` 的镜像」，而炸弹判定完全在 Dart 侧，
+  /// 原生那边没有对应的错误码。硬塞一个进去会让 `error_codes_test.dart` 那张
+  /// 「每个镜像常量都要有原生对应」的表失去意义 —— 那张表正是用来防漂移的。
+  ///
+  /// 单独一个字段还有个好处：上层判「是不是炸弹」不必猜数字（比如「是否
+  /// 小于 -6 就是 Dart 侧的错误」这种脆弱约定），直接 `breach != null`。
+  /// P3 的弹窗要区分「损坏 → 跳过」「炸弹 → 暂停并问用户」，靠的就是它。
+  final LimitBreach? breach;
 
   @override
   String toString() =>

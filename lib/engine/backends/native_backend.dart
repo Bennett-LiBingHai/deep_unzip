@@ -21,6 +21,7 @@ import 'dart:io';
 
 import 'package:deep_unzip_engine/deep_unzip_engine.dart' as engine;
 
+import '../limits.dart';
 import '../models.dart';
 import '../protocol.dart';
 
@@ -78,13 +79,29 @@ ExtractOutcome extractArchive({
   String? password,
   void Function(ExtractTick tick)? onTick,
   bool Function()? shouldCancel,
+  LimitThresholds limits = LimitThresholds.standard,
 }) {
-  final dir = Directory(outDir);
-  if (!dir.existsSync()) dir.createSync(recursive: true);
-
+  // 顺序是刻意的：**先开归档、过闸门，再建输出目录**。
+  //
+  // 反过来（先建目录再开）会在炸弹被拒时留下一个空目录 —— 用户看到的是
+  // 「多出来一个空文件夹」，而日志说那个包被放弃了。而且那道闸门本来就是
+  // 「一个字节都还没写」的时刻，建目录算第一次落盘，不该在它前面。
   final a = _open(parts, password);
   final watch = Stopwatch()..start();
   try {
+    final breach = checkArchiveLimits(
+      _profileOf(a, parts),
+      limits: limits,
+    );
+    if (breach != null) {
+      // 抛的是 EngineException 而不是原生码：这条判定整个住在 Dart 侧，
+      // 原生根本不知道「炸弹」这回事。详见 EngineException.breach 的说明。
+      throw EngineException(breach.message, breach: breach);
+    }
+
+    final dir = Directory(outDir);
+    if (!dir.existsSync()) dir.createSync(recursive: true);
+
     String last = '';
     a.extractAll(
       outDir,
@@ -107,6 +124,38 @@ ExtractOutcome extractArchive({
   } finally {
     a.close();
   }
+}
+
+/// 把已打开的归档量成一个 [ArchiveProfile]。
+///
+/// 量磁盘那一步（[ArchiveProfile.compressedBytes]）有几个刻意的取舍：
+///
+/// - **量的是分卷在磁盘上的字节数之和**，不是压缩流本身的长度。对单卷就是文件
+///   大小，对分卷是各卷之和，正是「这个包占了用户多少空间」。
+/// - **不减 `baseOffset`**。SFX 或带前置数据的包，其前置部分（最多 1 MiB）
+///   算进了分母，让比值偏小一点点 —— 偏保守的方向，宁可漏判不可误判。
+/// - 任一卷量不到（`lengthSync` 抛）就当**未知**（0），整条比值检查跳过。
+///   量不出来的东西不能拿来当判据。
+ArchiveProfile _profileOf(engine.DuzArchive a, List<String> parts) {
+  // 数条目那半交给 limits.dart 的纯函数 —— 它能在 `flutter_test` 里被喂数字
+  // 单测，而这里（要碰真实归档与磁盘）不能。本函数只剩量磁盘这一件事。
+  return ArchiveProfile.fromEntries(
+    entries: a.entries.map((e) => (size: e.size, isDir: e.isDir)),
+    compressedBytes: _bytesOnDisk(parts),
+  );
+}
+
+/// 这些分卷在磁盘上一共占多少字节。任一卷量不到就返回 0（= 未知）。
+int _bytesOnDisk(List<String> parts) {
+  var total = 0;
+  for (final p in parts) {
+    try {
+      total += File(p).lengthSync();
+    } on FileSystemException {
+      return 0;
+    }
+  }
+  return total;
 }
 
 // ---------------------------------------------------------------------------

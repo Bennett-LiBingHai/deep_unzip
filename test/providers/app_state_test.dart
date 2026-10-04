@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:deep_unzip/engine/controller.dart';
+import 'package:deep_unzip/engine/limits.dart';
 import 'package:deep_unzip/engine/models.dart';
 import 'package:deep_unzip/engine/output_paths.dart';
 import 'package:deep_unzip/engine/protocol.dart';
@@ -478,6 +479,89 @@ void main() {
       expect(state.toastType, 'warn');
     });
 
+    t('被炸弹防护拦下 → 记「炸弹防护」，别混进「解压失败」', () async {
+      final root = tempRoot('as_bomb');
+      put(root, 'a.zip', realZip({'x': 'y'}));
+      put(root, 'b.zip', realZip({'x': 'y'}));
+
+      const breach = LimitBreach(
+        kind: LimitKind.totalSize,
+        tag: '炸弹防护',
+        message: '解压后共 8.0 GB，超过上限 1.0 GB，已放弃',
+      );
+      final engine = FakeEngine()
+        ..behavior = (e, outDir) async {
+          if (e.rounds == 1) {
+            // 闸门住在 native_backend 里（假引擎整个绕过它），所以这里只能
+            // 手动抛一条同样形状的异常，测的是**它之后**那半条链：
+            // EngineException.breach → 日志 tag → 用户看到什么。
+            throw EngineException(breach.message, breach: breach);
+          }
+        };
+      final state = AppState(engine: engine);
+      addTearDown(state.dispose);
+
+      await state.selectFolderPath(root.path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(engine.rounds, 2, reason: '一个超限的包不该让整批停下');
+      final byName = {for (final l in state.logs) l.name: l};
+      expect(byName['a.zip']!.status, LogStatus.failed);
+      // 用户得能一眼看出这是「我们主动放弃」而不是「包坏了」——
+      // 前者他会想去调阈值，后者他只会去重下文件。
+      expect(byName['a.zip']!.tags, contains('炸弹防护'));
+      expect(byName['b.zip']!.status, LogStatus.success);
+      // 收尾 toast 是整批的汇总（它会把逐包的 warn 顶掉），所以这里断言
+      // 汇总而不是那条瞬时提示 —— 后者在批次跑完时已经没了。
+      expect(state.completeDetail, contains('1 个失败'));
+    });
+
+    t('设置页改的阈值真的传到了引擎（这批任务全程用同一份快照）', () async {
+      final root = tempRoot('as_limits');
+      put(root, 'a.zip', realZip({'x': 'y'}));
+
+      final engine = FakeEngine();
+      final state = AppState(engine: engine);
+      addTearDown(state.dispose);
+
+      state.setLimitPreset(2); // 严格
+      await state.selectFolderPath(root.path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(engine.limitsSeen.single, LimitThresholds.strict,
+          reason: '闸门读的是命令里带上来的这份，不是 worker 自己再去读设置');
+    });
+
+    t('解压途中改阈值，不影响这一批已开工的部分', () async {
+      final root = tempRoot('as_limits_snap');
+      put(root, 'a.zip', realZip({'x': 'y'}));
+      put(root, 'b.zip', realZip({'x': 'y'}));
+
+      final gate = Completer<void>();
+      final engine = FakeEngine()
+        ..behavior = (e, outDir) async {
+          if (e.rounds == 1) await gate.future;
+        };
+      final state = AppState(engine: engine);
+      addTearDown(state.dispose);
+
+      await state.selectFolderPath(root.path);
+      state.startExtract();
+      await settle();
+      expect(engine.rounds, 1, reason: '前提：第一个包还卡在闸门上');
+
+      // 用户在解压途中去设置页换了个档。
+      state.setLimitPreset(0); // 宽松
+      gate.complete();
+      await drainExtract(state);
+
+      expect(engine.limitsSeen, hasLength(2));
+      expect(engine.limitsSeen, everyElement(LimitThresholds.standard),
+          reason: '同一批里前半个包用旧值、后半个包用新值，会让结果没法解释');
+    });
+
     t('进度由引擎 tick 驱动：整批比例 = (已完成包数 + 当前包比例) / 总包数', () async {
       final root = tempRoot('as_tick');
       put(root, 'a.zip', realZip({'x': 'y'}));
@@ -768,6 +852,79 @@ void main() {
 
       state.deleteExtractor(idx);
       expect(state.extractors.any((e) => e.name == 'FOO'), isFalse);
+    });
+  });
+
+  group('炸弹防护阈值', () {
+    t('默认是标准档', () {
+      final state = booted();
+      expect(state.limits, LimitThresholds.standard);
+      expect(state.limitPresetLabel, '标准');
+      expect(state.limitsCustom, isFalse);
+    });
+
+    t('chip 转一圈：从标准出发依次经过严格、自定义，回到宽松', () {
+      final state = booted();
+      final seen = <String>[];
+      for (var i = 0; i < 4; i++) {
+        seen.add(state.limitPresetLabel);
+        state.cycleLimitPreset();
+      }
+
+      // 顺序就是 kLimitPresets 的顺序（宽松→标准→严格）再接一个「自定义」。
+      // 起点是标准，所以第一跳去严格，绕完一圈回到宽松。
+      expect(seen, ['标准', '严格', '自定义', '宽松']);
+      expect(state.limitPresetLabel, '标准', reason: '四跳之后回到起点');
+    });
+
+    t('选到具体档位就整体换值', () {
+      final state = booted();
+      state.setLimitPreset(2); // 严格
+      expect(state.limits, LimitThresholds.strict);
+      expect(state.limitPresetLabel, '严格');
+
+      state.setLimitPreset(0); // 宽松
+      expect(state.limits, LimitThresholds.loose);
+    });
+
+    t('切进「自定义」保留当前值 —— 是去微调，不是从零开始', () {
+      final state = booted();
+      state.setLimitPreset(2); // 先到严格
+      state.cycleLimitPreset(); // 再跳到自定义
+
+      expect(state.limitsCustom, isTrue);
+      expect(state.limits, LimitThresholds.strict,
+          reason: '落在自定义那一刻的数值不该被清掉，否则用户看到四个空值');
+    });
+
+    t('setLimit 改一项、落到自定义、不动别的', () {
+      final state = booted();
+      state.setLimit(LimitField.ratio, 42);
+
+      expect(state.limits.maxRatio, 42);
+      expect(state.limits.maxTotalBytes, LimitThresholds.standard.maxTotalBytes,
+          reason: '只该动被改的那一项');
+      expect(state.limitsCustom, isTrue, reason: 'chip 必须如实显示「自定义」');
+    });
+
+    t('改回预设的数值**也不会**跳回该档 —— 否则编辑到一半编辑器就被收了', () {
+      final state = booted();
+      state.setLimit(LimitField.ratio, 42);
+      expect(state.limitsCustom, isTrue);
+
+      // 改回标准的 1000。值确实等于标准档了，但用户还在编辑。
+      state.setLimit(LimitField.ratio, LimitThresholds.standard.maxRatio);
+
+      expect(state.limits, LimitThresholds.standard, reason: '值确实回到了标准');
+      expect(state.limitsCustom, isTrue,
+          reason: 'chip 停在自定义：数值是手改出来的，不该替用户做这个判断');
+    });
+
+    t('转到自定义之后再点一下，回到宽松', () {
+      final state = booted();
+      state.setLimitPreset(3); // 自定义
+      state.cycleLimitPreset();
+      expect(state.limitPresetLabel, '宽松');
     });
   });
 

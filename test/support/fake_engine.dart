@@ -12,6 +12,7 @@
 library;
 
 import 'package:deep_unzip/engine/controller.dart';
+import 'package:deep_unzip/engine/limits.dart';
 import 'package:deep_unzip/engine/models.dart';
 
 class FakeEngine extends EngineController {
@@ -37,6 +38,13 @@ class FakeEngine extends EngineController {
   /// 依次收到的递归层级，与 [outDirs] 等长同序。
   final List<int> depthsSeen = [];
 
+  /// 依次收到的炸弹防护阈值，与 [outDirs] 等长同序。
+  ///
+  /// 记下来是为了钉住「设置页改的阈值真的传到了引擎」这条线 ——
+  /// 闸门本身住在 `native_backend` 里（假引擎整个绕过它），所以那半边只能
+  /// 靠 `limits_test.dart` 的纯函数用例覆盖，这半边只能靠这里。
+  final List<LimitThresholds> limitsSeen = [];
+
   /// 依次收到的 `recursive` 开关，与 [outDirs] 等长同序。
   final List<bool> recursiveSeen = [];
 
@@ -54,11 +62,13 @@ class FakeEngine extends EngineController {
     int depth = 0,
     bool recursive = false,
     ScanOptions options = const ScanOptions(),
+    LimitThresholds limits = LimitThresholds.standard,
   }) async {
     outDirs.add(outDir);
     partsSeen.add(parts);
     depthsSeen.add(depth);
     recursiveSeen.add(recursive);
+    limitsSeen.add(limits);
     rounds++;
     await behavior?.call(this, outDir);
     return ExtractOutcome(

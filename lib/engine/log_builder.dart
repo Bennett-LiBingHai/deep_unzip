@@ -119,11 +119,16 @@ LogEntry buildExtractLog({
           if (item.flags.contains(ArchiveFlag.encrypted)) '加密',
           '${o.entryCount} 项',
         ],
-      // 密码错和「包坏了」要分得开：前者换下一个候选密码还有救
-      // （P4 会自动试），后者只能跳过。都记成「解压失败」的话，
-      // 用户看着密码库里的条目会一头雾水。
+      // 三种失败要分得开：
+      // - 密码错 → 换下一个候选密码还有救（P4 会自动试）
+      // - 炸弹防护 → 不是「坏了」，是我们主动放弃；将来还能让用户选
+      // - 其余 → 包坏了，只能跳过
+      // 都记成「解压失败」的话，用户看着密码库里的条目、或者看着一个明明
+      // 完好的包被标红，都会一头雾水。
       (_, final e, _) when e != null => [
-          if (e.code == DuzErrorCode.password) '密码未匹配' else '解压失败',
+          if (e.breach != null) ...[e.breach!.tag, '解压失败']
+          else if (e.code == DuzErrorCode.password) '密码未匹配'
+          else '解压失败',
         ],
       (_, _, final reason) => [reason!],
     },

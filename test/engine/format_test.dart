@@ -157,4 +157,86 @@ void main() {
       expect(formatDate(DateTime(2026, 1, 9)), '2026-01-09');
     });
   });
+
+  group('parseSize：formatBytes 的逆运算', () {
+    /// 这一组的核心不变量：**设置页里读出来再写回去，数值不许漂**。
+    /// 输入框预填的就是 `formatBytes` 的输出，用户没改就直接确定 ——
+    /// 那一下必须是恒等变换，否则「点开又关掉」都会悄悄改掉阈值。
+    test('formatBytes 的输出总能原样解析回去（幂等）', () {
+      final samples = [
+        512,
+        1024,
+        1536,
+        245 * 1024 * 1024,
+        (1.2 * 1024 * 1024 * 1024).round(),
+        8 * 1024 * 1024 * 1024,
+        64 * 1024 * 1024 * 1024,
+        5 * 1024 * 1024 * 1024 * 1024,
+      ];
+
+      for (final n in samples) {
+        final text = formatBytes(n);
+        final back = parseSize(text);
+        expect(back, isNotNull, reason: '「$text」（来自 $n）解析不出来');
+
+        // `formatBytes` 只保留一位小数（大数还不保留），所以小于 10 的值
+        // 往回解析会有截断误差 —— 那是**展示**造成的，不是解析的错。
+        // 断言「格式化后再解析等于格式化后再解析」，即真正的不动点性质。
+        expect(formatBytes(back!), text, reason: '「$text」往返之后变了形');
+      }
+    });
+
+    test('各种写法都认', () {
+      expect(parseSize('8GB'), 8 * 1024 * 1024 * 1024);
+      expect(parseSize('8 GB'), 8 * 1024 * 1024 * 1024);
+      expect(parseSize('  8 gb  '), 8 * 1024 * 1024 * 1024);
+      expect(parseSize('512mb'), 512 * 1024 * 1024);
+      expect(parseSize('1.5TB'), (1.5 * 1024 * 1024 * 1024 * 1024).round());
+      expect(parseSize('100KB'), 100 * 1024);
+      expect(parseSize('4096B'), 4096);
+    });
+
+    test('裸数字按字节算', () {
+      expect(parseSize('1024'), 1024);
+    });
+
+    test('0 不合法 —— 阈值是「允许到多少」，填 0 等于什么都不许解', () {
+      expect(parseSize('0'), isNull);
+      expect(parseSize('0 B'), isNull);
+    });
+
+    test('认不出来返回 null —— 不兜底、不猜', () {
+      expect(parseSize(''), isNull);
+      expect(parseSize('abc'), isNull);
+      expect(parseSize('8XB'), isNull);
+      expect(parseSize('8 GB 额外'), isNull);
+      expect(parseSize('-8GB'), isNull);
+      expect(parseSize('8.5.5GB'), isNull);
+    });
+
+    test('大到失真的值当作无效', () {
+      // 填进去只会让每个包都被拦，不如让「确定」按不动。
+      expect(parseSize('999999999TB'), isNull);
+    });
+  });
+
+  group('parseCount', () {
+    test('十进制整数，千分位逗号随便写', () {
+      expect(parseCount('200000'), 200000);
+      expect(parseCount('200,000'), 200000);
+      expect(parseCount(' 1,000,000 '), 1000000);
+    });
+
+    test('0 与负数不合法 —— 阈值是「允许到多少」，0 等于什么都不许解', () {
+      expect(parseCount('0'), isNull);
+      expect(parseCount('-1'), isNull);
+    });
+
+    test('认不出来返回 null', () {
+      expect(parseCount(''), isNull);
+      expect(parseCount('1.5'), isNull);
+      expect(parseCount('1000:1'), isNull);
+      expect(parseCount('十万'), isNull);
+    });
+  });
 }

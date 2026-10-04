@@ -11,6 +11,7 @@ import '../data/builtin_extractors.dart';
 import '../engine/controller.dart';
 import '../engine/cycles.dart';
 import '../engine/format.dart';
+import '../engine/limits.dart';
 import '../engine/log_builder.dart';
 import '../engine/models.dart';
 import '../engine/output_paths.dart';
@@ -196,6 +197,47 @@ class AppState extends ChangeNotifier {
     const opts = [0, 5, 10, 20];
     final idx = opts.indexOf(_maxDepth);
     _maxDepth = opts[(idx + 1) % opts.length];
+    _notify();
+  }
+
+  // ---- 炸弹防护阈值 ----
+
+  LimitThresholds _limits = LimitThresholds.standard;
+  LimitThresholds get limits => _limits;
+
+  /// chip 停在哪一档：[kLimitPresets] 的下标，或 `kLimitPresets.length` 表示
+  /// 「自定义」。
+  ///
+  /// **必须单独存，不能从 `_limits` 反推。** 反推的写法（「值等于哪个预设就
+  /// 显示哪个」）有个死结：用户点进「自定义」时值还没变，chip 会立刻跳回
+  /// 「标准」，刚展开的那几行又收回去 —— 于是永远改不了任何一项。
+  int _limitPreset = 1; // 1 = 标准，与 _limits 的初值一致
+  int get limitPreset => _limitPreset;
+
+  bool get limitsCustom => _limitPreset >= kLimitPresets.length;
+
+  String get limitPresetLabel =>
+      limitsCustom ? kCustomLimitLabel : kLimitPresets[_limitPreset].label;
+
+  /// 依次走过：宽松 → 标准 → 严格 → 自定义 → 宽松…
+  void cycleLimitPreset() => setLimitPreset((_limitPreset + 1) % (kLimitPresets.length + 1));
+
+  void setLimitPreset(int index) {
+    _limitPreset = index.clamp(0, kLimitPresets.length);
+    // 落到「自定义」时**保留当前值**：用户多半是想从这一档微调，而不是
+    // 要一组空数字。落到具体档位时才整体替换。
+    if (!limitsCustom) _limits = kLimitPresets[_limitPreset].thresholds;
+    _notify();
+  }
+
+  /// 改一项阈值，并自动落到「自定义」档。
+  ///
+  /// 这里**不**去反查「改完是不是正好等于某个预设，是的话就跳回去」：那同样
+  /// 会让用户在编辑途中被弹出编辑器（把某一项改回预设值的一瞬间，四行就没了）。
+  /// chip 显示「自定义」、而数值恰好等于某档 —— 这不矛盾，它确实是被手改过的。
+  void setLimit(LimitField field, int value) {
+    _limits = field.apply(_limits, value);
+    _limitPreset = kLimitPresets.length;
     _notify();
   }
 
@@ -561,6 +603,10 @@ class AppState extends ChangeNotifier {
     final recursive = setting('recursive');
     final maxDepth = _maxDepth;
     final options = _scanOptions;
+    // 阈值同样要**在这里取好**。底下用的是 `limits` 这个 getter，它读的是
+    // 活的 `_limits` —— 用户在解压途中去设置页换个档，同一批里前半个包按
+    // 旧阈值、后半个按新阈值，日志上会显得同样的包有的过有的被拦。
+    final limits = _limits;
 
     _extracting = true;
     _paused = false;
@@ -641,6 +687,7 @@ class AppState extends ChangeNotifier {
             depth: item.depth,
             recursive: recursive,
             options: options,
+            limits: limits,
           );
           _doneCount++;
           _addLog(buildExtractLog(

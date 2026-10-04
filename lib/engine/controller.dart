@@ -18,6 +18,7 @@ library;
 import 'dart:async';
 import 'dart:isolate';
 
+import 'limits.dart';
 import 'models.dart';
 import 'protocol.dart';
 import 'scanner.dart';
@@ -282,6 +283,7 @@ class EngineController {
     int depth = 0,
     bool recursive = false,
     ScanOptions options = const ScanOptions(),
+    LimitThresholds limits = LimitThresholds.standard,
   }) async {
     await _ready.future;
     // 只能在这个 await **之后**检查：dispose 可能刚好在这期间跑完。
@@ -306,6 +308,7 @@ class EngineController {
       depth: depth,
       recursive: recursive,
       options: options,
+      limits: limits,
     ));
 
     return c.future;
@@ -372,9 +375,15 @@ class EngineController {
         _activeJob = null;
         _extractWaiters.remove(jobId)?.complete(outcome);
 
-      case EvFailed(:final jobId, :final message, :final detail, :final code):
+      case EvFailed(
+          :final jobId,
+          :final message,
+          :final detail,
+          :final code,
+          :final breach
+        ):
         _failActive(
-          EngineException(message, detail: detail, code: code),
+          EngineException(message, detail: detail, code: code, breach: breach),
           onlyJob: jobId == 0 ? null : jobId,
         );
     }
