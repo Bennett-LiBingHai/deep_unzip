@@ -1,5 +1,8 @@
+import 'dart:io';
+
 import 'package:deep_unzip/engine/output_paths.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:path/path.dart' as p;
 
 void main() {
   group('deriveOutputName —— 基本后缀', () {
@@ -105,17 +108,84 @@ void main() {
 
     test('重名时追加 _1、_2', () {
       final taken = {'/sdcard/c', '/sdcard/c_1'};
-      final got = resolveOutputDir('/sdcard/c.zip', dirExists: taken.contains);
+      final got = resolveOutputDir('/sdcard/c.zip', isTaken: taken.contains);
       expect(got, '/sdcard/c_2');
     });
 
     test('无冲突时不加后缀', () {
-      final got = resolveOutputDir('/sdcard/c.zip', dirExists: (_) => false);
+      final got = resolveOutputDir('/sdcard/c.zip', isTaken: (_) => false);
       expect(got, '/sdcard/c');
     });
 
     test('根目录下的文件', () {
-      expect(resolveOutputDir('/a.zip', dirExists: (_) => false), '/a');
+      expect(resolveOutputDir('/a.zip', isTaken: (_) => false), '/a');
+    });
+  });
+
+  // 需求 5 的伪后缀。真机上 `fake.pdf`（实为 ZIP）整包失败，根因就在这里：
+  // 输出名跟源文件同名，后端建目录时撞上一个已经存在的**文件**。
+  group('伪后缀的输出名', () {
+    test('假后缀被剥掉，输出名不再等于源文件名', () {
+      expect(deriveOutputName('/sdcard/fake.pdf', spoofedExtension: true),
+          'fake');
+      expect(deriveOutputName('/sdcard/photo.jpg', spoofedExtension: true),
+          'photo');
+      expect(deriveOutputName('/sdcard/movie.mp4', spoofedExtension: true),
+          'movie');
+    });
+
+    test('不声明伪后缀时维持原样 —— 真 PDF 的名字不该被动', () {
+      expect(deriveOutputName('/sdcard/fake.pdf'), 'fake.pdf');
+    });
+
+    test('先剥假后缀，才轮得到真后缀 —— backup.zip.exe → backup', () {
+      // 反过来做只会得到 `backup.zip`：`.exe` 不剥掉，阶段 2 就看不见 `.zip`。
+      expect(deriveOutputName('/sdcard/backup.zip.exe', spoofedExtension: true),
+          'backup');
+    });
+
+    test('带卷号的伪后缀：movie.mkv.001 → movie', () {
+      // 阶段 1 先剥 `.001`，阶段 1.5 再剥假后缀 `.mkv`。
+      expect(deriveOutputName('/sdcard/movie.mkv.001', spoofedExtension: true),
+          'movie');
+    });
+
+    test('剥空时仍然回退到 extracted，不返回空串', () {
+      // `.pdf` 整个就是名字（点在开头，_lastSegment 给 null），无可剥，
+      // 于是原样留着 —— 关键是**不能**变成空串。
+      expect(deriveOutputName('/sdcard/.pdf', spoofedExtension: true), '.pdf');
+    });
+
+    test('resolveOutputDir 把伪后缀透传下去', () {
+      expect(
+        resolveOutputDir('/sdcard/fake.pdf',
+            spoofedExtension: true, isTaken: (_) => false),
+        '/sdcard/fake',
+      );
+    });
+  });
+
+  // 没有后缀的压缩包（真名就叫 `data` 的 zip）推出来的输出名就是 `data`，
+  // 跟源文件撞上。占用判定必须把「文件」也算占着，否则后端建目录会抛。
+  group('占用判定：同名文件也算占着', () {
+    test('被同名文件占着时退到 _1', () {
+      final got = resolveOutputDir('/sdcard/data',
+          isTaken: (path) => path == '/sdcard/data');
+      expect(got, '/sdcard/data_1');
+    });
+
+    test('真实文件系统上，同名文件确实算占用', () {
+      final dir = Directory.systemTemp.createTempSync('duz_occupied');
+      addTearDown(() => dir.deleteSync(recursive: true));
+
+      // 在真正的磁盘上放一个**文件**，路径正好等于推导出的输出名。
+      final src = File(p.join(dir.path, 'data'))..writeAsStringSync('not a dir');
+
+      final got = resolveOutputDir(src.path);
+      expect(got, isNot(src.path), reason: '不能把源文件自己的路径当输出目录');
+      // 只比基名：返回值一律是 posix 形态（见 output_paths.dart 里
+      // _toPosix 的说明），拿 `p.join` 拼出来的宿主形态路径比会栽在分隔符上。
+      expect(p.basename(got), 'data_1');
     });
   });
 }

@@ -398,6 +398,29 @@ void main() {
       expect(state.toastType, 'ok');
     });
 
+    t('伪后缀包（需求 5）：解到 fake/ 而不是 fake.pdf/ —— 后者跟源文件撞名', () async {
+      final root = tempRoot('as_spoof');
+      // 真身是 ZIP，名字却叫 .pdf。这是真机上整包失败的那个形状。
+      put(root, 'fake.pdf', realZip({'x': 'y'}));
+
+      final engine = FakeEngine();
+      final state = AppState(engine: engine);
+      addTearDown(state.dispose);
+
+      await state.selectFolderPath(root.path);
+      expect(state.archives.single.name, 'fake.pdf',
+          reason: '前提：它得先被当成一个包扫出来，否则这条测的不是伪后缀');
+
+      state.startExtract();
+      await drainExtract(state);
+
+      final outDir = engine.outDirs.single.replaceAll(r'\', '/');
+      expect(outDir, endsWith('/fake'),
+          reason: '假后缀要剥掉。留着的话输出目录 = 源文件路径，'
+              '后端 `createSync` 撞上一个已存在的文件，整包失败');
+      expect(outDir, isNot(endsWith('/fake.pdf')));
+    });
+
     t('引擎报密码错 → 记失败、标密码未匹配、不中断整批', () async {
       final root = tempRoot('as_pwd');
       put(root, 'a.zip', realZip({'x': 'y'}));

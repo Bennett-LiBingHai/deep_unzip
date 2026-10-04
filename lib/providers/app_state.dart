@@ -628,7 +628,12 @@ class AppState extends ChangeNotifier {
           }
         }
 
-        final outDir = resolveOutputDir(item.entryPath);
+        // 后缀是假的（需求 5）时要把那段假后缀剥掉，否则输出目录会跟源文件
+        // 同名 —— 见 deriveOutputName 里那段说明，真机上就是这么整包失败的。
+        final outDir = resolveOutputDir(
+          item.entryPath,
+          spoofedExtension: item.sniff.isExtensionSpoofed,
+        );
         try {
           final outcome = await engine.extract(
             parts: item.parts,

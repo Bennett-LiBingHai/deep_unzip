@@ -108,7 +108,13 @@ String _stripLastSegment(String stem) =>
 ///
 /// 全剥空时回退到 `extracted`，**绝不返回空串**：空串会让
 /// `p.join(parent, '')` 得到父目录自身，那就把内容直接解进源目录了。
-String deriveOutputName(String archivePath) {
+///
+/// [spoofedExtension] 为真表示「末尾那段后缀是假的」（需求 5）。这时它不在
+/// 压缩后缀表里，阶段 2 认不出来，于是它会**原样活到输出名里**
+/// —— `fake.pdf`（实为 ZIP）推出 `fake.pdf/`，跟源文件自己同名。那个路径上
+/// 已经有一个文件，后端 `createSync` 建目录直接抛 `FileSystemException`，
+/// 整个包解不出来。真机上就是这么失败的，所以这一档必须显式剥掉。
+String deriveOutputName(String archivePath, {bool spoofedExtension = false}) {
   var stem = p.posix.basename(_toPosix(archivePath));
   if (stem.isEmpty) return 'extracted';
 
@@ -117,6 +123,14 @@ String deriveOutputName(String archivePath) {
     final seg = _lastSegment(stem);
     if (seg == null || !_isVolumeSegment(seg)) break;
     stem = _stripLastSegment(stem);
+  }
+
+  // 阶段 1.5：剥掉那段假后缀。**必须排在阶段 2 之前**：`backup.zip.exe`
+  // 的正确输出名是 `backup`，先剥 `.exe` 才能让阶段 2 接着认出 `.zip`。
+  // 反过来做只会得到 `backup.zip`。
+  if (spoofedExtension) {
+    final seg = _lastSegment(stem);
+    if (seg != null) stem = _stripLastSegment(stem);
   }
 
   // 阶段 2：压缩后缀，最多 3 层（`a.tar.bz2` / `a.tar.gz` 是两层，
@@ -138,23 +152,39 @@ String deriveOutputName(String archivePath) {
 
 /// 算出最终输出目录：`<源目录>/<名字>`，重名时追加 `_1`、`_2`…
 ///
-/// [dirExists] 可注入，默认查真实文件系统。注入它有两个理由：单测不必碰
+/// [spoofedExtension] 原样透传给 [deriveOutputName]，见那里的说明。
+///
+/// [isTaken] 可注入，默认查真实文件系统。注入它有两个理由：单测不必碰
 /// 磁盘；以及**一次任务内**同一基名可能出现多次而目录还没建出来 ——
 /// 那时调用方传的是「本次已占用的路径」，而不是磁盘状态。
 String resolveOutputDir(
   String archivePath, {
-  bool Function(String path)? dirExists,
+  bool spoofedExtension = false,
+  bool Function(String path)? isTaken,
 }) {
   final normalized = _toPosix(archivePath);
   final parent = p.posix.dirname(normalized);
-  final base = deriveOutputName(normalized);
-  final exists = dirExists ?? (String d) => Directory(d).existsSync();
+  final base = deriveOutputName(normalized, spoofedExtension: spoofedExtension);
+  final taken = isTaken ?? _anythingExists;
 
   var candidate = p.posix.join(parent, base);
   var n = 1;
-  while (exists(candidate)) {
+  while (taken(candidate)) {
     candidate = p.posix.join(parent, '${base}_$n');
     n++;
   }
   return candidate;
 }
+
+/// 这个路径上**有没有东西** —— 文件、目录、链接都算占着。
+///
+/// 不能只看 `Directory(path).existsSync()`。那样「被一个同名**文件**占着」
+/// 会被判成空闲，于是把一个根本建不出来的目录交给后端，`createSync` 抛
+/// `FileSystemException`，整包失败。真机上 `fake.pdf` 就是这么死的
+/// （伪后缀没剥掉时输出目录恰好等于源文件名）。
+///
+/// 剥掉伪后缀之后这条路仍然值得留着：**没有后缀**的压缩包（一个真名叫
+/// `data` 的 zip）推出来的输出名就是 `data`，跟源文件自己撞上，一样要靠这里
+/// 退到 `data_1`。
+bool _anythingExists(String path) =>
+    FileSystemEntity.typeSync(path) != FileSystemEntityType.notFound;
