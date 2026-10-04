@@ -38,7 +38,7 @@ class HomeScreen extends StatelessWidget {
             ],
             if (state.hasScanned &&
                 !state.extracting &&
-                !state.completed &&
+                !state.batchRun &&
                 !state.scanning) ...[
               const SizedBox(height: 16),
               _buildScanResult(),
@@ -47,7 +47,11 @@ class HomeScreen extends StatelessWidget {
               const SizedBox(height: 16),
               _buildProgressPanel(),
             ],
-            if (state.completed) ...[
+            // 跑过就出卡片，**没有例外**。从前这里挂的是 `completed`
+            // （= 全部成功），整批都失败时卡片就不出现了 —— 关掉「错误时暂停」
+            // 之后失败不再弹窗、直接记一条失败接着跑，全败变得很容易撞上，
+            // 真机验收时用户点了出来。判据统一收进 `BatchOutcome`。
+            if (state.batchRun) ...[
               const SizedBox(height: 16),
               _buildCompleteBanner(context),
             ],
@@ -731,25 +735,36 @@ class HomeScreen extends StatelessWidget {
 
   /// 这一批收尾后的总结卡片。
   ///
-  /// 三档标题，由 [AppState.stopReason] 决定 —— **被停掉的那两档绝不能显示
-  /// 「全部解压完成」**：剩下的包一个都没解，绿卡片上写「完成」是直接骗人。
+  /// 标题**只**由 [AppState.outcome] 决定 —— 界面不再自己推「算不算完成」。
+  /// 只有 `clean` 那一档配得上「全部解压完成」那张绿卡片；被停掉的、有失败
+  /// 的、全砸了的，绿卡片上写「完成」都是直接骗人。
+  ///
   /// 真机验收时用户要求停止后也落在这张卡片上（并且主按钮是「换个文件夹」），
   /// 说法是「像格式弹窗一样，不管点哪个都能跳到总结页」。
   String get _bannerTitle {
-    switch (state.stopReason) {
+    switch (state.outcome) {
+      // 卡片只在跑过之后出现（`batchRun`），所以 null 到不了这里。
+      // 真到了就给个中性的说法，别写「完成」。
       case null:
+        return '这批已结束';
+      case BatchOutcome.clean:
         return '全部解压完成';
-      case StopSource.user:
+      case BatchOutcome.partial:
+        return '部分失败';
+      case BatchOutcome.allFailed:
+        return '全部失败';
+      case BatchOutcome.stopped:
         return '已停止';
-      case StopSource.error:
+      case BatchOutcome.errored:
         return '解压出错，已停止';
     }
   }
 
   Widget _buildCompleteBanner(BuildContext context) {
-    // 停下来用暖色 + 停止图标：绿勾配「已停止」是个自相矛盾的画面。
-    final stopped = state.stopReason != null;
-    final accent = stopped ? AppTheme.neonOrange : AppTheme.neonGreen;
+    // 只有「全解开」配绿色 + 勾。其余一律暖色：绿勾配「全部失败」是个
+    // 自相矛盾的画面。
+    final clean = state.outcome == BatchOutcome.clean;
+    final accent = clean ? AppTheme.neonGreen : AppTheme.neonOrange;
 
     return Container(
       padding: const EdgeInsets.all(16),
@@ -776,7 +791,13 @@ class HomeScreen extends StatelessWidget {
                   borderRadius: BorderRadius.circular(12),
                 ),
                 child: Icon(
-                  stopped ? Icons.stop_circle : Icons.check_circle,
+                  // 没停止也有可能是「失败」（部分 / 全部），那两颗用圆圈惊叹号
+                  // 而不是叉 —— 叉读起来像「你操作错了」，而这批包是自己坏的。
+                  switch (state.outcome) {
+                    BatchOutcome.clean => Icons.check_circle,
+                    BatchOutcome.stopped => Icons.stop_circle,
+                    _ => Icons.error_outline,
+                  },
                   color: accent,
                   size: 24,
                 ),

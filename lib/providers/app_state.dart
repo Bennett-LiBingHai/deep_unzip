@@ -26,18 +26,38 @@ import '../models/password_entry.dart';
 import '../services/prompts.dart';
 import '../services/disk_space.dart';
 
-/// 这一批是**怎么停下来的**。
+/// 这批解压**最后是怎么收场的**。总结卡片的标题、配色、图标全看它。
 ///
-/// 只有「停下」这一个维度：没被停过的批次是 `null`（跑完了，中间可能有失败
-/// 或跳过）。总结卡片靠它换标题与配色 —— 一个被停掉的批次摆出「全部解压完成」
-/// 那张绿卡片会直接骗人：剩下的包一个都没解，用户却看到「完成」。
-enum StopSource {
-  /// 主按钮那颗「停止解压」。
-  user,
+/// ## 为什么是一个枚举，而不是几个 bool
+///
+/// 从前这里是三样东西：`completed`（= 全部成功）、`stopReason`（= 为什么停的）、
+/// `batchRun`（= 跑过没有）。而界面拿 `completed` 去问「该不该出总结卡片」——
+/// 于是整批都失败时它一张卡片都不出（`completed` 是 false），界面退回扫描结果
+/// 那张表，像这批压根没跑过。真机验收时用户点了出来：关掉「错误时暂停」之后，
+/// 失败不再弹窗、直接记一条失败接着跑，整批打完就正好落在那个洞里。
+///
+/// 病根是 `completed` 被当成了「这批跑完了」用，而它一直说的是「全部成功」。
+/// 更早一版还漏过另一半：**部分**失败时卡片出得来，却顶着「全部解压完成」这个
+/// 标题 —— 同样是假话。
+///
+/// 所以现在只有这一个枚举，`null` = 这份快照还没跑过（等价于旧的
+/// `batchRun == false`，见 [AppState.batchRun]）。
+enum BatchOutcome {
+  /// 一个没失败，也没被停。
+  clean,
+
+  /// 跑完了，但有些包没解开。
+  partial,
+
+  /// 跑完了，处理过的包一个都没解开。
+  allFailed,
+
+  /// 用户按了主按钮那颗「停止解压」。
+  stopped,
 
   /// 「解不开」弹窗里那颗「停止」。这一档**总是**伴随一次解压失败 ——
   /// 弹窗就是被那个失败引爆的。
-  error,
+  errored,
 }
 
 /// 全局应用状态。
@@ -173,23 +193,27 @@ class AppState extends ChangeNotifier {
   double _speed = 0;
   int _depth = 0;
   String _eta = '--';
-  bool _completed = false;
   String _completeDetail = '';
 
-  /// 这一批是怎么停的；`null` = 没被停过。见 [StopSource]。
-  StopSource? _stopReason;
+  /// 这一批是怎么收场的；`null` = 这份扫描快照还没跑过。见 [BatchOutcome]。
+  ///
+  /// 它是**唯一**的收场标志：界面出不出总结卡片、卡片写什么标题、主按钮是
+  /// 「开始智能解压」还是「换个文件夹」，全部由它派生 —— 见 [batchRun]。
+  ///
+  /// 从前这里是 `_completed` + `_stopReason` + `_batchRun` 三份状态，而界面
+  /// 拿 `_completed`（= 全部成功）去问「该不该出卡片」，全批失败时卡片就不见了。
+  /// 合成一个枚举之后，「跑过了」与「跑得怎么样」再无可能对不上。
+  BatchOutcome? _outcome;
 
-  /// 当前这份扫描结果**已经被解压过一轮了**（成功、失败、停止都算）。
+  /// 这一批处理过、**砸掉**的包数。收场判定要用（见 [BatchOutcome]）。
+  int _failedCount = 0;
+
+  /// 停止是用户按主按钮按出来的，而不是弹窗里那颗「停止」。
   ///
-  /// 界面要靠它决定主按钮该不该还是「开始智能解压」—— 一旦这批跑过，
-  /// 再点就等于把同一个队列重排一遍，而输出目录重名会追加 `_1`/`_2`
-  /// （见 output_paths.dart），结果不是「重新解一遍」而是往磁盘里撒重复目录。
-  ///
-  /// **停止也算跑过了**（原先是例外，真机验收时改的）：停下来的那一批现在
-  /// 会落在总结卡片上，卡片上写清「手动停止 · 已完成 1/3 个压缩包」，主按钮
-  /// 是「换个文件夹」—— 那是一条明确的出路。留着「开始智能解压」反而像什么都
-  /// 没发生过，用户会以为按下就能接着解剩下那两个，实际却是把已解过的重解一遍。
-  bool _batchRun = false;
+  /// `_cancelRequested` 两条路共用（见 [stopExtract]），收场时靠这一个 bit
+  /// 把 `stopped`（「已停止」）与 `errored`（「解压出错，已停止」）分开 ——
+  /// 后者总是伴随一次解压失败，标题里必须点出来。
+  bool _stoppedByUser = false;
 
   /// 用户在弹窗里明确放掉的包数（「跳过」/ 格式弹窗的「取消」）。
   ///
@@ -220,17 +244,30 @@ class AppState extends ChangeNotifier {
   double get speed => _speed;
   int get depth => _depth;
   String get eta => _eta;
-  bool get completed => _completed;
   String get completeDetail => _completeDetail;
 
-  /// 这一批是怎么停的；`null` = 跑完了（中途可能有失败或跳过）。
+  /// 这批解压最后是怎么收场的；`null` = 这份扫描快照还没跑过。
   ///
-  /// 总结卡片靠它选标题与配色：被停掉的批次绝不能显示「全部解压完成」。
-  StopSource? get stopReason => _stopReason;
+  /// 总结卡片的标题、配色、图标全看它。**界面不该再自己去推**「算不算完成」
+  /// —— 那正是上一版出错的来路（见 [BatchOutcome]）。
+  BatchOutcome? get outcome => _outcome;
 
-  /// 这批扫描结果已经解压过了（无论成败）。为真时主按钮应换成「换个文件夹」，
-  /// 不能再是「开始智能解压」—— 理由见 [_batchRun]。
-  bool get batchRun => _batchRun;
+  /// 这批处理过、砸掉的包数。
+  int get failedCount => _failedCount;
+
+  /// 这批扫描结果已经解压过了（无论成败、包括被停掉的）。为真时主按钮应换成
+  /// 「换个文件夹」，不能再是「开始智能解压」—— 一旦这批跑过，再点就等于把
+  /// 同一个队列重排一遍，而输出目录重名会追加 `_1`/`_2`（见 output_paths.dart），
+  /// 结果不是「重新解一遍」而是往磁盘里撒重复目录。
+  ///
+  /// **停止也算跑过了**（原先是例外，真机验收时改的）：停下来的那一批现在会
+  /// 落在总结卡片上，卡片上写清「已完成 1/3 个压缩包」，主按钮是「换个文件夹」
+  /// —— 那是一条明确的出路。留着「开始智能解压」反而像什么都没发生过，用户会
+  /// 以为按下就能接着解剩下那两个，实际却是把已解过的重解一遍。
+  ///
+  /// 它与 [outcome] 是同一个事实的两种问法（「跑过没有」/「跑得怎么样」），
+  /// 所以直接派生，不另存一个字段 —— 两份状态迟早会对不上，那正是上一版的 bug。
+  bool get batchRun => _outcome != null;
 
   // 密码库。**空库起步** —— 之前从 mock 数据播种是为了演示观感，但那会让
   // 用户第一次打开就看到四条「别人的」密码（还带假的命中次数）。真实做法是
@@ -668,10 +705,10 @@ class AppState extends ChangeNotifier {
     _speed = 0;
     _depth = 0;
     _eta = '--';
-    _completed = false;
     _completeDetail = '';
-    _batchRun = false;
-    _stopReason = null;
+    _outcome = null;
+    _failedCount = 0;
+    _stoppedByUser = false;
     _manualSkips = 0;
   }
 
@@ -689,7 +726,7 @@ class AppState extends ChangeNotifier {
     // 名字** —— 重跑不会「再解一遍」，而是把同一个队列重排一次，输出目录
     // 重名时会追加 `_1`/`_2`，等于往磁盘里撒重复目录（见 output_paths.dart）。
     // 想再来一遍就重新选一次目录，那会重新扫描，拿到的是新快照。
-    if (_batchRun) {
+    if (batchRun) {
       showToast('这批已经解压过了，换个文件夹再试', type: 'warn');
       return;
     }
@@ -712,7 +749,7 @@ class AppState extends ChangeNotifier {
   void stopExtract() {
     if (!_extracting || _cancelRequested) return;
     _cancelRequested = true;
-    _stopReason = StopSource.user;
+    _stoppedByUser = true;
     _notify();
     showToast('将在当前压缩包解完后停止');
   }
@@ -748,9 +785,10 @@ class AppState extends ChangeNotifier {
     final pauseOnError = setting('errorPause');
 
     _extracting = true;
-    _completed = false;
     _completeDetail = '';
-    _stopReason = null;
+    _outcome = null;
+    _failedCount = 0;
+    _stoppedByUser = false;
     _manualSkips = 0;
     _cancelRequested = false;
     _batchTotal = queue.length;
@@ -922,12 +960,13 @@ class AppState extends ChangeNotifier {
             );
             if (decision == ArchiveDecision.stop) {
               // 复用 `_cancelRequested`：收尾那块按它认「这一批被停过」，
-              // 总结卡片据此换成「已停止」而不是「全部解压完成」。
+              // 总结卡片据此换成「解压出错，已停止」而不是「全部解压完成」。
+              // `_stoppedByUser` **不置位** —— 这一档是弹窗里按的，标题要
+              // 把那句「解压出错」写出来（见 [BatchOutcome]）。
               //
               // 失败的这个包本身不重试：「停止」是关于整批的，不是「留着这个
               // 包等下再试」，它已经记了一条失败日志。
               _cancelRequested = true;
-              _stopReason = StopSource.error;
               failed++;
               break;
             }
@@ -962,23 +1001,22 @@ class AppState extends ChangeNotifier {
       // 分母取**最终**的 `_batchTotal` 而不是开头那张快照：递归跑出来的
       // 嵌套包也是这一批的活儿，只算开头那 8 个的话，收尾会出现
       // 「已解 12 个 / 共 8 个」这种自相矛盾的文案。
-      //
-      // **被停掉的那批也显示总结卡片**。原先中止是例外：`_completed` 为假，
-      // 界面上什么都不留，主按钮回到「开始智能解压」，看起来像什么都没发生过。
-      // 真机验收时用户点了出来 —— 半路停下的那批更需要那行字说清楚「已经解了
-      // 几个、还剩几个」，以及一颗明确的「换个文件夹」。
-      //
-      // 卡片**标题**由 [stopReason] 决定（见 `home_screen.dart` 的
-      // `_bannerTitle`），所以「停」这一档不会顶着「全部解压完成」那张绿卡片。
-      // 全线失败仍然不出卡片（`failed < _batchTotal` 为假），那条老行为没动。
-      _completed = cancelled || failed < _batchTotal;
-      // 跑完的（无论成败、也包括被停掉的）都算这份快照用掉了，主按钮一律换成
-      // 「换个文件夹」（见 [_batchRun]）。停掉之后想接着解剩下那几个，就重新
-      // 选一次目录 —— 那会重新扫描、拿到一份新快照。
+      _failedCount = failed;
+      // 一次定下收场性质。**每一批跑完都落在总结卡片上**，没有例外 ——
+      // 被停掉的那批（真机验收时用户点出来的）、整批都失败的那批（关掉
+      // 「错误时暂停」之后失败不再弹窗，全败变得很容易撞上），一样出卡片。
+      // 界面上再没有「这批好像压根没跑过」这个状态（见 [BatchOutcome]）。
+      _outcome = _outcomeOf(
+        cancelled: cancelled,
+        failed: failed,
+        done: _doneCount,
+      );
+      // `batchRun` 由 `_outcome` 派生，所以「跑过了」这件事到这里自动成立：
+      // 主按钮换成「换个文件夹」（见 [batchRun]）。停掉之后想接着解剩下那几个，
+      // 就重新选一次目录 —— 那会重新扫描、拿到一份新快照。
       //
       // 代价说清楚：重新选目录会把**已经解好的**再解一遍，输出目录重名时撒出
       // `_1`/`_2` 的重复目录。真正的续传要等 journal（条目 3）。
-      _batchRun = true;
       final elapsed = _batchStart == null
           ? Duration.zero
           : DateTime.now().difference(_batchStart!);
@@ -1056,6 +1094,28 @@ class AppState extends ChangeNotifier {
       flags: {...item.flags, ArchiveFlag.nested}.toList(),
       depth: item.depth,
     ));
+  }
+
+  /// 给这一批定收场性质。**唯一的判据来源** —— 界面不再自己推。
+  ///
+  /// [done] 是处理过的包数（成 / 败 / 跳过都算）。用**它**而不是 `_batchTotal`
+  /// 当「全败」的分母：被停掉的那批 `done` 可能远小于 `total`，而递归跑出来的
+  /// 嵌套包又会让它变大。判「处理过的里面有没有一个活的」，[done] 才是那个分母。
+  ///
+  /// 跳过不算失败：用户自己在弹窗上放掉的包（`_manualSkips`）和程序拦下的
+  /// （自引用、超深）都不该让这一批显示成「全部失败」。
+  BatchOutcome _outcomeOf({
+    required bool cancelled,
+    required int failed,
+    required int done,
+  }) {
+    if (cancelled) {
+      // 两条路的差别只在标题：主按钮那颗是「已停止」，弹窗那颗是
+      // 「解压出错，已停止」—— 后者总是伴随一次失败，瞒着不说等于骗人。
+      return _stoppedByUser ? BatchOutcome.stopped : BatchOutcome.errored;
+    }
+    if (failed == 0) return BatchOutcome.clean;
+    return failed >= done ? BatchOutcome.allFailed : BatchOutcome.partial;
   }
 
   /// 收尾文案：`N 个压缩包 · 耗时 Xs [· F 个失败] [· 手动跳过 N 个] [· N 个自动跳过]`。

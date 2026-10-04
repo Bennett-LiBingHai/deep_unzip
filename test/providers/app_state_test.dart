@@ -322,7 +322,7 @@ void main() {
       expect(state.progress, 0.0);
       expect(state.doneCount, 0);
       expect(state.eta, '--');
-      expect(state.completed, isFalse);
+      expect(state.outcome, isNull, reason: '还没跑过任何一批');
       expect(state.extracting, isFalse);
     });
 
@@ -393,7 +393,7 @@ void main() {
         endsWith('/sub/a'),
         reason: 'A/B/c.zip → A/B/c/，剥掉整个压缩后缀',
       );
-      expect(state.completed, isTrue);
+      expect(state.outcome, BatchOutcome.clean);
       expect(state.progress, 1.0);
       expect(state.completeDetail, contains('1 个压缩包'));
       expect(state.logs.first.name, 'a.zip');
@@ -632,8 +632,7 @@ void main() {
       // 停在半路也要出总结卡片，而且标题必须说「停了」而不是「完成了」
       // （见 `home_screen.dart` 的 `_bannerTitle`）。那句「完成」是假话：三个
       // 包只解了一个。
-      expect(state.completed, isTrue);
-      expect(state.stopReason, StopSource.user);
+      expect(state.outcome, BatchOutcome.stopped);
       expect(state.completeDetail, contains('已完成 1/3 个压缩包'));
       // 停止**也消费**这份快照：主按钮换成「换个文件夹」。真机验收时用户要求的
       // —— 从前的做法是放开闸门、回到「开始智能解压」，可那看起来像什么都没
@@ -982,7 +981,7 @@ void main() {
 
       // 分母跟着长：收尾必须报 2 个，不能只说开头那 1 个。
       expect(state.completeDetail, contains('2 个压缩包'));
-      expect(state.completed, isTrue);
+      expect(state.outcome, BatchOutcome.clean);
       expect(state.progress, 1.0);
     });
 
@@ -1189,10 +1188,9 @@ void main() {
 
       expect(engine.rounds, 1, reason: '停了就不该接着解 b.zip');
       expect(state.extracting, isFalse);
-      // 停止也要出总结卡片，且 `stopReason` 表明是**哪一档**停的 ——
-      // 弹窗那档总是伴随一次解压失败，标题要写「解压出错」而不是「手动停止」。
-      expect(state.completed, isTrue);
-      expect(state.stopReason, StopSource.error);
+      // 停止也要出总结卡片，且 `outcome` 表明是**哪一档**停的 ——
+      // 弹窗那档总是伴随一次解压失败，标题要写「解压出错」而不是「已停止」。
+      expect(state.outcome, BatchOutcome.errored);
       expect(state.completeDetail, contains('已完成 0/2 个压缩包'));
     });
 
@@ -1388,10 +1386,9 @@ void main() {
       // 的包直接丢掉。
       expect(engine.rounds, 1, reason: '停了就不该接着解 b.zip');
       expect(state.extracting, isFalse);
-      // 停在半路也要出总结卡片（真机验收时用户要求的），`stopReason` 指明
+      // 停在半路也要出总结卡片（真机验收时用户要求的），`outcome` 指明
       // 是弹窗那一档 —— 卡片标题据此写「解压出错，已停止」而不是「已停止」。
-      expect(state.completed, isTrue);
-      expect(state.stopReason, StopSource.error);
+      expect(state.outcome, BatchOutcome.errored);
       // 炸掉的那个算失败、不算「完成」，所以是 0/2。
       expect(state.completeDetail, contains('已完成 0/2 个压缩包'));
       expect(state.completeDetail, contains('1 个失败'));
@@ -1417,7 +1414,8 @@ void main() {
       expect(state.completeDetail, contains('手动跳过 1 个'));
       expect(state.completeDetail, isNot(contains('失败')));
       expect(state.completeDetail, isNot(contains('自动跳过')));
-      expect(state.stopReason, isNull, reason: '跑完了就不该有「停下来」这回事');
+      expect(state.outcome, BatchOutcome.clean,
+          reason: '手动跳过一个包不算失败，这一批仍是一个没砸');
     });
 
     t('关掉 errorPause → 不问了，照旧记一条失败接着跑', () async {
@@ -1723,11 +1721,11 @@ void main() {
       state.startExtract();
       await drainExtract(state);
 
-      expect(state.completed, isTrue);
+      expect(state.outcome, BatchOutcome.clean);
       expect(state.batchRun, isTrue);
     });
 
-    t('整批都失败也是「用掉了」—— 闸门不能挂在 completed 上', () async {
+    t('整批都失败也是「用掉了」—— 而且照样出总结卡片', () async {
       final root = tempRoot('as_batchrun_fail');
       put(root, 'a.zip', realZip({'x': 'y'}));
 
@@ -1742,7 +1740,10 @@ void main() {
       state.startExtract();
       await drainExtract(state);
 
-      expect(state.completed, isFalse, reason: '有失败时 completed 就是 false');
+      // 全砸了当然不是「完成」，但它绝对不是「什么都没发生」：卡片照样出，
+      // 标题是「全部失败」。从前这里 `completed` 为假，界面连卡片都不出 ——
+      // 真机验收时关掉「错误时暂停」的路径上撞出来的那个洞。
+      expect(state.outcome, BatchOutcome.allFailed);
       expect(state.batchRun, isTrue,
           reason: '失败了也重跑不得：_1/_2 照样会撒出来');
     });
@@ -1785,7 +1786,7 @@ void main() {
       await state.selectFolderPath(root.path);
 
       expect(state.batchRun, isFalse);
-      expect(state.completed, isFalse);
+      expect(state.outcome, isNull, reason: '新快照还没跑过');
 
       state.startExtract();
       await drainExtract(state);

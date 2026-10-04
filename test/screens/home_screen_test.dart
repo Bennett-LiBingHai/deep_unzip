@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:deep_unzip/engine/controller.dart';
+import 'package:deep_unzip/engine/protocol.dart';
 import 'package:deep_unzip/providers/app_state.dart';
 import 'package:deep_unzip/screens/home_screen.dart';
 import 'package:deep_unzip/services/file_manager_bridge.dart';
@@ -180,7 +181,8 @@ void main() {
       // P1 之后这里不再是「什么都没发生」：引擎真的被驱动了，整批跑完，
       // 完成横幅亮出来。这一条同时锁住了「收尾不漏状态」。
       expect(state.extracting, isFalse);
-      expect(state.completed, isTrue);
+      expect(state.outcome, BatchOutcome.clean);
+      expect(find.text('全部解压完成'), findsOneWidget);
       expect(state.logs.first.name, anyOf('a.zip', 'b.zip'));
 
       // 跑过一轮之后主按钮换成「换个文件夹」。**不能再是「开始智能解压」**：
@@ -202,8 +204,9 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(state.extracting, isFalse);
-      expect(state.completed, isFalse);
+      expect(state.outcome, isNull, reason: '取消 = 这批压根没跑过');
       expect(state.batchRun, isFalse, reason: '取消不算「这批用掉了」');
+      expect(find.text('全部解压完成'), findsNothing);
 
       final button = tester.widget<PrimaryButton>(find.byType(PrimaryButton));
       expect(button.label, '开始智能解压');
@@ -277,6 +280,63 @@ void main() {
           reason: '只解了一个包却写「全部完成」是假话');
       expect(find.textContaining('已完成 1/2 个压缩包'), findsOneWidget);
       expect(label(), '换个文件夹');
+
+      await drainTimers(tester);
+    });
+
+    testWidgets('整批都失败 → 照样落在总结页上，标题是「全部失败」', (tester) async {
+      // 真机上发现的洞：关掉「错误时暂停」之后，失败不再弹窗、直接记一条
+      // 失败接着跑，于是整批打完时 `failed == total` —— 而总结卡片的显示
+      // 条件当时挂的是 `completed`（= 全部成功），全败时是 false，于是
+      // **一张卡片都不出**，界面退回扫描结果那张表，像什么都没发生过。
+      //
+      // 病根是 `completed` 被当成了「这批跑完了」用。它说的一直是「全部成功」，
+      // 「跑完了」是 `batchRun` 的事（见 `app_state.dart` 里 `_batchRun` 的
+      // 说明）。这条用例钉住两者各归各位。
+      engine.behavior = (_, outDir) async {
+        throw const EngineException('这个包坏了', code: DuzErrorCode.extract);
+      };
+
+      await pumpHome(tester, state);
+      await tester.tap(find.byType(PrimaryButton));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('确认解压'));
+      await tester.pumpAndSettle();
+
+      expect(state.extracting, isFalse);
+      expect(state.batchRun, isTrue, reason: '前提：这一批确实跑过了');
+      // 全失败当然不是「全部解压完成」—— 绿色那张卡在这里是句假话。
+      expect(find.text('全部解压完成'), findsNothing);
+      expect(find.text('全部失败'), findsOneWidget);
+      expect(find.textContaining('2 个失败'), findsOneWidget);
+
+      final button = tester.widget<PrimaryButton>(find.byType(PrimaryButton));
+      expect(button.label, '换个文件夹',
+          reason: '总结页该带的脱困路径，全败时更要有');
+
+      await drainTimers(tester);
+    });
+
+    testWidgets('部分失败 → 也落在总结页上，不说「全部完成」', (tester) async {
+      // 全败是上面那条的极端。这条是「3 个里坏了 1 个」—— 从前它反而会出
+      // 卡片，却顶着「全部解压完成」这个标题，同样是假话。
+      engine.behavior = (e, outDir) async {
+        if (e.rounds == 1) {
+          throw const EngineException('第一个坏了', code: DuzErrorCode.extract);
+        }
+      };
+
+      await pumpHome(tester, state);
+      await tester.tap(find.byType(PrimaryButton));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('确认解压'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('全部解压完成'), findsNothing);
+      expect(find.text('部分失败'), findsOneWidget);
+      expect(find.textContaining('1 个失败'), findsOneWidget);
+      expect(find.textContaining('1/2 个压缩包'), findsNothing,
+          reason: '跑完整批就不该写成「已完成 1/2」—— 那是被停下来的说法');
 
       await drainTimers(tester);
     });
