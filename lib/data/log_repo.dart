@@ -19,18 +19,30 @@ import '../engine/format.dart';
 import '../models/log_entry.dart';
 import 'json_store.dart';
 
+/// 落盘时的**硬顶**，与用户设的保留条数无关。
+///
+/// 「日志留几条」这件事由用户说了算，权威在 `AppState._maxLogs`（跟着
+/// `SettingsData.maxLogs` 过一趟磁盘）。这个常数不是那个用途 —— 它只防一种
+/// 情况：**磁盘上那份文件被手改过**。没有它的话，一个一百万条的文件会在
+/// `main()` 等 `runApp` 的那条路上被整个解析进内存。
+///
+/// 所以它必须**高于所有可选档位**（见 `persist.dart` 的 `kMaxLogsOptions`），
+/// 否则用户调到最高档时会撞上一个他没设过的上限。
+const int kLogHardCeiling = 5000;
+
 class LogRepo {
-  LogRepo(this._store, this._file);
+  /// 具名参数写在 `_maxEntries` 上、调用点却用公开名 `maxEntries:` ——
+  /// 这是 Dart 对私有字段形参的写法（`{this._maxEntries}` 声明合法，暴露给
+  /// 调用点的名字去掉下划线）。
+  LogRepo(this._store, this._file, {this._maxEntries = kLogHardCeiling});
 
   final JsonStore _store;
   final File _file;
 
-  static const int _schemaVersion = 1;
+  /// 见 [kLogHardCeiling]。测试里会传一个小值来验封顶本身。
+  final int _maxEntries;
 
-  /// 封顶条数。与 `AppState._maxLogs` **必须一致** —— 那个是内存里的上限，
-  /// 这个是落盘时的上限；不一致的话会出现「内存里 300 条、磁盘上 500 条」，
-  /// 重启后多出来那 200 条又冒出来。
-  static const int maxEntries = 300;
+  static const int _schemaVersion = 1;
 
   /// 读回日志，最新的在前。
   ///
@@ -48,14 +60,18 @@ class LogRepo {
       if (e is! Map) continue;
       final entry = _decodeEntry(e);
       if (entry != null) out.add(entry);
-      if (out.length >= maxEntries) break;
+      if (out.length >= _maxEntries) break;
     }
     return out;
   }
 
   /// 整份覆盖写。失败会抛，由 `DeviceStore` 决定要不要吞。
+  ///
+  /// 交上来多少写多少 —— 该留几条是调用方（`AppState`）已经决定过的事，
+  /// 这里再截一刀只会让「用户设了 1000 条、磁盘上却只有 300」这种账对不上。
+  /// 唯一的例外是 [_maxEntries] 那道硬顶。
   Future<void> save(List<LogEntry> logs) {
-    final capped = logs.length > maxEntries ? logs.sublist(0, maxEntries) : logs;
+    final capped = logs.length > _maxEntries ? logs.sublist(0, _maxEntries) : logs;
     return _store.write(_file, {
       'v': _schemaVersion,
       'entries': [

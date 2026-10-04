@@ -311,6 +311,97 @@ void main() {
     });
   });
 
+  group('日志保留条数', () {
+    LogEntry numbered(int i) => LogEntry(
+          name: '第 $i 个',
+          status: LogStatus.success,
+          size: '-',
+          time: 'x',
+          duration: '-',
+          tags: const [],
+        );
+
+    t('cycleMaxLogs 一圈走遍每一档，再回到起点', () {
+      final store = FakeStore();
+      final state = AppState(engine: FakeEngine(), persistStore: store);
+      addTearDown(state.dispose);
+
+      expect(state.maxLogs, kDefaultMaxLogs);
+      expect(store.settingsSaved, isEmpty, reason: '还没动过，一次都不该写盘');
+
+      final seen = <int>[];
+      for (var i = 0; i < kMaxLogsOptions.length; i++) {
+        state.cycleMaxLogs();
+        seen.add(state.maxLogs);
+        expect(store.lastSettings?.maxLogs, state.maxLogs,
+            reason: '每切一档都要立刻交出去，不能等下次顺手写');
+      }
+
+      expect(seen.toSet(), kMaxLogsOptions.toSet(), reason: '一圈必须走遍每一档');
+      expect(seen.last, kDefaultMaxLogs, reason: '走满一圈回到起点');
+    });
+
+    t('调小上限 → 当场丢掉最早的，并立刻落盘 + 出声', () async {
+      final root = tempRoot('as_logcap_shrink');
+      put(root, 'a.zip', realZip({'x': 'y'}));
+
+      final store = FakeStore();
+      final state = AppState(
+        engine: EngineController(throttle: Duration.zero),
+        persistStore: store,
+      );
+      addTearDown(state.dispose);
+
+      // 攒到比最小档（100）多几条。每条扫描收尾都会落盘一次，所以这期间
+      // `store.lastLogs` 一直是满的 —— 正好用来验「调小之后它跟着缩」。
+      for (var i = 0; i < 105; i++) {
+        await state.selectFolderPath(root.path);
+      }
+      expect(state.logs, hasLength(105));
+      final before = List.of(state.logs);
+
+      // 档位顺序 [100, 300, 500, 1000]，从默认的 300 转到 100 要三下。
+      state.cycleMaxLogs(); // 500
+      state.cycleMaxLogs(); // 1000
+      expect(state.logs, hasLength(105), reason: '往大调不该丢东西');
+      state.cycleMaxLogs(); // 100
+      expect(state.maxLogs, 100);
+
+      expect(state.logs, hasLength(100));
+      expect(identical(state.logs.first, before.first), isTrue,
+          reason: '最新的在队首，必须留着');
+      expect(identical(state.logs.last, before[99]), isTrue,
+          reason: '砍的是队尾 —— 留下的正好是队首那 100 条');
+      expect(store.lastLogs, hasLength(100),
+          reason: '砍掉不能只砍内存：下一次落盘又会把 105 条写回去');
+      expect(store.lastSettings?.maxLogs, 100);
+      expect(state.toastType, 'warn', reason: '丢的是用户自己的历史，得说一声');
+      expect(state.toastMsg, contains('已丢弃最早的 5 条'));
+    });
+
+    t('读回来的档位生效，磁盘上多出来的当场砍掉', () {
+      final store = FakeStore()
+        ..toLoad = AppSnapshot(
+          settings: const SettingsData(maxLogs: 100),
+          // 140 条：比档位多，但远没到 `kLogHardCeiling` —— 仓库那一层
+          // 不会替我们砍，只有 `AppState` 知道用户其实只要 100 条。
+          logs: [for (var i = 0; i < 140; i++) numbered(i)],
+        );
+
+      final state = AppState(
+        engine: FakeEngine(),
+        persistStore: store,
+        restore: store.toLoad,
+      );
+      addTearDown(state.dispose);
+
+      expect(state.maxLogs, 100);
+      expect(state.logs, hasLength(100));
+      expect(state.logs.first.name, '第 0 个', reason: '最新的在前，从头留');
+      expect(state.logs.last.name, '第 99 个');
+    });
+  });
+
   group('扫描期间的状态', () {
     t('新一轮扫描作废上一轮的解压统计', () async {
       final root = tempRoot('as_reset');
@@ -1853,12 +1944,12 @@ void main() {
       expect(state.logs.single.status, LogStatus.failed);
     });
 
-    t('档位不越界、深度收敛 —— 读回来的坏值不能让设置页崩', () {
-      // 这两个字段是设置页的芯片直接拿去 `indexOf` 的：越界就是数组下标 -1，
+    t('档位不越界、深度与日志封顶都收敛 —— 读回来的坏值不能让设置页崩', () {
+      // 这几个字段都是设置页的芯片直接拿去 `indexOf` 的：越界就是数组下标 -1，
       // 打开设置页即崩。收敛在 `SettingsRepo` 里也做了一遍，这里是第二道。
       final store = FakeStore()
         ..toLoad = const AppSnapshot(
-          settings: SettingsData(maxDepth: 999, limitPreset: 88),
+          settings: SettingsData(maxDepth: 999, limitPreset: 88, maxLogs: 7),
         );
 
       final state = AppState(
@@ -1871,6 +1962,8 @@ void main() {
       expect(state.maxDepth, 20, reason: '收敛到最近的合法档');
       expect(state.limitPreset, kLimitPresets.length, reason: '夹到「自定义」档');
       expect(state.limitsCustom, isTrue);
+      // 7 离 100 最近（|7-100|=93 是所有档位里最小的）。
+      expect(state.maxLogs, 100, reason: '收敛到最近的合法档');
     });
 
     t('档里缺一个开关的键 → 那一个回出厂默认，不变成 false', () {

@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:deep_unzip/data/json_store.dart';
 import 'package:deep_unzip/data/log_repo.dart';
+import 'package:deep_unzip/data/persist.dart';
 import 'package:deep_unzip/models/log_entry.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -117,11 +118,28 @@ void main() {
     });
   });
 
-  group('封顶 300', () {
-    test('存 350 条 → 文件里只留 300（留最新的）', () async {
-      await repo.save([
-        for (var i = 0; i < 350; i++) entry('第 $i 个'),
-      ]);
+  group('硬顶 —— 与用户设的保留条数无关的那道', () {
+    test('默认不按 300 截：用户调到 1000 时磁盘上必须真有那么多', () async {
+      // 「留几条」的权威在 `AppState._maxLogs`（跟着设置走）。仓库这一层要是
+      // 还自己截一刀，用户把上限调到 1000 之后会发现磁盘上永远只有 300 ——
+      // 重启一次就少掉 700 条，而且看不出是谁丢的。
+      await repo.save([for (var i = 0; i < 500; i++) entry('第 $i 个')]);
+
+      final decoded =
+          jsonDecode(file.readAsStringSync()) as Map<String, Object?>;
+      expect(decoded['entries'] as List, hasLength(500));
+    });
+
+    test('硬顶高于每一个可选档位 —— 撞不到用户没设过的上限', () {
+      for (final opt in kMaxLogsOptions) {
+        expect(kLogHardCeiling, greaterThan(opt),
+            reason: '硬顶 $kLogHardCeiling 不得低于档位 $opt');
+      }
+    });
+
+    test('超过硬顶的那部分不写盘，留最新的', () async {
+      final capped = LogRepo(JsonStore(), file, maxEntries: 300);
+      await capped.save([for (var i = 0; i < 350; i++) entry('第 $i 个')]);
 
       final decoded =
           jsonDecode(file.readAsStringSync()) as Map<String, Object?>;
@@ -131,17 +149,19 @@ void main() {
       expect((entries.last as Map)['name'], '第 299 个');
     });
 
-    test('读的时候也封顶 —— 文件被手改成 500 条也不炸', () async {
+    test('读的时候也封顶 —— 文件被手改成一万条也不炸', () async {
+      // 封顶的理由：`main()` 是等这份日志读完才 `runApp` 的，照着一个被手改
+      // 过的文件分配内存就是启动即死。
       file.writeAsStringSync(jsonEncode({
         'v': 1,
         'entries': [
-          for (var i = 0; i < 500; i++)
+          for (var i = 0; i < kLogHardCeiling + 2000; i++)
             {'name': '第 $i 个', 'status': 'success', 'size': '-', 'time': 'x',
              'duration': '-', 'tags': <String>[]},
         ],
       }));
 
-      expect(await repo.load(), hasLength(300));
+      expect(await repo.load(), hasLength(kLogHardCeiling));
     });
   });
 

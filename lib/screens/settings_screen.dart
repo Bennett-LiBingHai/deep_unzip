@@ -101,6 +101,20 @@ class SettingsScreen extends StatelessWidget {
             const SizedBox(height: 16),
             _buildLimitsSection(context),
             const SizedBox(height: 16),
+            _group('日志', [
+              _settingItem(
+                icon: Icons.receipt_long_outlined,
+                iconColor: AppTheme.neonCyan,
+                title: '日志保留条数',
+                desc: '超出后丢弃最早的记录，调小会立刻生效',
+                trailing: _cyclerChip(
+                  label: '${state.maxLogs} 条',
+                  color: AppTheme.neonCyan,
+                  onTap: () => state.cycleMaxLogs(),
+                ),
+              ),
+            ]),
+            const SizedBox(height: 16),
             _buildExtractorSection(context),
             const SizedBox(height: 20),
           ],
@@ -237,7 +251,7 @@ class SettingsScreen extends StatelessWidget {
     );
   }
 
-  /// 点一下切下一档的 chip。深度和炸弹防护档位共用，免得两处样式各走各的。
+  /// 点一下切下一档的 chip。深度、炸弹防护、日志封顶三处共用，免得样式各走各的。
   Widget _cyclerChip({
     required String label,
     required Color color,

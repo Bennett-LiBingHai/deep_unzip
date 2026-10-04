@@ -63,19 +63,38 @@ const int kDefaultMaxDepth = 0;
 /// 改动时漏掉一处就是一个只在特定路径上才炸的 bug。
 const List<int> kMaxDepthOptions = [0, 5, 10, 20];
 
+/// 日志封顶的默认值。与原型期行为一致（那时候是 `AppState._maxLogs = 300`）。
+const int kDefaultMaxLogs = 300;
+
+/// 日志封顶的档位，设置页的芯片依次走过这张表。
+///
+/// 与 [kMaxDepthOptions] 同一个理由：`AppState.cycleMaxLogs`、设置页、加载时的
+/// 收敛（[coerceMaxLogs]）读同一份，不许各写一份。
+const List<int> kMaxLogsOptions = [100, 300, 500, 1000];
+
 /// 把磁盘上读回来的深度收敛到 [kMaxDepthOptions] 里。
 ///
 /// **必须收敛**：`settings_screen` 的芯片用 `kMaxDepthOptions.indexOf(maxDepth)`
 /// 定位，表外的值给出 `-1`，再拿去索引标签数组就是越界 —— 设置页直接打崩。
 /// 老版本写的档位、被人手改过的文件，都可能给出表外的值。
+int coerceMaxDepth(int? raw) => _nearest(kMaxDepthOptions, raw, kDefaultMaxDepth);
+
+/// 把磁盘上读回来的日志封顶收敛到 [kMaxLogsOptions] 里。
+///
+/// 这条不收敛**不会**像深度那样打崩设置页（那行只印 `'$_maxLogs 条'`，不查
+/// 表），但会留下一个芯片点不出来的数：手改成 7 之后显示「7 条」，再点一下
+/// 直接跳到「100 条」—— 用户没法理解中间发生了什么。所以照样收敛。
+int coerceMaxLogs(int? raw) => _nearest(kMaxLogsOptions, raw, kDefaultMaxLogs);
+
+/// 取表里离 [raw] 最近的一档；[raw] 为 null 或表是空的时给 [fallback]。
 ///
 /// 取**最近的合法档**而不是无脑归零：用户真设过 20 层，值要是恰好落在表外，
-/// 归零等于把他设的限制悄悄放开。
-int coerceMaxDepth(int? raw) {
-  if (raw == null) return kDefaultMaxDepth;
-  if (kMaxDepthOptions.contains(raw)) return raw;
-  var best = kMaxDepthOptions.first;
-  for (final v in kMaxDepthOptions) {
+/// 归零等于把他设的限制悄悄放开。距离相等时留先遇到的那个（表里靠前的档）。
+int _nearest(List<int> options, int? raw, int fallback) {
+  if (raw == null) return fallback;
+  if (options.contains(raw)) return raw;
+  var best = options.first;
+  for (final v in options) {
     if ((v - raw).abs() < (best - raw).abs()) best = v;
   }
   return best;
@@ -94,10 +113,16 @@ class SettingsData {
     this.maxDepth = kDefaultMaxDepth,
     this.limitPreset = kDefaultLimitPreset,
     this.limits = LimitThresholds.standard,
+    this.maxLogs = kDefaultMaxLogs,
   });
 
   final Map<String, bool> toggles;
   final int maxDepth;
+
+  /// 日志保留条数。**权威在 `AppState._maxLogs`**，这个字段只是把它带过
+  /// 磁盘这一趟：`LogRepo` 不再自己封顶（见那边的注释），内存里留多少条
+  /// 完全由这个数说了算，落盘只是把内存那一份原样写出去。
+  final int maxLogs;
 
   /// chip 停在哪一档：`kLimitPresets` 的下标，或 `kLimitPresets.length`
   /// 表示「自定义」。**必须与 [limits] 一起存**，理由见 `app_state.dart`

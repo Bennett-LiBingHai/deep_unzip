@@ -287,7 +287,40 @@ class AppState extends ChangeNotifier {
   }
 
   /// 日志封顶。纯追加写、又要在退出时整份落盘，不封顶会无限长。
-  static const int _maxLogs = 300;
+  ///
+  /// 这个数是**权威**：`LogRepo` 只管把这里交出去的那一份原样写盘，不再自己
+  /// 截一刀（见 `log_repo.dart` 的 `kLogHardCeiling`）。所以调小它必须**当场**
+  /// 把多出来的砍掉，否则内存里那 300 条会在下一次自然边界又整份写回去。
+  int _maxLogs = kDefaultMaxLogs;
+  int get maxLogs => _maxLogs;
+
+  /// 依次走过：100 → 300 → 500 → 1000 → 100…
+  void cycleMaxLogs() {
+    // 档位表在 `data/persist.dart`，与加载时的收敛（`coerceMaxLogs`）同一份。
+    final idx = kMaxLogsOptions.indexOf(_maxLogs);
+    _maxLogs = kMaxLogsOptions[(idx + 1) % kMaxLogsOptions.length];
+
+    // 调大时 dropped 是 0，什么都不用做；调小就是**当场**丢，见上面那段。
+    final dropped = _trimLogsToCap();
+    _persistSettings();
+    if (dropped == 0) {
+      _notify();
+      return;
+    }
+    // 丢的是用户自己的历史，不能悄无声息。走 toast 那条路（它内部会 notify）。
+    _persistLogs();
+    showToast('日志上限 $_maxLogs 条，已丢弃最早的 $dropped 条', type: 'warn');
+  }
+
+  /// 把 `_logs` 砍到 [_maxLogs] 以内，返回丢掉了几条。
+  ///
+  /// 只在**队尾**砍：最新的一条在队首，砍尾巴丢的是最早的，正是该丢的那头。
+  int _trimLogsToCap() {
+    if (_logs.length <= _maxLogs) return 0;
+    final dropped = _logs.length - _maxLogs;
+    _logs.removeRange(_maxLogs, _logs.length);
+    return dropped;
+  }
 
   // 解压器。**内置那几条是真配置，不是演示数据** —— 见 BuiltinExtractors。
   // 从原来的 mock_data.dart 搬过来只是因为那里被整个删掉了。
@@ -421,6 +454,7 @@ class AppState extends ChangeNotifier {
       ..addAll(s.settings.toggles);
 
     _maxDepth = coerceMaxDepth(s.settings.maxDepth);
+    _maxLogs = coerceMaxLogs(s.settings.maxLogs);
     // 档位下标收敛到合法区间；超界的归到「自定义」那档而不是 0。
     _limitPreset = s.settings.limitPreset.clamp(0, kLimitPresets.length);
     _limits = s.settings.limits;
@@ -431,6 +465,9 @@ class AppState extends ChangeNotifier {
     _logs
       ..clear()
       ..addAll(s.logs);
+    // 磁盘上那份可能比现在的上限多（上次调小之前写的、或者被手改过）。
+    // `LogRepo` 只封到 `kLogHardCeiling`，用户档位比它低，剩下的在这儿砍。
+    _trimLogsToCap();
   }
 
   /// 落盘当前设置。改一个开关就调用一次。
@@ -445,6 +482,7 @@ class AppState extends ChangeNotifier {
       // 的话，写出去的会是**编码那一刻**的内容而不是调用时的内容。
       toggles: Map.of(_settings),
       maxDepth: _maxDepth,
+      maxLogs: _maxLogs,
       limitPreset: _limitPreset,
       limits: _limits,
     )));
@@ -1210,9 +1248,7 @@ class AppState extends ChangeNotifier {
   /// 新日志进队首（最新的在最上面），并封顶。
   void _addLog(LogEntry entry) {
     _logs.insert(0, entry);
-    if (_logs.length > _maxLogs) {
-      _logs.removeRange(_maxLogs, _logs.length);
-    }
+    _trimLogsToCap();
   }
 
   void addExtractor(Extractor e) {

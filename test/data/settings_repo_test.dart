@@ -8,7 +8,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 /// 往返正确，还要钉住「键怎么摆」以及**两条收敛**：
 ///
 /// 1. `maxDepth` 必须落在 `{0,5,10,20}` 里 —— 表外的值会让设置页的芯片
-///    用 `indexOf` 拿到 -1，再拿去索引标签数组就是越界崩溃。
+///    用 `indexOf` 拿到 -1，再拿去索引标签数组就是越界崩溃。（`maxLogs`
+///    同理收敛到 `{100,300,500,1000}`，只是它不索引标签、崩不了。）
 /// 2. 非「自定义」档时，阈值**以预设为准**，不信磁盘上那四个数 ——
 ///    否则会出现「chip 写着『严格』、闸门跑的是另一套」这种没人查得出来的错。
 void main() {
@@ -24,6 +25,7 @@ void main() {
 
       expect(data.toggles, kDefaultToggles);
       expect(data.maxDepth, kDefaultMaxDepth);
+      expect(data.maxLogs, kDefaultMaxLogs);
       expect(data.limitPreset, kDefaultLimitPreset);
       expect(data.limits, LimitThresholds.standard);
     });
@@ -45,7 +47,7 @@ void main() {
   });
 
   group('往返', () {
-    test('六个开关 + 深度 + 自定义阈值原样回来', () async {
+    test('六个开关 + 深度 + 日志封顶 + 自定义阈值原样回来', () async {
       const saved = SettingsData(
         toggles: {
           'recursive': false,
@@ -56,6 +58,7 @@ void main() {
           'errorPause': true,
         },
         maxDepth: 10,
+        maxLogs: 1000,
         limitPreset: 3, // 3 == kLimitPresets.length，即「自定义」
         limits: LimitThresholds(
           maxEntries: 12345,
@@ -70,6 +73,7 @@ void main() {
 
       expect(back.toggles, saved.toggles);
       expect(back.maxDepth, 10);
+      expect(back.maxLogs, 1000);
       expect(back.limitPreset, 3);
       expect(back.limits.maxEntries, 12345);
       expect(back.limits.maxEntryBytes, 2 << 30);
@@ -108,6 +112,17 @@ void main() {
       // 用户真设过 20 层，值要是落在表外，归零等于把他设的限制悄悄放开。
       SharedPreferences.setMockInitialValues({'maxDepth': 19});
       expect((await repo.load()).maxDepth, 20);
+    });
+
+    test('日志封顶落在表外 → 收敛到最近的合法档', () async {
+      // 崩是崩不了（那行只印 `'$maxLogs 条'`），但表外的值会给用户一个
+      // 点不出来的数：显示「7 条」，再点一下直接跳到「100 条」。
+      for (final (raw, expected) in [(7, 100), (4999, 1000), (0, 100), (350, 300)]) {
+        SharedPreferences.setMockInitialValues({'maxLogs': raw});
+        final data = await repo.load();
+        expect(data.maxLogs, expected, reason: '$raw 应收敛成 $expected');
+        expect(kMaxLogsOptions.contains(data.maxLogs), isTrue);
+      }
     });
 
     test('档位下标越界 → 夹回合法区间', () async {
@@ -154,6 +169,7 @@ void main() {
       expect(prefs.getBool('toggle.recursive'), isTrue);
       expect(prefs.getBool('toggle.errorPause'), isTrue);
       expect(prefs.getInt('maxDepth'), kDefaultMaxDepth);
+      expect(prefs.getInt('maxLogs'), kDefaultMaxLogs);
       expect(prefs.getInt('limitPreset'), kDefaultLimitPreset);
       expect(prefs.getInt('limit.entries'), LimitThresholds.standard.maxEntries);
       expect(prefs.getInt('limit.ratio'), LimitThresholds.standard.maxRatio);

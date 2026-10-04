@@ -12,6 +12,7 @@
 /// |---|---|---|
 /// | `toggle.<名>` | bool | 六个开关，逐个独立存 |
 /// | `maxDepth` | int | 递归深度，`{0,5,10,20}` |
+/// | `maxLogs` | int | 日志保留条数，`{100,300,500,1000}` |
 /// | `limitPreset` | int | 炸弹档位下标，或「自定义」 |
 /// | `limit.<字段>` | int | 自定义时那四个阈值 |
 ///
@@ -31,6 +32,7 @@ class SettingsRepo {
   static const String _togglePrefix = 'toggle.';
   static const String _limitPrefix = 'limit.';
   static const String _keyMaxDepth = 'maxDepth';
+  static const String _keyMaxLogs = 'maxLogs';
   static const String _keyLimitPreset = 'limitPreset';
 
   Future<SettingsData> load() async {
@@ -45,6 +47,7 @@ class SettingsRepo {
     }
 
     final maxDepth = coerceMaxDepth(prefs.getInt(_keyMaxDepth));
+    final maxLogs = coerceMaxLogs(prefs.getInt(_keyMaxLogs));
     final preset = _coercePreset(prefs.getInt(_keyLimitPreset));
 
     // 预设档位时**以预设为准**，不信磁盘上那四个数：它们可能来自一个更早的
@@ -65,6 +68,7 @@ class SettingsRepo {
     return SettingsData(
       toggles: toggles,
       maxDepth: maxDepth,
+      maxLogs: maxLogs,
       limitPreset: preset,
       limits: limits,
     );
@@ -76,6 +80,7 @@ class SettingsRepo {
       await prefs.setBool('$_togglePrefix${entry.key}', entry.value);
     }
     await prefs.setInt(_keyMaxDepth, data.maxDepth);
+    await prefs.setInt(_keyMaxLogs, data.maxLogs);
     await prefs.setInt(_keyLimitPreset, data.limitPreset);
     for (final field in LimitField.values) {
       await prefs.setInt('$_limitPrefix${field.name}', field.read(data.limits));
