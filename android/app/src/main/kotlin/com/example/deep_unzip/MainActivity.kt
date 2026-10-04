@@ -37,12 +37,26 @@ import java.io.File
  * 把这两种情况压成一个 `true`，界面就只能假装成功。所以往上如实回结果码，
  * 由 Dart 侧（见 `lib/services/file_manager_bridge.dart`）决定怎么跟用户说。
  *
- * ## 不要加 `<queries>`
+ * ## 为什么必须**显式点名**组件，不能发隐式 Intent
  *
- * `startActivity` **不受**包可见性过滤，只有 `query*` 系列 API 才受。所以这里
- * 一律「直接试、捕 `ActivityNotFoundException`」，不用 `resolveActivity` ——
- * 后者在 API 30+ 会因为看不到而误报「没人能处理」。同理也不需要给 Manifest
- * 加任何东西。
+ * 真机上量出来的（Redmi Note 13 Pro / Android 16）：
+ *
+ * - `VIEW + vnd.android.document/directory` 有 **7 个**处理者 —— 除了
+ *   DocumentsUI，还有夸克浏览器、百度网盘、UC、智慧树、以及另一个解压软件。
+ *   隐式发出去就是一个「用哪个应用打开」的选择器。「打开输出目录」弹这个，
+ *   等于请用户拿浏览器的文件夹视图去看解压结果。
+ * - 而且 targetSdk 30+ 的 app 没有 `<queries>` 时**一个都看不见**，隐式 Intent
+ *   连解析都失败，直接 `ActivityNotFoundException`。（这一条我一开始写反了：
+ *   以为 `startActivity` 不受包可见性过滤 —— 那是「显式 Intent 不受过滤」，
+ *   隐式照样受。）
+ * - 本机的 DocumentsUI 是**小米塞的 Google 版**，包名
+ *   `com.google.android.documentsui`，而类名还是 AOSP 的
+ *   `com.android.documentsui.files.FilesActivity`。点名 AOSP 包名会
+ *   `START_CLASS_NOT_FOUND`。所以包名要两条都试。
+ *
+ * 结论：先用 `<queries>` 放行的 `queryIntentActivities` 问出**设备上真实存在**
+ * 的 DocumentsUI，逐个显式开；问不出来再猜两个已知包名。隐式 Intent 只留一道，
+ * 排在最后当兜底。
  */
 class MainActivity : FlutterActivity() {
 
@@ -53,9 +67,20 @@ class MainActivity : FlutterActivity() {
         /** 系统 ExternalStorageProvider 的 authority。 */
         const val EXTERNAL_STORAGE_AUTHORITY = "com.android.externalstorage.documents"
 
-        /** AOSP DocumentsUI 的主界面，兜底时点名用。 */
-        const val DOCUMENTSUI_PACKAGE = "com.android.documentsui"
-        const val DOCUMENTSUI_ACTIVITY = "com.android.documentsui.files.FilesActivity"
+        /**
+         * DocumentsUI 的文件浏览界面。**类名在 AOSP 与 Google 版上是一样的**，
+         * 不一样的是包名 —— 见 [KNOWN_DOCUMENTSUI_PACKAGES]。
+         */
+        const val DOCUMENTSUI_FILES_ACTIVITY = "com.android.documentsui.files.FilesActivity"
+
+        /**
+         * 已知的 DocumentsUI 包名，两个都试。
+         *
+         * 第一个是 Google 版（小米等 ROM 直接塞的这个，本机实测就是它）；
+         * 第二个是 AOSP 原版。`queryIntentActivities` 那一路问不出来时靠这个兜底。
+         */
+        val KNOWN_DOCUMENTSUI_PACKAGES =
+            listOf("com.google.android.documentsui", "com.android.documentsui")
 
         /** 主存储卷的 docId 前缀。`StorageVolume.getUuid()` 对主卷返回 null。 */
         const val PRIMARY_VOLUME_ID = "primary"
@@ -99,12 +124,20 @@ class MainActivity : FlutterActivity() {
 
         val uri = documentUriFor(path) ?: return R_UNSUPPORTED_PATH
 
-        // 三道精确方案，从最标准到最具体。只要有一道被系统接受就算成功 ——
-        // 注意「被接受」只说明有 app 接了这个 Intent，不代表它乖乖跳到了
-        // 目标目录（那是它的事，我们查不了）。所以下面还有 generic 一档。
-        if (tryStart(preciseIntent(uri))) return R_OPENED
-        if (tryStart(bareIntent(uri))) return R_OPENED
-        if (tryStart(explicitDocumentsUi(uri))) return R_OPENED
+        // 逐个点名 DocumentsUI。只要有一个起得来就算成功 ——
+        // 注意「起得来」只说明这个组件接受了 Intent，不代表它乖乖跳到了目标
+        // 目录（那是它的事，我们查不了）。所以下面还有 generic 一档。
+        for (component in documentsUiCandidates()) {
+            if (tryStart(documentsUiIntent(uri).setComponent(component))) {
+                return R_OPENED
+            }
+        }
+
+        // 设备上认 content:// 目录 URI 的 app 可能一个都不叫 documentsui
+        // （包名对不上、或者 `<queries>` 跟新 ROM 对不上，两条路都落空）。
+        // 隐式发一道 —— 代价是装了几个处理者的话会弹选择器，所以排在最后，
+        // 而且必须在 generic 之前：它至少还带着目标目录。
+        if (tryStart(documentsUiIntent(uri))) return R_OPENED
 
         // 最后一档：不指定目录，只要能开出一个文件管理器。
         // 如实回 opened_generic，界面会把路径摆给用户让他自己点进去。
@@ -114,35 +147,41 @@ class MainActivity : FlutterActivity() {
     }
 
     /**
-     * 「这是一份目录」—— 正规写法，带 MIME type，支持的文件管理器会直接跳进去。
-     */
-    private fun preciseIntent(uri: Uri): Intent =
-        Intent(Intent.ACTION_VIEW)
-            .setDataAndType(uri, DocumentsContract.Document.MIME_TYPE_DIR)
-            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-
-    /**
-     * 有些文件管理器只按 data 匹配、完全不看 type，带上 `vnd.android.document/directory`
-     * 反而不匹配。去掉 type 再试一次。
-     */
-    private fun bareIntent(uri: Uri): Intent =
-        Intent(Intent.ACTION_VIEW)
-            .setData(uri)
-            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-
-    /**
-     * 点名 AOSP DocumentsUI。有些 ROM 上它没声明 `directory` 的 MIME 过滤器，
-     * 隐式 Intent 匹配不到，但点名组件能起。
+     * 能开目录、且包名像 DocumentsUI 的组件，按可信度排序。
      *
-     * 显式 Intent 打别的 app 的组件可能吃 `SecurityException`（没导出），
+     * 见类注释：为什么不能用隐式 Intent，以及为什么包名要试两个。
+     * 显式 Intent 打别的 app 没导出的组件会吃 `SecurityException`，
      * [tryStart] 一并当「没找到」处理。
      */
-    private fun explicitDocumentsUi(uri: Uri): Intent =
+    private fun documentsUiCandidates(): List<ComponentName> {
+        val out = LinkedHashSet<ComponentName>()
+
+        // 1. 问系统要设备上**真实存在**的处理者，只留包名像 DocumentsUI 的。
+        //    这一条能扛住 OEM 改名，优先于任何写死的名字。
+        val query = Intent(Intent.ACTION_VIEW)
+            .setType(DocumentsContract.Document.MIME_TYPE_DIR)
+            .addCategory(Intent.CATEGORY_DEFAULT)
+        packageManager.queryIntentActivities(query, 0)
+            .map { it.activityInfo }
+            .filter { it.packageName.contains("documentsui", ignoreCase = true) }
+            .forEach { out += ComponentName(it.packageName, it.name) }
+
+        // 2. 猜名字兜底。上一步依赖 Manifest 里的 `<queries>` 与 ROM 对得上，
+        //    对不上时这里是最后的机会。
+        KNOWN_DOCUMENTSUI_PACKAGES.forEach {
+            out += ComponentName(it, DOCUMENTSUI_FILES_ACTIVITY)
+        }
+
+        return out.toList()
+    }
+
+    /**
+     * 「这是一份目录」—— 正规写法，带 MIME type。DocumentsUI 收到后会直接
+     * 跳进这个目录。
+     */
+    private fun documentsUiIntent(uri: Uri): Intent =
         Intent(Intent.ACTION_VIEW)
             .setDataAndType(uri, DocumentsContract.Document.MIME_TYPE_DIR)
-            .setComponent(
-                ComponentName(DOCUMENTSUI_PACKAGE, DOCUMENTSUI_ACTIVITY)
-            )
             .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
 
     /**

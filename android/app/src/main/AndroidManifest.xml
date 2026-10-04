@@ -65,5 +65,23 @@
             <action android:name="android.intent.action.PROCESS_TEXT"/>
             <data android:mimeType="text/plain"/>
         </intent>
+
+        <!-- 「打开输出目录」要开 DocumentsUI（见 MainActivity.kt）。
+
+             为什么非得声明：`<queries>` 是**声明**不是**权限** —— 没有授权弹窗、
+             没有隐私面，也不影响 Release 包「不联网、单机应用」的身份。
+             但不声明的话，targetSdk 30+ 的应用在包可见性过滤下**看不见**
+             DocumentsUI，隐式 Intent 直接解析失败（本机实测：7 个可处理者一个都
+             看不到）。声明之后 `queryIntentActivities` 才拿得到真实组件名，
+             我们也才有可能点名调用而不是发一个会弹出「用哪个应用打开」的隐式 Intent。 -->
+        <intent>
+            <action android:name="android.intent.action.VIEW"/>
+            <category android:name="android.intent.category.DEFAULT"/>
+            <data android:mimeType="vnd.android.document/directory"/>
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.MAIN"/>
+            <category android:name="android.intent.category.APP_FILES"/>
+        </intent>
     </queries>
 </manifest>

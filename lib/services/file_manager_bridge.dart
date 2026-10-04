@@ -15,6 +15,12 @@
 ///   `content://`，不触发上面那个异常；而且它是系统的 provider，接收方不用认识
 ///   我们。docId 形如 `primary:Download/foo`。
 ///
+/// 但光有 URI 还不够 —— **还得点名 DocumentsUI 组件**，因为真机上
+/// `VIEW + vnd.android.document/directory` 有 7 个处理者（夸克、百度网盘、UC…），
+/// 隐式发出去是个「用哪个应用打开」的选择器。细节与两条踩过的坑（小米塞的是
+/// **Google 版** DocumentsUI，包名与 AOSP 不同；以及 `<queries>` 不声明就连
+/// 一个处理者都看不见）都写在 `MainActivity.kt` 的类注释里。
+///
 /// ## 这个桥为什么返回枚举而不是 bool
 ///
 /// 因为「打开成功」有好几档含义。系统里真正认识那个 URI 的文件管理器是 AOSP
