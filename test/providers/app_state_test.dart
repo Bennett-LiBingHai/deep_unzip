@@ -9,7 +9,6 @@ import 'package:deep_unzip/models/archive_file.dart';
 import 'package:deep_unzip/models/extractor.dart';
 import 'package:deep_unzip/models/log_entry.dart';
 import 'package:deep_unzip/providers/app_state.dart';
-import 'package:deep_unzip/utils/mock_data.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
 
@@ -641,13 +640,20 @@ void main() {
 
     t('addPassword 拒绝空串与重复', () {
       final state = booted();
+      // 密码库空库起步（见 AppState 里的注释），所以先自己放一条进去，
+      // 才有「重复」可谈。
+      expect(state.passwords, isEmpty, reason: '夹具前提：不该再有播种数据');
+
       final before = state.passwords.length;
 
       state.addPassword('');
-      expect(state.passwords.length, before);
+      expect(state.passwords.length, before, reason: '空串不该进库');
 
-      state.addPassword(MockData.passwords.first.value);
-      expect(state.passwords.length, before, reason: '重复密码不该进库');
+      state.addPassword('已存在');
+      expect(state.passwords.length, before + 1);
+
+      state.addPassword('已存在');
+      expect(state.passwords.length, before + 1, reason: '重复密码不该进库');
     });
 
     t('addPassword 成功的插到队首', () {
@@ -660,11 +666,17 @@ void main() {
 
     t('deletePassword 按下标删', () {
       final state = booted();
-      final target = state.passwords[1].value;
+      // addPassword 插队首，所以这里最终的顺序是 [第二条, 第一条]；
+      // 下标 1 上应当是先加的那条。
+      state.addPassword('第一条');
+      state.addPassword('第二条');
+      expect(state.passwords[1].value, '第一条');
 
       state.deletePassword(1);
 
-      expect(state.passwords.any((p) => p.value == target), isFalse);
+      expect(state.passwords.any((p) => p.value == '第一条'), isFalse);
+      expect(state.passwords.any((p) => p.value == '第二条'), isTrue,
+          reason: '只该删掉下标 1 那条');
     });
 
     t('内置解压器删不掉', () {

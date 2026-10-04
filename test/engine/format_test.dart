@@ -2,9 +2,10 @@ import 'package:deep_unzip/engine/format.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
-  group('formatBytes：必须与 mock_data 同形', () {
-    test('mock 里出现过的每一个值都要还原得一模一样', () {
-      // 取自 lib/utils/mock_data.dart，这是 UI 已经习惯的形状。
+  group('formatBytes：必须与页面习惯的形状同形', () {
+    test('UI 里出现过的每一个值都要还原得一模一样', () {
+      // 这些是页面渲染时习惯的形状（原先由 mock 数据示范，那份数据已删；
+      // 值本身是 UI 的既有契约，不能变）。
       expect(formatBytes(245 * 1024 * 1024), '245 MB');
       expect(formatBytes(88 * 1024 * 1024), '88 MB');
       expect(formatBytes(12 * 1024 * 1024), '12 MB');

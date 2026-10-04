@@ -7,6 +7,7 @@ import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 import 'package:permission_handler/permission_handler.dart';
 
+import '../data/builtin_extractors.dart';
 import '../engine/controller.dart';
 import '../engine/cycles.dart';
 import '../engine/format.dart';
@@ -20,7 +21,6 @@ import '../models/archive_file.dart';
 import '../models/extractor.dart';
 import '../models/log_entry.dart';
 import '../models/password_entry.dart';
-import '../utils/mock_data.dart';
 
 /// 全局应用状态。
 ///
@@ -149,12 +149,14 @@ class AppState extends ChangeNotifier {
   /// 暂停中。区别于 [extracting]：暂停时 `extracting` 为 false 但任务还在。
   bool get paused => _paused;
 
-  // 密码库
-  final List<PasswordEntry> _passwords = List.from(MockData.passwords);
+  // 密码库。**空库起步** —— 之前从 mock 数据播种是为了演示观感，但那会让
+  // 用户第一次打开就看到四条「别人的」密码（还带假的命中次数）。真实做法是
+  // 让用户自己攒；P4 接上 `flutter_secure_storage` 后这里改成从 `vault_v1` 读。
+  final List<PasswordEntry> _passwords = [];
   List<PasswordEntry> get passwords => List.unmodifiable(_passwords);
 
-  // 日志
-  final List<LogEntry> _logs = List.from(MockData.logs);
+  // 日志。同样空库起步：历史应当只记录**本机真的解压过**的东西。
+  final List<LogEntry> _logs = [];
   List<LogEntry> get logs => List.unmodifiable(_logs);
   LogStatus? _logFilter;
   LogStatus? get logFilter => _logFilter;
@@ -167,8 +169,9 @@ class AppState extends ChangeNotifier {
   /// 日志封顶。纯追加写、又要在退出时整份落盘，不封顶会无限长。
   static const int _maxLogs = 300;
 
-  // 解压器
-  final List<Extractor> _extractors = List.from(MockData.extractors);
+  // 解压器。**内置那几条是真配置，不是演示数据** —— 见 BuiltinExtractors。
+  // 从原来的 mock_data.dart 搬过来只是因为那里被整个删掉了。
+  final List<Extractor> _extractors = List.from(BuiltinExtractors.all);
   List<Extractor> get extractors => List.unmodifiable(_extractors);
 
   // 设置开关

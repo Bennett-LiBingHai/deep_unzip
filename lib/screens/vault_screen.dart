@@ -79,6 +79,12 @@ class _VaultScreenState extends State<VaultScreen> {
   }
 
   Widget _buildSummary() {
+    // 右边那格原本是写死的 `87%`（标签「历史匹配率」）—— 纯装饰。密码库改成
+    // 空库起步之后，那个数字跟左边的「0 已保存密码」直接打架，所以换成真的：
+    // 库里各条 hitCount 之和。P4 接上真实匹配计数后这里会更有意义。
+    final hits =
+        widget.state.passwords.fold<int>(0, (sum, p) => sum + p.hitCount);
+
     return GlassCard(
       padding: const EdgeInsets.all(16),
       child: Row(
@@ -106,9 +112,9 @@ class _VaultScreenState extends State<VaultScreen> {
           Column(
             crossAxisAlignment: CrossAxisAlignment.end,
             children: [
-              const Text(
-                '87%',
-                style: TextStyle(
+              Text(
+                '$hits',
+                style: const TextStyle(
                   fontSize: 18,
                   fontWeight: FontWeight.w700,
                   fontFamily: 'monospace',
@@ -117,7 +123,7 @@ class _VaultScreenState extends State<VaultScreen> {
               ),
               const SizedBox(height: 2),
               const Text(
-                '历史匹配率',
+                '累计命中',
                 style: TextStyle(fontSize: 11, color: AppTheme.textDim),
               ),
             ],

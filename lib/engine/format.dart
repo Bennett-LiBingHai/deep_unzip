@@ -1,10 +1,10 @@
 /// 展示格式化。
 ///
 /// 集中在这里的唯一理由：UI 的 `ArchiveFile.size` / `LogEntry.duration` /
-/// `LogEntry.size` 都是**预格式化字符串**，`mock_data.dart` 里已经定好了形状，
-/// 真实数据必须长成一样，否则列表会出现 `245 MB` 与 `245.0MB` 混排。
+/// `LogEntry.size` 都是**预格式化字符串**，页面按固定形状渲染，真实数据必须
+/// 长成一样，否则列表会出现 `245 MB` 与 `245.0MB` 混排。
 ///
-/// 已确认的既有形状（来自 `mock_data.dart` 与三个页面）：
+/// 已确认的既有形状（来自三个页面的渲染，并由 `test/engine/format_test.dart` 钉住）：
 ///
 /// | 用法 | 形状 |
 /// |---|---|
@@ -12,7 +12,7 @@
 /// | `LogEntry.duration` | `12.8s` / `45.1s` / `-`（未知） |
 /// | `AppState.eta` | `12s` / `--`（未知） |
 /// | `AppState.speed` | 双精度 MB/s，页面自己拼 `MB/s` |
-/// | `vault_screen` 的百分比 | `87%` |
+/// | `home_screen` 的进度百分比 | `87%` |
 library;
 
 /// 1024 进制单位。
@@ -20,7 +20,7 @@ const List<String> _kUnits = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
 
 /// `245 MB` / `1.2 GB` / `512 B`。
 ///
-/// 规则与 mock 数据一致：数值 < 10 保留一位小数，否则取整。
+/// 规则与既有形状一致：数值 < 10 保留一位小数，否则取整。
 /// 字节级别不带小数（`512 B` 而不是 `512.0 B`）。
 String formatBytes(int bytes) {
   if (bytes <= 0) return '0 B';
@@ -77,8 +77,8 @@ String formatPercent(double fraction) {
 
 /// 千分位分组：`12345` → `12,345`。
 ///
-/// 用于「N 个文件」这类计数 —— mock 数据没有这个形态，
-/// 但递归解压很容易出现五位数条目，不分隔读不出来。
+/// 用于「N 个文件」这类计数 —— 递归解压很容易出现五位数条目，
+/// 不分隔读不出来。
 String formatCount(int n) {
   final negative = n < 0;
   final digits = n.abs().toString();
