@@ -321,7 +321,7 @@ void main() {
           tags: const [],
         );
 
-    t('cycleMaxLogs 一圈走遍每一档，再回到起点', () {
+    t('setMaxLogs 填多少就是多少，不吸附到档位', () {
       final store = FakeStore();
       final state = AppState(engine: FakeEngine(), persistStore: store);
       addTearDown(state.dispose);
@@ -329,16 +329,20 @@ void main() {
       expect(state.maxLogs, kDefaultMaxLogs);
       expect(store.settingsSaved, isEmpty, reason: '还没动过，一次都不该写盘');
 
-      final seen = <int>[];
-      for (var i = 0; i < kMaxLogsOptions.length; i++) {
-        state.cycleMaxLogs();
-        seen.add(state.maxLogs);
-        expect(store.lastSettings?.maxLogs, state.maxLogs,
-            reason: '每切一档都要立刻交出去，不能等下次顺手写');
-      }
+      state.setMaxLogs(347);
+      expect(state.maxLogs, 347, reason: '347 就该是 347，不该被挪成 300 或 500');
+      expect(store.lastSettings?.maxLogs, 347,
+          reason: '改完要立刻交出去，不能等下次顺手写');
+    });
 
-      expect(seen.toSet(), kMaxLogsOptions.toSet(), reason: '一圈必须走遍每一档');
-      expect(seen.last, kDefaultMaxLogs, reason: '走满一圈回到起点');
+    t('越界夹回区间 —— 弹窗那边先拦一道，这是第二道', () {
+      final state = AppState(engine: FakeEngine());
+      addTearDown(state.dispose);
+
+      state.setMaxLogs(0);
+      expect(state.maxLogs, kMinMaxLogs);
+      state.setMaxLogs(999999);
+      expect(state.maxLogs, kMaxMaxLogs);
     });
 
     t('调小上限 → 当场丢掉最早的，并立刻落盘 + 出声', () async {
@@ -360,11 +364,9 @@ void main() {
       expect(state.logs, hasLength(105));
       final before = List.of(state.logs);
 
-      // 档位顺序 [100, 300, 500, 1000]，从默认的 300 转到 100 要三下。
-      state.cycleMaxLogs(); // 500
-      state.cycleMaxLogs(); // 1000
+      state.setMaxLogs(1000);
       expect(state.logs, hasLength(105), reason: '往大调不该丢东西');
-      state.cycleMaxLogs(); // 100
+      state.setMaxLogs(100);
       expect(state.maxLogs, 100);
 
       expect(state.logs, hasLength(100));
@@ -383,7 +385,7 @@ void main() {
       final store = FakeStore()
         ..toLoad = AppSnapshot(
           settings: const SettingsData(maxLogs: 100),
-          // 140 条：比档位多，但远没到 `kLogHardCeiling` —— 仓库那一层
+          // 140 条：比用户设的 100 多，但远没到 `kMaxMaxLogs` —— 仓库那一层
           // 不会替我们砍，只有 `AppState` 知道用户其实只要 100 条。
           logs: [for (var i = 0; i < 140; i++) numbered(i)],
         );
@@ -1944,9 +1946,14 @@ void main() {
       expect(state.logs.single.status, LogStatus.failed);
     });
 
-    t('档位不越界、深度与日志封顶都收敛 —— 读回来的坏值不能让设置页崩', () {
-      // 这几个字段都是设置页的芯片直接拿去 `indexOf` 的：越界就是数组下标 -1，
-      // 打开设置页即崩。收敛在 `SettingsRepo` 里也做了一遍，这里是第二道。
+    t('档位不越界、深度收敛、日志封顶夹回 —— 读回来的坏值不能让设置页崩', () {
+      // `maxDepth`/`limitPreset` 是设置页的芯片直接拿去 `indexOf` 的：越界就是
+      // 数组下标 -1，打开设置页即崩。收敛在 `SettingsRepo` 里也做了一遍，
+      // 这里是第二道。
+      //
+      // `maxLogs` 走的是**另一条**路：它不是芯片，是自由输入框，所以只夹回
+      // 区间、**不吸附到档位**。7 是合法值，就该是 7 —— 把它挪到某个「最近的
+      // 档」正是用户上一轮明确否掉的做法。
       final store = FakeStore()
         ..toLoad = const AppSnapshot(
           settings: SettingsData(maxDepth: 999, limitPreset: 88, maxLogs: 7),
@@ -1962,8 +1969,25 @@ void main() {
       expect(state.maxDepth, 20, reason: '收敛到最近的合法档');
       expect(state.limitPreset, kLimitPresets.length, reason: '夹到「自定义」档');
       expect(state.limitsCustom, isTrue);
-      // 7 离 100 最近（|7-100|=93 是所有档位里最小的）。
-      expect(state.maxLogs, 100, reason: '收敛到最近的合法档');
+      expect(state.maxLogs, 7, reason: '自由输入不吸附 —— 合法值原样留着');
+    });
+
+    t('日志封顶是负的 / 是 0 → 夹回下界，别让它变成一条都不留', () {
+      // 0 会被夹到 [kMinMaxLogs]，而不是被当成「不记录日志」—— 那是另一个
+      // 语义，该由一个独立的开关来表意，不该跟「手滑填了个 0」混在一起。
+      for (final raw in [-3, 0]) {
+        final store = FakeStore()
+          ..toLoad = AppSnapshot(settings: SettingsData(maxLogs: raw));
+
+        final state = AppState(
+          engine: FakeEngine(),
+          persistStore: store,
+          restore: store.toLoad,
+        );
+        addTearDown(state.dispose);
+
+        expect(state.maxLogs, kMinMaxLogs, reason: '$raw 该夹到 $kMinMaxLogs');
+      }
     });
 
     t('档里缺一个开关的键 → 那一个回出厂默认，不变成 false', () {

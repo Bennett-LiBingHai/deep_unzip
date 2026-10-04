@@ -294,13 +294,12 @@ class AppState extends ChangeNotifier {
   int _maxLogs = kDefaultMaxLogs;
   int get maxLogs => _maxLogs;
 
-  /// 依次走过：100 → 300 → 500 → 1000 → 100…
-  void cycleMaxLogs() {
-    // 档位表在 `data/persist.dart`，与加载时的收敛（`coerceMaxLogs`）同一份。
-    final idx = kMaxLogsOptions.indexOf(_maxLogs);
-    _maxLogs = kMaxLogsOptions[(idx + 1) % kMaxLogsOptions.length];
+  /// 改日志保留条数。自由输入，界外由 `coerceMaxLogs` 夹回
+  /// [kMinMaxLogs]–[kMaxMaxLogs]（弹窗那边也会先拦一道，这里是第二道）。
+  void setMaxLogs(int value) {
+    _maxLogs = coerceMaxLogs(value);
 
-    // 调大时 dropped 是 0，什么都不用做；调小就是**当场**丢，见上面那段。
+    // 调大时 dropped 是 0，什么都不用做；调小就是**当场**丢，见 [_maxLogs] 那段。
     final dropped = _trimLogsToCap();
     _persistSettings();
     if (dropped == 0) {

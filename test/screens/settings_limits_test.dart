@@ -1,3 +1,4 @@
+import 'package:deep_unzip/data/persist.dart';
 import 'package:deep_unzip/engine/limits.dart';
 import 'package:deep_unzip/providers/app_state.dart';
 import 'package:deep_unzip/screens/settings_screen.dart';
@@ -34,9 +35,10 @@ void main() {
   tearDown(() => state.dispose());
 
   Future<void> pumpSettings(WidgetTester tester) async {
-    // 设置页比一屏长得多（递归/识别/错误/炸弹/扩展五组），默认 800×600 会把
-    // 炸弹防护那组整个挤出视口。调高画布让五组全部落在视口内。
-    await tester.binding.setSurfaceSize(const Size(800, 2400));
+    // 设置页比一屏长得多（递归/识别/错误/炸弹/日志/扩展六组），默认 800×600
+    // 会把炸弹防护那组整个挤出视口。调高画布让六组全部落在视口内 ——
+    // `ListView` 是按视口惰性挂载的，没进视口的那组连 `find` 都找不到。
+    await tester.binding.setSurfaceSize(const Size(800, 2800));
     addTearDown(() => tester.binding.setSurfaceSize(null));
     await tester.pumpWidget(MaterialApp(
       theme: AppTheme.dark,
@@ -79,6 +81,16 @@ void main() {
     expect(find.byType(TextField), findsOneWidget, reason: '${field.label} 的弹窗没打开');
   }
 
+  /// 某一行上有没有那支笔。
+  ///
+  /// **必须按行问**，不能全页 `find.byIcon(Icons.edit_outlined)` 数个数：设置页
+  /// 上现在不止一行带笔（炸弹防护四行 + 日志条数那一行），全页计数会把别的行
+  /// 算进来 —— 于是「预设档位下这几行不该带笔」会在笔跑到别的行上时照样通过。
+  Finder pencilIn(String label) => find.descendant(
+        of: find.ancestor(of: find.text(label), matching: find.byType(Row)),
+        matching: find.byIcon(Icons.edit_outlined),
+      );
+
   testWidgets('默认「标准」：四行照常列出来，但只读', (tester) async {
     await pumpSettings(tester);
 
@@ -92,8 +104,10 @@ void main() {
           reason: '${field.label} 摆的不是「标准」这一档的数');
     }
 
-    expect(find.byIcon(Icons.edit_outlined), findsNothing,
-        reason: '预设档位下这几行不该带那支笔');
+    for (final field in LimitField.values) {
+      expect(pencilIn(field.label), findsNothing,
+          reason: '预设档位下 ${field.label} 不该带那支笔');
+    }
     await tester.tap(find.text(LimitField.totalBytes.label));
     await tester.pumpAndSettle();
     expect(find.byType(TextField), findsNothing,
@@ -113,15 +127,19 @@ void main() {
     expect(rowValue(tester, LimitField.totalBytes),
         LimitField.totalBytes.display(LimitThresholds.strict),
         reason: '切到「严格」后行上的数该跟着换');
-    expect(find.byIcon(Icons.edit_outlined), findsNothing);
+    for (final field in LimitField.values) {
+      expect(pencilIn(field.label), findsNothing, reason: '换预设不等于变成可编辑');
+    }
 
     // 严格 → 自定义：值带过去，且四行都长出笔来。
     await tapChip(tester, '严格');
     expect(find.text('自定义'), findsOneWidget);
     expect(state.limits, LimitThresholds.strict,
         reason: '进「自定义」时带过去的应该是上一档的值');
-    expect(find.byIcon(Icons.edit_outlined), findsNWidgets(LimitField.values.length),
-        reason: '自定义档位下四行都该可编辑');
+    for (final field in LimitField.values) {
+      expect(pencilIn(field.label), findsOneWidget,
+          reason: '自定义档位下 ${field.label} 该可编辑');
+    }
 
     for (final field in LimitField.values) {
       expect(find.text(field.display(state.limits)), findsWidgets,
@@ -200,7 +218,9 @@ void main() {
     await pumpSettings(tester);
     await tapChip(tester, '标准');
     await tapChip(tester, '严格');
-    expect(find.byIcon(Icons.edit_outlined), findsNWidgets(LimitField.values.length));
+    for (final field in LimitField.values) {
+      expect(pencilIn(field.label), findsOneWidget);
+    }
 
     await tapChip(tester, '自定义'); // 自定义 → 宽松
     expect(find.text('宽松'), findsOneWidget);
@@ -211,8 +231,10 @@ void main() {
       expect(rowValue(tester, field), field.display(LimitThresholds.loose),
           reason: '${field.label} 该换成「宽松」那一档的数');
     }
-    expect(find.byIcon(Icons.edit_outlined), findsNothing,
-        reason: '离开自定义就该把那支笔收起来');
+    for (final field in LimitField.values) {
+      expect(pencilIn(field.label), findsNothing,
+          reason: '离开自定义就该把 ${field.label} 那支笔收起来');
+    }
     expect(state.limits, LimitThresholds.loose);
   });
 
@@ -229,5 +251,60 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(state.limits, before.copyWith(maxEntryBytes: 2 << 30));
+  });
+
+  // ---------------------------------------------------------------------------
+  // 日志保留条数。和上面四行不一样：那是**选档**，这是**自由填数**。
+  // ---------------------------------------------------------------------------
+
+  /// 打开日志条数的输入框。返回时弹窗开着。
+  Future<void> openLogLimit(WidgetTester tester) async {
+    expect(find.text('$kDefaultMaxLogs 条'), findsOneWidget);
+    await tester.tap(find.text('$kDefaultMaxLogs 条'));
+    await tester.pumpAndSettle();
+    expect(find.byType(TextField), findsOneWidget, reason: '日志条数的弹窗没打开');
+  }
+
+  testWidgets('日志条数：预填当前值，填多少就是多少', (tester) async {
+    await pumpSettings(tester);
+
+    // 这一行带笔、四行阈值不带 —— 前者是点开填数，后者是点开选档。
+    expect(pencilIn('日志保留条数'), findsOneWidget);
+    expect(pencilIn(LimitField.totalBytes.label), findsNothing,
+        reason: '炸弹防护那几行在默认档位下不该带笔');
+
+    await openLogLimit(tester);
+    expect(tester.widget<TextField>(find.byType(TextField)).controller!.text,
+        '$kDefaultMaxLogs', reason: '预填当前值，用户改的是数字不是重打一遍');
+
+    await tester.enterText(find.byType(TextField), '347');
+    await tester.pump();
+    expect(find.text('= 347 条'), findsOneWidget, reason: '实时预览没跟上输入');
+
+    await tester.tap(find.text('确定'));
+    await tester.pumpAndSettle();
+
+    expect(find.byType(TextField), findsNothing, reason: '确定之后弹窗该关掉');
+    expect(state.maxLogs, 347, reason: '自由输入，347 不该被吸附成 300 或 500');
+    expect(find.text('347 条'), findsOneWidget, reason: '行上的值没跟着刷新');
+  });
+
+  testWidgets('日志条数填到界外：说清范围，不给提交', (tester) async {
+    await pumpSettings(tester);
+    await openLogLimit(tester);
+
+    await tester.enterText(find.byType(TextField), '999999');
+    await tester.pump();
+    expect(find.text('范围 $kMinMaxLogs – $kMaxMaxLogs 条'), findsOneWidget,
+        reason: '越界要在预览行上直说');
+
+    // `warnIfMissed: false` 的理由同「认不出来的输入」那条：置灰靠
+    // `IgnorePointer`，打不中正是要验的行为本身。
+    await tester.tap(find.text('确定'), warnIfMissed: false);
+    await tester.pumpAndSettle();
+
+    // 悄悄夹成 5000 会让用户以为自己填的数生效了。
+    expect(state.maxLogs, kDefaultMaxLogs);
+    expect(find.byType(TextField), findsOneWidget, reason: '没救回来就不该关弹窗');
   });
 }

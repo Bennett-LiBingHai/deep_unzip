@@ -18,28 +18,27 @@ import 'dart:io';
 import '../engine/format.dart';
 import '../models/log_entry.dart';
 import 'json_store.dart';
-
-/// 落盘时的**硬顶**，与用户设的保留条数无关。
-///
-/// 「日志留几条」这件事由用户说了算，权威在 `AppState._maxLogs`（跟着
-/// `SettingsData.maxLogs` 过一趟磁盘）。这个常数不是那个用途 —— 它只防一种
-/// 情况：**磁盘上那份文件被手改过**。没有它的话，一个一百万条的文件会在
-/// `main()` 等 `runApp` 的那条路上被整个解析进内存。
-///
-/// 所以它必须**高于所有可选档位**（见 `persist.dart` 的 `kMaxLogsOptions`），
-/// 否则用户调到最高档时会撞上一个他没设过的上限。
-const int kLogHardCeiling = 5000;
+import 'persist.dart';
 
 class LogRepo {
   /// 具名参数写在 `_maxEntries` 上、调用点却用公开名 `maxEntries:` ——
   /// 这是 Dart 对私有字段形参的写法（`{this._maxEntries}` 声明合法，暴露给
   /// 调用点的名字去掉下划线）。
-  LogRepo(this._store, this._file, {this._maxEntries = kLogHardCeiling});
+  ///
+  /// 默认值取 [kMaxMaxLogs]（用户能填的最大条数），不是另设一道数。理由：没有
+  /// 哪一个**合法**的档能超过它，所以「用户填得出多少」和「磁盘上那份最多能
+  /// 有多少」是同一件事 —— 各写一个数就得靠注释和测试盯着它们别走散。
+  LogRepo(this._store, this._file, {this._maxEntries = kMaxMaxLogs});
 
   final JsonStore _store;
   final File _file;
 
-  /// 见 [kLogHardCeiling]。测试里会传一个小值来验封顶本身。
+  /// 封顶条数。它跟用户设的保留条数**不是**一回事 ——
+  /// 「留几条」由 `AppState._maxLogs` 说了算，这里只防一种情况：**磁盘上那份
+  /// 文件被手改过**。没有它的话，一个一百万条的文件会在 `main()` 等 `runApp`
+  /// 的那条路上被整个解析进内存。
+  ///
+  /// 测试里会传一个小值来验封顶本身。
   final int _maxEntries;
 
   static const int _schemaVersion = 1;

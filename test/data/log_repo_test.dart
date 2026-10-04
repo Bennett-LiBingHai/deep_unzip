@@ -130,11 +130,17 @@ void main() {
       expect(decoded['entries'] as List, hasLength(500));
     });
 
-    test('硬顶高于每一个可选档位 —— 撞不到用户没设过的上限', () {
-      for (final opt in kMaxLogsOptions) {
-        expect(kLogHardCeiling, greaterThan(opt),
-            reason: '硬顶 $kLogHardCeiling 不得低于档位 $opt');
-      }
+    test('默认硬顶 = 用户能填的最大条数 —— 撞不到用户没设过的上限', () async {
+      // 这两个数**就是同一个**（仓库的默认值取 `kMaxMaxLogs`）。要是有人给
+      // 仓库另设一个更小的数，用户把上限拉到 5000 之后会发现磁盘上永远只有
+      // 那个数那么多 —— 重启一次少一批，还看不出是谁丢的。
+      await repo.save([
+        for (var i = 0; i < kMaxMaxLogs + 500; i++) entry('第 $i 个'),
+      ]);
+
+      final decoded =
+          jsonDecode(file.readAsStringSync()) as Map<String, Object?>;
+      expect(decoded['entries'] as List, hasLength(kMaxMaxLogs));
     });
 
     test('超过硬顶的那部分不写盘，留最新的', () async {
@@ -155,13 +161,13 @@ void main() {
       file.writeAsStringSync(jsonEncode({
         'v': 1,
         'entries': [
-          for (var i = 0; i < kLogHardCeiling + 2000; i++)
+          for (var i = 0; i < kMaxMaxLogs + 2000; i++)
             {'name': '第 $i 个', 'status': 'success', 'size': '-', 'time': 'x',
              'duration': '-', 'tags': <String>[]},
         ],
       }));
 
-      expect(await repo.load(), hasLength(kLogHardCeiling));
+      expect(await repo.load(), hasLength(kMaxMaxLogs));
     });
   });
 

@@ -66,11 +66,22 @@ const List<int> kMaxDepthOptions = [0, 5, 10, 20];
 /// 日志封顶的默认值。与原型期行为一致（那时候是 `AppState._maxLogs = 300`）。
 const int kDefaultMaxLogs = 300;
 
-/// 日志封顶的档位，设置页的芯片依次走过这张表。
+/// 日志封顶的可填范围。**自由输入**，不是几档固定值 —— 这个数只跟用户的存储
+/// 习惯有关，没有「大就是好」或「小就是省」的说法，替他挑三档等于让他在三个
+/// 别人的答案里选。
 ///
-/// 与 [kMaxDepthOptions] 同一个理由：`AppState.cycleMaxLogs`、设置页、加载时的
-/// 收敛（[coerceMaxLogs]）读同一份，不许各写一份。
-const List<int> kMaxLogsOptions = [100, 300, 500, 1000];
+/// 下界取 1 而不是 0：0 是**另一个语义**（「不记录日志」），那该是一个独立的
+/// 开关；一个能填 0 的条数框会把「我不想留历史」和「我填错了」混成同一种表现。
+const int kMinMaxLogs = 1;
+
+/// 上界。它同时就是 `LogRepo` 那道硬顶：任何一份**合法的**日志都不可能超过
+/// 用户能设的最大值，所以「用户能填多少」和「磁盘上那份最多有多少」是同一个
+/// 数，不必各写一份、再靠测试盯着它们别走散。
+///
+/// 5000 条 ≈ 400 KB 的 JSON，启动时读一遍毫无压力；再往上就纯是「用户其实想
+/// 要一个不封顶的选项」，而那件事该由「不记录」那个开关来表达，不是把上限调到
+/// 一百万。
+const int kMaxMaxLogs = 5000;
 
 /// 把磁盘上读回来的深度收敛到 [kMaxDepthOptions] 里。
 ///
@@ -79,12 +90,13 @@ const List<int> kMaxLogsOptions = [100, 300, 500, 1000];
 /// 老版本写的档位、被人手改过的文件，都可能给出表外的值。
 int coerceMaxDepth(int? raw) => _nearest(kMaxDepthOptions, raw, kDefaultMaxDepth);
 
-/// 把磁盘上读回来的日志封顶收敛到 [kMaxLogsOptions] 里。
+/// 把磁盘上读回来的日志封顶夹进 [kMinMaxLogs]–[kMaxMaxLogs]。
 ///
-/// 这条不收敛**不会**像深度那样打崩设置页（那行只印 `'$_maxLogs 条'`，不查
-/// 表），但会留下一个芯片点不出来的数：手改成 7 之后显示「7 条」，再点一下
-/// 直接跳到「100 条」—— 用户没法理解中间发生了什么。所以照样收敛。
-int coerceMaxLogs(int? raw) => _nearest(kMaxLogsOptions, raw, kDefaultMaxLogs);
+/// 与 [coerceMaxDepth] 的「取最近的合法档」不同，这里**不吸附**：条数是自由
+/// 输入，磁盘上那个数就是用户自己填的，没有一张表可以让它「最近」到哪儿去。
+/// 越界只能是手改文件或跨版本残留，夹回边界是唯一说得过去的解释。
+int coerceMaxLogs(int? raw) =>
+    raw == null ? kDefaultMaxLogs : raw.clamp(kMinMaxLogs, kMaxMaxLogs);
 
 /// 取表里离 [raw] 最近的一档；[raw] 为 null 或表是空的时给 [fallback]。
 ///

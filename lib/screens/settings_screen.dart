@@ -8,6 +8,7 @@ import '../widgets/glass_card.dart';
 import '../widgets/custom_button.dart';
 import '../widgets/modals/add_extractor_modal.dart';
 import '../widgets/modals/limit_value_modal.dart';
+import '../widgets/modals/log_limit_modal.dart';
 
 /// 设置页面
 class SettingsScreen extends StatelessWidget {
@@ -107,10 +108,11 @@ class SettingsScreen extends StatelessWidget {
                 iconColor: AppTheme.neonCyan,
                 title: '日志保留条数',
                 desc: '超出后丢弃最早的记录，调小会立刻生效',
-                trailing: _cyclerChip(
+                trailing: _valueChip(
                   label: '${state.maxLogs} 条',
                   color: AppTheme.neonCyan,
-                  onTap: () => state.cycleMaxLogs(),
+                  editable: true,
+                  onTap: () => _editMaxLogs(context),
                 ),
               ),
             ]),
@@ -244,18 +246,23 @@ class SettingsScreen extends StatelessWidget {
     // {0,5,10,20}」是同一件事的两道防线。
     const opts = ['∞ 无限制', '5 层', '10 层', '20 层'];
     final idx = [0, 5, 10, 20].indexOf(state.maxDepth);
-    return _cyclerChip(
+    return _valueChip(
       label: opts[idx < 0 ? 0 : idx],
       color: AppTheme.neonCyan,
       onTap: () => state.cycleMaxDepth(),
     );
   }
 
-  /// 点一下切下一档的 chip。深度、炸弹防护、日志封顶三处共用，免得样式各走各的。
-  Widget _cyclerChip({
+  /// 一行右侧那颗值的 chip。深度、炸弹防护、日志条数三处共用，免得样式各走各的。
+  ///
+  /// [editable] 决定点下去是「切下一档」还是「打开输入框」，用一支笔标出来 ——
+  /// 同样是可点的文字，但一个是循环换值、另一个是让你自己填，不说清楚的话
+  /// 用户点开之前不知道会碰上什么。
+  Widget _valueChip({
     required String label,
     required Color color,
     required VoidCallback onTap,
+    bool editable = false,
   }) {
     return GestureDetector(
       onTap: onTap,
@@ -266,13 +273,22 @@ class SettingsScreen extends StatelessWidget {
           borderRadius: BorderRadius.circular(6),
           border: Border.all(color: color.withValues(alpha: 0.15)),
         ),
-        child: Text(
-          label,
-          style: TextStyle(
-            fontSize: 12,
-            fontFamily: 'monospace',
-            color: color,
-          ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              label,
+              style: TextStyle(
+                fontSize: 12,
+                fontFamily: 'monospace',
+                color: color,
+              ),
+            ),
+            if (editable) ...[
+              const SizedBox(width: 5),
+              Icon(Icons.edit_outlined, size: 11, color: color),
+            ],
+          ],
         ),
       ),
     );
@@ -294,7 +310,7 @@ class SettingsScreen extends StatelessWidget {
         iconColor: AppTheme.neonPurple,
         title: '解压上限',
         desc: '超限就放弃这个包，避免压缩炸弹撑爆磁盘',
-        trailing: _cyclerChip(
+        trailing: _valueChip(
           label: state.limitPresetLabel,
           color: AppTheme.neonPurple,
           onTap: () => state.cycleLimitPreset(),
@@ -366,6 +382,15 @@ class SettingsScreen extends StatelessWidget {
       current: state.limits,
     );
     if (value != null) state.setLimit(field, value);
+  }
+
+  /// 打开日志条数的输入框。自由填写，界外的值弹窗自己拦（不给提交）。
+  Future<void> _editMaxLogs(BuildContext context) async {
+    final value = await LogLimitModal.show(
+      context: context,
+      current: state.maxLogs,
+    );
+    if (value != null) state.setMaxLogs(value);
   }
 
   Widget _buildExtractorSection(BuildContext context) {

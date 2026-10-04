@@ -8,8 +8,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 /// 往返正确，还要钉住「键怎么摆」以及**两条收敛**：
 ///
 /// 1. `maxDepth` 必须落在 `{0,5,10,20}` 里 —— 表外的值会让设置页的芯片
-///    用 `indexOf` 拿到 -1，再拿去索引标签数组就是越界崩溃。（`maxLogs`
-///    同理收敛到 `{100,300,500,1000}`，只是它不索引标签、崩不了。）
+///    用 `indexOf` 拿到 -1，再拿去索引标签数组就是越界崩溃。（`maxLogs` 是
+///    自由输入，收敛方式不同：只夹回区间，不吸附到档位。）
 /// 2. 非「自定义」档时，阈值**以预设为准**，不信磁盘上那四个数 ——
 ///    否则会出现「chip 写着『严格』、闸门跑的是另一套」这种没人查得出来的错。
 void main() {
@@ -114,14 +114,20 @@ void main() {
       expect((await repo.load()).maxDepth, 20);
     });
 
-    test('日志封顶落在表外 → 收敛到最近的合法档', () async {
-      // 崩是崩不了（那行只印 `'$maxLogs 条'`），但表外的值会给用户一个
-      // 点不出来的数：显示「7 条」，再点一下直接跳到「100 条」。
-      for (final (raw, expected) in [(7, 100), (4999, 1000), (0, 100), (350, 300)]) {
+    test('日志封顶越界 → 夹回区间，但**不吸附**', () async {
+      // 跟深度那条不一样：条数是自由输入，没有一张表可以让它「最近」到哪儿
+      // 去 —— 350 就该是 350，不该被挪成 300 或 500。只有越界才动它。
+      for (final (raw, expected) in [
+        (350, 350),
+        (1, 1),
+        (kMaxMaxLogs, kMaxMaxLogs),
+        (0, kMinMaxLogs),
+        (-5, kMinMaxLogs),
+        (999999, kMaxMaxLogs),
+      ]) {
         SharedPreferences.setMockInitialValues({'maxLogs': raw});
         final data = await repo.load();
         expect(data.maxLogs, expected, reason: '$raw 应收敛成 $expected');
-        expect(kMaxLogsOptions.contains(data.maxLogs), isTrue);
       }
     });
 
