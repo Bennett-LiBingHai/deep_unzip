@@ -11,7 +11,7 @@ import 'package:flutter_test/flutter_test.dart';
 import '../support/fake_engine.dart';
 import '../support/fake_store.dart';
 
-/// 日志页的头部：**当前条数**和**清空**。
+/// 日志页列表上方那条工具条：**当前条数**和**清空**（摆在筛选条下面）。
 ///
 /// ## 为什么要专门给这截 UI 写 widget 测试
 ///

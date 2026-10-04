@@ -22,10 +22,12 @@ class LogScreen extends StatelessWidget {
         return ListView(
           padding: const EdgeInsets.fromLTRB(18, 8, 18, 100),
           children: [
-            _buildHeader(context, filtered.length),
+            _buildHeader(),
             const SizedBox(height: 16),
             _buildFilters(),
-            const SizedBox(height: 16),
+            const SizedBox(height: 10),
+            _buildListBar(context, filtered.length),
+            const SizedBox(height: 14),
             ...filtered.map(
               (l) => Padding(
                 padding: const EdgeInsets.only(bottom: 10),
@@ -39,29 +41,21 @@ class LogScreen extends StatelessWidget {
     );
   }
 
-  Widget _buildHeader(BuildContext context, int shown) {
+  Widget _buildHeader() {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Row(
-          children: [
-            ShaderMask(
-              shaderCallback: (bounds) =>
-                  AppTheme.primaryGradient.createShader(bounds),
-              child: const Text(
-                '解压日志',
-                style: TextStyle(
-                  fontSize: 22,
-                  fontWeight: FontWeight.w700,
-                  color: Colors.white,
-                ),
-              ),
+        ShaderMask(
+          shaderCallback: (bounds) =>
+              AppTheme.primaryGradient.createShader(bounds),
+          child: const Text(
+            '解压日志',
+            style: TextStyle(
+              fontSize: 22,
+              fontWeight: FontWeight.w700,
+              color: Colors.white,
             ),
-            const SizedBox(width: 10),
-            _countChip(shown),
-            const Spacer(),
-            _clearButton(context),
-          ],
+          ),
         ),
         const SizedBox(height: 4),
         const Text(
@@ -83,30 +77,31 @@ class LogScreen extends StatelessWidget {
   /// 与空态文案共用这一个判断，免得两处各写各的、哪天走岔了。
   bool get _narrowedByFilter => state.logFilter != null && state.logCount > 0;
 
-  /// 当前日志条数。摆在标题后面而不是塞进副标题 —— 副标题那串英文已经够长，
-  /// 再往后接一个数会读成句子的一部分，跟标题并排才一眼看得出「这是个计数」。
+  /// 列表工具条：左边当前条数，右边清空。摆在**筛选条下面**。
+  ///
+  /// 为什么不在标题那一行：标题行回答的是「这页叫什么」，筛选条往下才是
+  /// 「这份列表长什么样、能对它做什么」—— 条数与清空都属于后者，跟筛选是一组，
+  /// 跟着列表走比挂在页头更顺。
   ///
   /// 筛选中时给的是「筛出 X / 共 Y」两个数：只报当前筛出来那几条，用户会以为
-  /// 被筛掉的那些**没了**，而上面那颗清空按钮删的偏偏是全部。
-  Widget _countChip(int shown) {
+  /// 被筛掉的那些**没了**，而右边那颗清空按钮删的偏偏是全部。
+  Widget _buildListBar(BuildContext context, int shown) {
     final total = state.logCount;
     final label =
         _narrowedByFilter ? '筛出 $shown / 共 $total 条' : '共 $total 条';
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 3),
-      decoration: BoxDecoration(
-        color: AppTheme.neonCyan.withValues(alpha: 0.08),
-        borderRadius: BorderRadius.circular(6),
-        border: Border.all(color: AppTheme.neonCyan.withValues(alpha: 0.15)),
-      ),
-      child: Text(
-        label,
-        style: const TextStyle(
-          fontSize: 11,
-          fontFamily: 'monospace',
-          color: AppTheme.neonCyan,
+    return Row(
+      children: [
+        Text(
+          label,
+          style: const TextStyle(
+            fontSize: 12,
+            fontFamily: 'monospace',
+            color: AppTheme.neonCyan,
+          ),
         ),
-      ),
+        const Spacer(),
+        _clearButton(context),
+      ],
     );
   }
 
