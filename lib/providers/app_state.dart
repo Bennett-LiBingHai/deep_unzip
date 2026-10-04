@@ -278,6 +278,12 @@ class AppState extends ChangeNotifier {
   // 日志。同样空库起步：历史应当只记录**本机真的解压过**的东西。
   final List<LogEntry> _logs = [];
   List<LogEntry> get logs => List.unmodifiable(_logs);
+
+  /// 条数。单独开一个 getter 而不是让界面写 `logs.length` —— `logs` 每次都
+  /// `List.unmodifiable` 复制一份，日志页头部每帧都要这个数，为了读个长度
+  /// 把整张表复制一遍不值当。
+  int get logCount => _logs.length;
+
   LogStatus? _logFilter;
   LogStatus? get logFilter => _logFilter;
 
@@ -286,11 +292,25 @@ class AppState extends ChangeNotifier {
     return _logs.where((l) => l.status == _logFilter).toList();
   }
 
+  /// 清空全部日志。**不可撤**，所以日志页那边得先弹一道确认再调这里。
+  ///
+  /// 空的时候直接返回：没有记录可清却弹一条「已清空 0 条」，是在拿假动作
+  /// 回应真点击。
+  void clearLogs() {
+    final n = _logs.length;
+    if (n == 0) return;
+    _logs.clear();
+    _persistLogs();
+    // 删的是用户自己的历史，出声（`showToast` 内部会 notify）。
+    showToast('已清空 $n 条日志记录');
+  }
+
   /// 日志封顶。纯追加写、又要在退出时整份落盘，不封顶会无限长。
   ///
   /// 这个数是**权威**：`LogRepo` 只管把这里交出去的那一份原样写盘，不再自己
-  /// 截一刀（见 `log_repo.dart` 的 `kLogHardCeiling`）。所以调小它必须**当场**
-  /// 把多出来的砍掉，否则内存里那 300 条会在下一次自然边界又整份写回去。
+  /// 截一刀（它的构造函数默认顶在 `kMaxMaxLogs`，见那边的注释）。所以调小它
+  /// 必须**当场**把多出来的砍掉，否则内存里那 300 条会在下一次自然边界又整份
+  /// 写回去。
   int _maxLogs = kDefaultMaxLogs;
   int get maxLogs => _maxLogs;
 
