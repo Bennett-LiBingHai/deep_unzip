@@ -52,6 +52,8 @@ dependencies:
   # 且它要和 app 共享同一份 NDK / CMake 配置。
   deep_unzip_engine:
     path: packages/deep_unzip_engine
+  shared_preferences: ^2.5.5
+  flutter_secure_storage: ^11.2.0
 
 dev_dependencies:
   flutter_test:

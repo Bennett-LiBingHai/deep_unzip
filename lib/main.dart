@@ -1,6 +1,10 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import 'app_navigator.dart';
+import 'data/device_store.dart';
+import 'data/persist.dart';
 import 'theme/app_theme.dart';
 import 'providers/app_state.dart';
 import 'services/dialog_bridge.dart';
@@ -10,12 +14,42 @@ import 'screens/log_screen.dart';
 import 'screens/settings_screen.dart';
 import 'widgets/particle_background.dart';
 
-void main() {
-  runApp(const DeepUnzipApp());
+Future<void> main() async {
+  // `DeviceStore.open()` 与后续的读都要过平台通道（path_provider、
+  // shared_preferences、flutter_secure_storage），必须先起绑定。
+  WidgetsFlutterBinding.ensureInitialized();
+
+  // **先读完再 `runApp`**，而不是界面起来之后再异步补：设置、密码库、日志
+  // 都是同步 getter，页面在 `build` 里直接读。异步补的话第一帧会拿默认值
+  // 渲染一遍 —— 用户看到的是「开关自己跳了一下、密码库闪了一下才出来」。
+  //
+  // 这一步的耗时是三次本地读（不到几十毫秒），而 `DeviceStore` 内部对每一份
+  // 都做了容错，读不出来就是出厂默认，不会把启动流程卡住或抛出去。
+  final store = await DeviceStore.open();
+  final snapshot = await store.load().timeout(
+        // `DeviceStore` 内部对每一份读都做了容错（**异常**统一降级成出厂默认），
+        // 但「读不回来」和「永远不回来」是两回事：平台通道要是卡住，这里就会
+        // 一直等在一个不会完成的 Future 上 —— 表现是**开屏白屏、没有任何提示**，
+        // 而且没有任何日志能指到这里。
+        //
+        // 三秒是随手定的：正常路径是三次本地读，几十毫秒。真超了，那就拿
+        // 默认档先把界面开出来，用户的设置还在磁盘上，下次启动再读。
+        const Duration(seconds: 3),
+        onTimeout: () => AppSnapshot.empty,
+      );
+
+  runApp(DeepUnzipApp(store: store, snapshot: snapshot));
 }
 
 class DeepUnzipApp extends StatelessWidget {
-  const DeepUnzipApp({super.key});
+  const DeepUnzipApp({
+    super.key,
+    required this.store,
+    required this.snapshot,
+  });
+
+  final PersistStore store;
+  final AppSnapshot snapshot;
 
   @override
   Widget build(BuildContext context) {
@@ -25,14 +59,17 @@ class DeepUnzipApp extends StatelessWidget {
       theme: AppTheme.dark,
       // 引擎 isolate 侧没有 BuildContext，只能靠这个 key 拿 context 弹窗。
       navigatorKey: AppNavigator.key,
-      home: const MainShell(),
+      home: MainShell(store: store, snapshot: snapshot),
     );
   }
 }
 
 /// 主框架 —— 底部导航 + 动态背景
 class MainShell extends StatefulWidget {
-  const MainShell({super.key});
+  const MainShell({super.key, required this.store, required this.snapshot});
+
+  final PersistStore store;
+  final AppSnapshot snapshot;
 
   @override
   State<MainShell> createState() => _MainShellState();
@@ -43,8 +80,13 @@ class _MainShellState extends State<MainShell> {
   // 行为退回成只记日志 + toast —— 引擎照跑，但用户看不到选择（见 app_state 里
   // _onBlocked 为 null 的分支）。AppState 本身不 import material，
   // 实现放在 dialog_bridge 里，这条注入就是那道边界的接缝。
-  final AppState _state = AppState(
+  //
+  // `late` 而非直接初始化：它要读 `widget`，而字段初始化器跑在 `widget` 就位
+  // 之前。`late` 把它推迟到 `initState` 里第一次访问时，那里两者都在了。
+  late final AppState _state = AppState(
     blockedPrompt: const DialogBridge().askArchiveBlocked,
+    persistStore: widget.store,
+    restore: widget.snapshot,
   );
   int _currentIndex = 0;
 

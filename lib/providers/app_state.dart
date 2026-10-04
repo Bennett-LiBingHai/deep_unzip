@@ -8,6 +8,7 @@ import 'package:path/path.dart' as p;
 import 'package:permission_handler/permission_handler.dart';
 
 import '../data/builtin_extractors.dart';
+import '../data/persist.dart';
 import '../engine/controller.dart';
 import '../engine/cycles.dart';
 import '../engine/format.dart';
@@ -53,12 +54,31 @@ class AppState extends ChangeNotifier {
     EngineController? engine,
     DiskSpaceProbe? diskSpace,
     ArchiveBlockedPrompt? blockedPrompt,
+    // 参数名与字段名（`_store`）**不止差一个下划线** —— 与上面那条同因：
+    // 叫 `store` 会换来一条 Dart 根本没法照做的假警告。
+    PersistStore? persistStore,
+    AppSnapshot? restore,
   })  : _injectedEngine = engine,
         _diskSpace = diskSpace ?? DiskSpaceProbe(),
-        _onBlocked = blockedPrompt;
+        _onBlocked = blockedPrompt,
+        _store = persistStore {
+    // 出厂值在字段初始化时就位了（见下方 `_settings` 等），这里把磁盘上读回来
+    // 的那份盖上去。**在构造函数体里做而不是让调用方改**，是为了让「读到的
+    // 快照」和「出厂默认」走同一条装配路径 —— 分成两条路的话，某天加一个字段
+    // 只改了其中一条，就会冒出「首次启动对、重启后错」这种最难查的 bug。
+    if (restore != null) _applySnapshot(restore);
+  }
 
   final EngineController? _injectedEngine;
   EngineController? _engine;
+
+  /// 落盘的出海口。**为 null 时完全不持久化**，行为与没有这个特性时一致
+  /// —— 单测默认就是这一档（真实现要过 `shared_preferences` /
+  /// `flutter_secure_storage` 的平台通道，那是 `DeviceStore` 的事）。
+  ///
+  /// 类型是纯 Dart 的接口（见 `data/persist.dart`），所以这一层不必 import
+  /// 任何插件，`app_state.dart` 那条「引擎侧不碰 package:flutter」的边界不破。
+  final PersistStore? _store;
 
   /// 量目标卷剩余空间。走平台通道，所以要**在主 isolate** 上调用 ——
   /// `extractArchive` 跑在 worker isolate 里，够不着通道（见 `protocol.dart`
@@ -202,29 +222,30 @@ class AppState extends ChangeNotifier {
   final List<Extractor> _extractors = List.from(BuiltinExtractors.all);
   List<Extractor> get extractors => List.unmodifiable(_extractors);
 
-  // 设置开关
-  final Map<String, bool> _settings = {
-    'recursive': true,
-    'symmetricOutput': true,
-    'fakeExtDetect': true,
-    'splitMerge': true,
-    'pwdAutoTry': true,
-    'errorPause': true,
-    'crcCheck': true,
-  };
+  // 设置开关。初值抄自 `data/persist.dart` 那张表 —— 与「磁盘上什么都没有」
+  // （`AppSnapshot.empty`）时给的那一份必须是同一套，否则「首次启动」和
+  // 「存过档」会跑出两种行为，最难查。
+  final Map<String, bool> _settings = Map.of(kDefaultToggles);
   bool setting(String key) => _settings[key] ?? false;
   void toggleSetting(String key) {
     _settings[key] = !(_settings[key] ?? false);
     _notify();
+    _persistSettings();
   }
 
-  int _maxDepth = 0; // 0 = 无限制
+  int _maxDepth = kDefaultMaxDepth; // 0 = 无限制
   int get maxDepth => _maxDepth;
   void cycleMaxDepth() {
-    const opts = [0, 5, 10, 20];
-    final idx = opts.indexOf(_maxDepth);
-    _maxDepth = opts[(idx + 1) % opts.length];
+    // 档位表在 `data/persist.dart`：设置页的芯片、加载时的收敛
+    // （`coerceMaxDepth`）与这里读的是同一份。三处各写一份 `[0, 5, 10, 20]`
+    // 的话，改动时漏掉一处就是一个只在特定路径上才炸的 bug。
+    //
+    // `indexOf` 给出 -1 时（值不在表里）取到 `kMaxDepthOptions[0]`，安全 ——
+    // 加载时已经收敛过，这只是第二道防线。
+    final idx = kMaxDepthOptions.indexOf(_maxDepth);
+    _maxDepth = kMaxDepthOptions[(idx + 1) % kMaxDepthOptions.length];
     _notify();
+    _persistSettings();
   }
 
   // ---- 炸弹防护阈值 ----
@@ -255,6 +276,7 @@ class AppState extends ChangeNotifier {
     // 要一组空数字。落到具体档位时才整体替换。
     if (!limitsCustom) _limits = kLimitPresets[_limitPreset].thresholds;
     _notify();
+    _persistSettings();
   }
 
   /// 改一项阈值，并自动落到「自定义」档。
@@ -266,6 +288,7 @@ class AppState extends ChangeNotifier {
     _limits = field.apply(_limits, value);
     _limitPreset = kLimitPresets.length;
     _notify();
+    _persistSettings();
   }
 
   // Toast
@@ -308,6 +331,70 @@ class AppState extends ChangeNotifier {
       _toastType = null;
       _notify();
     });
+  }
+
+  // ---------------------------------------------------------------------------
+  // 持久化
+  // ---------------------------------------------------------------------------
+
+  /// 把磁盘上读回来的那一份盖到出厂值上。
+  ///
+  /// 只在构造函数里跑一次。**不 `_notify()`**：此刻还没有监听者。
+  void _applySnapshot(AppSnapshot s) {
+    // 从出厂值起步再盖上读回来的键，而不是整份替换：磁盘上那份要是缺了某个
+    // 键（更早的版本写的），整份替换会让那个开关悄悄变成 `false`。
+    _settings
+      ..clear()
+      ..addAll(kDefaultToggles)
+      ..addAll(s.settings.toggles);
+
+    _maxDepth = coerceMaxDepth(s.settings.maxDepth);
+    // 档位下标收敛到合法区间；超界的归到「自定义」那档而不是 0。
+    _limitPreset = s.settings.limitPreset.clamp(0, kLimitPresets.length);
+    _limits = s.settings.limits;
+
+    _passwords
+      ..clear()
+      ..addAll(s.vault);
+    _logs
+      ..clear()
+      ..addAll(s.logs);
+  }
+
+  /// 落盘当前设置。改一个开关就调用一次。
+  ///
+  /// 界面不等这次写（[PersistStore] 的方法都是 `unawaited`）：等的话，一次
+  /// 慢磁盘就会让开关看起来卡住。失败由 `DeviceStore` 吞掉并 `debugPrint`。
+  void _persistSettings() {
+    final store = _store;
+    if (store == null) return;
+    unawaited(store.saveSettings(SettingsData(
+      // 复制一份再交出去：`_settings` 是活的，异步写盘期间用户又点了别的开关
+      // 的话，写出去的会是**编码那一刻**的内容而不是调用时的内容。
+      toggles: Map.of(_settings),
+      maxDepth: _maxDepth,
+      limitPreset: _limitPreset,
+      limits: _limits,
+    )));
+  }
+
+  /// 落盘密码库。增删一条就调用一次。
+  void _persistVault() {
+    final store = _store;
+    if (store == null) return;
+    unawaited(store.saveVault(List.of(_passwords)));
+  }
+
+  /// 落盘日志。
+  ///
+  /// **刻意不在 [_addLog] 里调**：解压期每解完一个包就记一条日志，整批 200 个
+  /// 包就是 200 次「整份覆盖写 + JSON 编码」，全压在 UI isolate 上 —— 而此刻
+  /// 日志页根本没人看。改成只在**自然边界**写一次：扫描收尾、整批收尾。
+  /// 代价是解压途中被杀会少掉这一批的逐包日志（那份收尾总结仍会写出去）。
+  void _persistLogs() {
+    final store = _store;
+    if (store == null) return;
+    unawaited(store.saveLogs(List.of(_logs)));
   }
 
   // ---------------------------------------------------------------------------
@@ -419,6 +506,7 @@ class AppState extends ChangeNotifier {
         folderName: _folderName,
         now: DateTime.now(),
       ));
+      _persistLogs();
       return;
     }
 
@@ -426,6 +514,9 @@ class AppState extends ChangeNotifier {
     _notify();
 
     _toastScanResult(_lastScan!);
+    // 扫描收尾是日志的天然边界（见 [_persistLogs]）：这一批扫描相关的日志
+    // 到此为止都记完了，写一次就够。
+    _persistLogs();
   }
 
   void _toastScanResult(ScanSummary s) {
@@ -826,6 +917,8 @@ class AppState extends ChangeNotifier {
       }
       _notify();
       showToast(_completeDetail, type: failed > 0 ? 'warn' : 'ok');
+      // 整批收尾 —— 逐包日志到这里全记完了，一次写出去（见 [_persistLogs]）。
+      _persistLogs();
     }
   }
 
@@ -949,12 +1042,14 @@ class AppState extends ChangeNotifier {
     }
     _passwords.insert(0, PasswordEntry(value: value, lastUsed: '今天'));
     _notify();
+    _persistVault();
     showToast('密码已添加到密码库', type: 'success');
   }
 
   void deletePassword(int index) {
     _passwords.removeAt(index);
     _notify();
+    _persistVault();
     showToast('密码已删除');
   }
 

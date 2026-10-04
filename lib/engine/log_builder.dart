@@ -53,6 +53,7 @@ LogEntry buildScanLog({
     status: scanLogStatus(summary),
     size: summary.items.isEmpty ? '-' : formatBytes(total),
     time: formatLogTime(now),
+    at: now,
     duration: formatDuration(elapsed),
     tags: [
       '${summary.items.length} 个压缩包',
@@ -72,6 +73,7 @@ LogEntry buildScanFailureLog({
       status: LogStatus.failed,
       size: '-',
       time: formatLogTime(now),
+      at: now,
       duration: '-',
       tags: const ['扫描失败'],
     );
@@ -106,6 +108,7 @@ LogEntry buildExtractLog({
     // 写个 `0.3s` 会让人以为部分成功了。
     size: formatBytes(item.sizeBytes),
     time: formatLogTime(now),
+    at: now,
     status: switch ((outcome, error, skippedReason)) {
       (final o, _, _) when o != null => LogStatus.success,
       (_, final e, _) when e != null => LogStatus.failed,

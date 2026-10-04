@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:deep_unzip/data/persist.dart';
 import 'package:deep_unzip/engine/controller.dart';
 import 'package:deep_unzip/engine/limits.dart';
 import 'package:deep_unzip/engine/models.dart';
@@ -9,6 +10,7 @@ import 'package:deep_unzip/engine/protocol.dart';
 import 'package:deep_unzip/models/archive_file.dart';
 import 'package:deep_unzip/models/extractor.dart';
 import 'package:deep_unzip/models/log_entry.dart';
+import 'package:deep_unzip/models/password_entry.dart';
 import 'package:deep_unzip/providers/app_state.dart';
 import 'package:deep_unzip/services/blocked_prompt.dart';
 import 'package:deep_unzip/services/disk_space.dart';
@@ -17,6 +19,7 @@ import 'package:path/path.dart' as p;
 
 import '../engine/zip_fixtures.dart';
 import '../support/fake_engine.dart';
+import '../support/fake_store.dart';
 
 /// `AppState` 是整个 UI 的契约面：4 个页面 + 4 个弹窗都直接读它的 getter。
 /// 这组测试盯的是「适配层翻译得对不对」，不是引擎本身（那在 engine/ 测过）。
@@ -1376,6 +1379,218 @@ void main() {
       state.startExtract();
       await drainExtract(state);
       expect(engine.rounds, 2, reason: '新快照要能真的再跑一次');
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // 持久化（条目 3）
+  //
+  // 插件的真实读写由 `test/data/` 下各自的 repo 用例对着 mock 通道验。这组盯
+  // 的是另一半：**AppState 在什么时候、把什么内容交了出去**，以及一条产品
+  // 约束 —— 磁盘上不能出现「哪些文件夹解压过」。
+  // ---------------------------------------------------------------------------
+
+  group('恢复：构造时把读回来的一份盖上去', () {
+    t('设置 / 深度 / 档位 / 阈值 / 密码库 / 日志 全部就位', () {
+      final store = FakeStore()
+        ..toLoad = AppSnapshot(
+          settings: const SettingsData(
+            toggles: {
+              'recursive': false,
+              'symmetricOutput': true,
+              'fakeExtDetect': true,
+              'splitMerge': true,
+              'pwdAutoTry': true,
+              'errorPause': true,
+              'crcCheck': false,
+            },
+            maxDepth: 10,
+            limitPreset: 3,
+            limits: LimitThresholds(maxEntries: 4242),
+          ),
+          vault: const [
+            PasswordEntry(value: '从磁盘读回来的', hitCount: 5, lastUsed: '2026-09-30'),
+          ],
+          logs: const [
+            LogEntry(
+              name: '上次那个包.zip',
+              status: LogStatus.failed,
+              size: '1.0 MB',
+              time: '09-30 20:33',
+              duration: '-',
+              tags: ['解压失败'],
+            ),
+          ],
+        );
+
+      final state = AppState(
+        engine: FakeEngine(),
+        persistStore: store,
+        restore: store.toLoad,
+      );
+      addTearDown(state.dispose);
+
+      expect(state.setting('recursive'), isFalse);
+      expect(state.setting('crcCheck'), isFalse);
+      expect(state.setting('splitMerge'), isTrue);
+      expect(state.maxDepth, 10);
+      expect(state.limitPreset, 3);
+      expect(state.limits.maxEntries, 4242);
+      expect(state.passwords.single.value, '从磁盘读回来的');
+      expect(state.passwords.single.hitCount, 5);
+      expect(state.logs.single.name, '上次那个包.zip');
+      expect(state.logs.single.status, LogStatus.failed);
+    });
+
+    t('档位不越界、深度收敛 —— 读回来的坏值不能让设置页崩', () {
+      // 这两个字段是设置页的芯片直接拿去 `indexOf` 的：越界就是数组下标 -1，
+      // 打开设置页即崩。收敛在 `SettingsRepo` 里也做了一遍，这里是第二道。
+      final store = FakeStore()
+        ..toLoad = const AppSnapshot(
+          settings: SettingsData(maxDepth: 999, limitPreset: 88),
+        );
+
+      final state = AppState(
+        engine: FakeEngine(),
+        persistStore: store,
+        restore: store.toLoad,
+      );
+      addTearDown(state.dispose);
+
+      expect(state.maxDepth, 20, reason: '收敛到最近的合法档');
+      expect(state.limitPreset, kLimitPresets.length, reason: '夹到「自定义」档');
+      expect(state.limitsCustom, isTrue);
+    });
+
+    t('档里缺一个开关的键 → 那一个回出厂默认，不变成 false', () {
+      // 整份替换（而不是从出厂值起步再覆盖）的话，缺的键会悄悄变成 false，
+      // 表现为「升级 app 之后某个功能自己关了」。
+      final store = FakeStore()
+        ..toLoad = const AppSnapshot(settings: SettingsData(toggles: {}));
+
+      final state = AppState(
+        engine: FakeEngine(),
+        persistStore: store,
+        restore: store.toLoad,
+      );
+      addTearDown(state.dispose);
+
+      expect(state.setting('recursive'), isTrue);
+      expect(state.setting('crcCheck'), isTrue);
+    });
+
+    t('没注入 store → 一切照出厂默认，不崩', () {
+      final state = AppState(engine: FakeEngine());
+      addTearDown(state.dispose);
+
+      expect(state.setting('recursive'), isTrue);
+      expect(state.maxDepth, kDefaultMaxDepth);
+      expect(state.passwords, isEmpty);
+      expect(state.logs, isEmpty);
+    });
+
+    t('恢复一份「什么都有」的档，也不会把「解压过」带过来', () {
+      // **这是那条产品约束的机器判据。** 磁盘上要是记了「哪些目录解过了」，
+      // 它就会在这里体现成 `folderSelected` 为真、`batchRun` 为真 —— 用户
+      // 一开 app 就看见「换个文件夹」，想重解一个目录却被挡在外面。
+      //
+      // 恢复的只有设置、密码、日志；源目录**不在** `AppSnapshot` 里
+      // （见 persist.dart 的库注释）。所以起点必须仍是「没选过文件夹」。
+      final store = FakeStore()..toLoad = AppSnapshot.empty;
+      final state = AppState(
+        engine: FakeEngine(),
+        persistStore: store,
+        restore: store.toLoad,
+      );
+      addTearDown(state.dispose);
+
+      expect(state.folderSelected, isFalse);
+      expect(state.folderPath, '');
+      expect(state.archives, isEmpty);
+      expect(state.batchRun, isFalse, reason: '闸门是纯内存的，不该从磁盘上活过来');
+      expect(state.hasScanned, isFalse);
+    });
+  });
+
+  group('落盘：改了什么就写什么', () {
+    late FakeStore store;
+    late AppState state;
+
+    setUp(() {
+      store = FakeStore();
+      state = AppState(engine: FakeEngine(), persistStore: store);
+    });
+    tearDown(() => state.dispose());
+
+    t('切开关 → 当场交出一份带新值的设置', () {
+      state.toggleSetting('recursive');
+
+      expect(store.lastSettings, isNotNull);
+      expect(store.lastSettings!.toggles['recursive'], isFalse);
+      expect(store.lastSettings!.toggles['crcCheck'], isTrue, reason: '别的开关要带上');
+    });
+
+    t('深度 / 档位 / 单项阈值都会落盘', () {
+      state.cycleMaxDepth();
+      expect(store.lastSettings!.maxDepth, 5);
+
+      state.setLimitPreset(2);
+      expect(store.lastSettings!.limitPreset, 2);
+      expect(store.lastSettings!.limits, LimitThresholds.strict);
+
+      state.setLimit(LimitField.entries, 777);
+      expect(store.lastSettings!.limits.maxEntries, 777);
+      expect(store.lastSettings!.limitPreset, kLimitPresets.length,
+          reason: '手改一项就落到「自定义」，这一条也要跟着存');
+    });
+
+    t('增删密码 → 交出整库快照', () {
+      state.addPassword('新密码');
+      expect(store.vaultSaved, hasLength(1));
+      expect(store.vaultSaved.last.single.value, '新密码');
+
+      state.deletePassword(0);
+      expect(store.vaultSaved, hasLength(2));
+      expect(store.vaultSaved.last, isEmpty);
+    });
+
+    t('往空密码库加同一个密码两次只落一次盘', () {
+      state.addPassword('同一个');
+      state.addPassword('同一个');
+      expect(store.vaultSaved, hasLength(1));
+    });
+
+    t('日志只在自然边界写 —— 不是每解一个包写一次', () async {
+      final root = tempRoot('as_persist_logs');
+      put(root, 'a.zip', realZip({'x': 'y'}));
+      put(root, 'b.zip', realZip({'x': 'y'}));
+
+      await state.selectFolderPath(root.path);
+      expect(store.logsSaved, hasLength(1), reason: '扫描收尾写一次');
+      expect(store.lastLogs!.single.name, contains('（扫描）'));
+
+      final before = store.logsSaved.length;
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(store.logsSaved, hasLength(before + 1),
+          reason: '两个包也只该有整批收尾那一次，不是每包一次');
+      // 收尾这一次要含上逐包的两条 —— 攒到边界一起写，不等于丢掉它们。
+      expect(store.lastLogs!.length, 3, reason: '两条解压 + 一条扫描');
+      expect(store.lastLogs!.map((e) => e.name), containsAll(['a.zip', 'b.zip']));
+    });
+
+    t('落盘的日志里没有完整路径 —— 那才是能反查「解过了」的东西', () async {
+      final root = tempRoot('as_persist_nopath');
+      put(root, 'sub/a.zip', realZip({'x': 'y'}));
+
+      await state.selectFolderPath(root.path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(store.logsSaved, isNotEmpty, reason: '前提：确实写过了');
+      expect(store.savedLogsMentionPath(root.path), isFalse);
+      expect(store.lastLogs!.map((e) => e.name), contains('a.zip'));
     });
   });
 
