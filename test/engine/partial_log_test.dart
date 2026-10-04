@@ -86,6 +86,29 @@ void main() {
     expect(scanLogStatus(summary), LogStatus.success);
   });
 
+  test('扫描中途按取消 → 也记成「部分成功」（这条最容易撞上）', () async {
+    // 分片不是唯一的口子，而且**不是最容易撞上的那个**。这一条才是：
+    // 扫一个大目录、途中按「取消」，只要已经扫到了包，就落进 partial。
+    // 跟包坏不坏、有没有分片毫无关系。
+    for (var i = 0; i < 4; i++) {
+      writeTempFile(root, 'zip_$i.zip', realZip({'a': 'b'}));
+    }
+    final sub = Directory(p.join(root.path, 'sub'))..createSync();
+    writeTempFile(sub, 'inner.zip', realZip({'c': 'd'}));
+
+    // 前几次问都答「不取消」，之后翻转 —— 模拟「扫到一半才按」。
+    var asked = 0;
+    final summary = await scanDirectory(
+      root.path,
+      isCancelled: () => ++asked > 2,
+    );
+
+    expect(summary.items, isNotEmpty, reason: '前提：取消之前已经扫到了包');
+    expect(summary.warnings.join('\n'), contains('扫描已取消'),
+        reason: '前提：确实记了取消这条告警');
+    expect(scanLogStatus(summary), LogStatus.partial);
+  });
+
   test('一个包都没扫到 + 有告警 → 记成「失败」，不是「部分成功」', () async {
     // 判据的边界。目录不存在时也是「没扫到 + 带告警」，但那不是部分成功 ——
     // 那是整个没跑起来。两条路都产出 warnings，分岔只在 items 空不空。
