@@ -7,15 +7,19 @@ import 'package:flutter_test/flutter_test.dart';
 
 import '../support/fake_engine.dart';
 
-/// 炸弹防护的设置界面：一个 chip 选档，选到「自定义」才展开成四行数值。
+/// 炸弹防护的设置界面：一个 chip 选档，四行阈值**始终**列着，「自定义」那一档
+/// 才变成可编辑。
 ///
 /// ## 为什么要专门给这截 UI 写 widget 测试
 ///
 /// `app_state_test.dart` 里那一组已经钉住了 `setLimitPreset`/`setLimit` 的
 /// 语义，`limits_test.dart` 钉住了阈值本身的判定。**两样都绿，这截 UI 仍然可以
-/// 是坏的** —— 展开的条件写错、弹窗回参没接、行上的值没跟着刷新，全都不在
-/// 那两个文件的覆盖范围内。而且这截 UI 的展开条件（认 chip 那一档，不认
+/// 是坏的** —— 可编辑的条件写错、弹窗回参没接、行上的值没跟着刷新，全都不在
+/// 那两个文件的覆盖范围内。而且这截 UI 的可编辑条件（认 chip 那一档，不认
 /// 「值是不是等于某个预设」）正是最容易在重构里被"顺手简化"掉的地方。
+///
+/// 另外还有一条**很容易被"顺手简化"回去**的：预设档位下那四行也得在。
+/// 只写一个「标准」，用户就是在看不见的数字上做选择。
 void main() {
   // 和 home_screen_test 同样的理由：默认 `tap()` 打不中只警告不报错，
   // 「点了没反应」会在压根没点到的前提下通过。
@@ -46,6 +50,28 @@ void main() {
     await tester.pumpAndSettle();
   }
 
+  /// 取某一行右侧那个数值。
+  ///
+  /// **必须按行取，不能全页 `find.text(value)`。** 标准档的「单文件上限」
+  /// 是 8 GB，严格档的「解压总量上限」也是 8 GB —— 同一个字符串满页都是，
+  /// 全页找会把两行串起来，于是「档位到底对不对」这件事根本验不出来。
+  String rowValue(WidgetTester tester, LimitField field) {
+    final row = find.ancestor(
+      of: find.text(field.label),
+      matching: find.byType(Row),
+    );
+    expect(row, findsOneWidget, reason: '${field.label} 那一行没找到');
+
+    final texts = tester
+        .widgetList<Text>(find.descendant(of: row, matching: find.byType(Text)))
+        .map((t) => t.data)
+        .whereType<String>()
+        .toList();
+    expect(texts, hasLength(2),
+        reason: '${field.label} 那一行该只有「名字」和「数值」两个文本，实际是 $texts');
+    return texts[1];
+  }
+
   /// 打开某一行的数值弹窗。
   Future<void> openRow(WidgetTester tester, LimitField field) async {
     await tester.tap(find.text(field.label));
@@ -53,37 +79,52 @@ void main() {
     expect(find.byType(TextField), findsOneWidget, reason: '${field.label} 的弹窗没打开');
   }
 
-  testWidgets('默认「标准」且不展开明细', (tester) async {
+  testWidgets('默认「标准」：四行照常列出来，但只读', (tester) async {
     await pumpSettings(tester);
 
     expect(find.text('解压上限'), findsOneWidget);
     expect(find.text('标准'), findsOneWidget);
+    // 这一条是本次改动的核心：预设档位下数值也要摆出来。
+    // 逐行比对而不是全页找 —— 见 [rowValue] 上面那段（严格档的 8 GB 与
+    // 标准档的 8 GB 只差在哪一行）。
     for (final field in LimitField.values) {
-      expect(find.text(field.label), findsNothing,
-          reason: '没切到自定义就不该有 ${field.label} 这一行');
+      expect(rowValue(tester, field), field.display(LimitThresholds.standard),
+          reason: '${field.label} 摆的不是「标准」这一档的数');
     }
+
+    expect(find.byIcon(Icons.edit_outlined), findsNothing,
+        reason: '预设档位下这几行不该带那支笔');
+    await tester.tap(find.text(LimitField.totalBytes.label));
+    await tester.pumpAndSettle();
+    expect(find.byType(TextField), findsNothing,
+        reason: '只读的行点了不该弹编辑器 —— 接了点击却什么都不发生更让人困惑');
 
     expect(state.limits, LimitThresholds.standard);
   });
 
-  testWidgets('切到「自定义」才展开四行，且值就是当前那套阈值', (tester) async {
+  testWidgets('切档只换数值，切到「自定义」才变成可编辑', (tester) async {
     await pumpSettings(tester);
 
-    // 标准 → 严格 → 自定义。**展开前两跳都要空着**，这是「展开只认 chip
-    // 那一档、不认值」的外部表现。
+    // 标准 → 严格：行还在，数值整体换成严格那一档，但仍然只读。
     await tapChip(tester, '标准');
     expect(find.text('严格'), findsOneWidget);
-    expect(find.text(LimitField.totalBytes.label), findsNothing,
-        reason: '切到「严格」只是换预设，不该展开明细');
+    expect(find.text(LimitField.totalBytes.label), findsOneWidget,
+        reason: '换预设不等于把明细收起来');
+    expect(rowValue(tester, LimitField.totalBytes),
+        LimitField.totalBytes.display(LimitThresholds.strict),
+        reason: '切到「严格」后行上的数该跟着换');
+    expect(find.byIcon(Icons.edit_outlined), findsNothing);
 
+    // 严格 → 自定义：值带过去，且四行都长出笔来。
     await tapChip(tester, '严格');
     expect(find.text('自定义'), findsOneWidget);
     expect(state.limits, LimitThresholds.strict,
         reason: '进「自定义」时带过去的应该是上一档的值');
+    expect(find.byIcon(Icons.edit_outlined), findsNWidgets(LimitField.values.length),
+        reason: '自定义档位下四行都该可编辑');
 
     for (final field in LimitField.values) {
-      expect(find.text(field.label), findsOneWidget);
-      expect(find.text(field.display(state.limits)), findsOneWidget,
+      expect(find.text(field.display(state.limits)), findsWidgets,
           reason: '${field.label} 行上显示的值与 state 不一致');
     }
   });
@@ -155,19 +196,23 @@ void main() {
         reason: '取消不该把 chip 弹回预设');
   });
 
-  testWidgets('切回预设档 → 明细收起来', (tester) async {
+  testWidgets('切回预设档 → 行还在，只是变回只读并换成那一档的数', (tester) async {
     await pumpSettings(tester);
     await tapChip(tester, '标准');
     await tapChip(tester, '严格');
-    expect(find.text(LimitField.ratio.label), findsOneWidget);
+    expect(find.byIcon(Icons.edit_outlined), findsNWidgets(LimitField.values.length));
 
     await tapChip(tester, '自定义'); // 自定义 → 宽松
     expect(find.text('宽松'), findsOneWidget);
 
     for (final field in LimitField.values) {
-      expect(find.text(field.label), findsNothing,
-          reason: '离开自定义就该收起 ${field.label}');
+      expect(find.text(field.label), findsOneWidget,
+          reason: '离开自定义不该把 ${field.label} 收起来 —— 那一档的数用户也得看得到');
+      expect(rowValue(tester, field), field.display(LimitThresholds.loose),
+          reason: '${field.label} 该换成「宽松」那一档的数');
     }
+    expect(find.byIcon(Icons.edit_outlined), findsNothing,
+        reason: '离开自定义就该把那支笔收起来');
     expect(state.limits, LimitThresholds.loose);
   });
 

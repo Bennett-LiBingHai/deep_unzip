@@ -273,6 +273,10 @@ class SettingsScreen extends StatelessWidget {
   /// 展开与否只认 [AppState.limitsCustom]（即 chip 停在「自定义」那一档），
   /// **不**去看「当前值是不是等于某个预设」—— 后者会让用户在编辑途中被
   /// 弹出编辑器（把某项改回预设值的一瞬间四行就收起来了）。
+  ///
+  /// 预设档位下这四行**照常列出来**，只是不可点、不带笔。只写一个「标准」
+  /// 等于让人在一组看不见的数字上做选择 —— 多严算严、多大算大，光看档名
+  /// 谁也说不准，而数值本来就摆在手边，没有理由藏起来。
   Widget _buildLimitsSection(BuildContext context) {
     return _group('炸弹防护', [
       _settingItem(
@@ -286,49 +290,63 @@ class SettingsScreen extends StatelessWidget {
           onTap: () => state.cycleLimitPreset(),
         ),
       ),
-      if (state.limitsCustom)
-        for (final field in LimitField.values) _limitRow(context, field),
+      for (final field in LimitField.values)
+        _limitRow(context, field, editable: state.limitsCustom),
     ]);
   }
 
-  /// 「自定义」里的一行：左边名字，右边当前值，点开改。
-  Widget _limitRow(BuildContext context, LimitField field) {
-    return GestureDetector(
-      onTap: () => _editLimit(context, field),
-      child: Container(
-        // 缩进一格，视觉上挂在「解压上限」那一项底下。
-        padding: const EdgeInsets.fromLTRB(60, 11, 16, 11),
-        decoration: BoxDecoration(
-          color: AppTheme.glass,
-          border: Border(
-            bottom: BorderSide(color: Colors.white.withValues(alpha: 0.03)),
-          ),
+  /// 一行阈值：左边名字，右边当前值。[editable] 时点开改。
+  ///
+  /// 只读（预设档位）与可编辑（自定义）**刻意共用同一套排版**：切过去的时候
+  /// 数值留在原位变得可点，用户不必重新找一遍自己刚才在看哪一行。区别只在
+  /// 颜色和那支笔 —— 只读的行点名和数值都是 `textSecondary`，整行暗下去，
+  /// 一眼能看出「这不是给你改的」。
+  Widget _limitRow(
+    BuildContext context,
+    LimitField field, {
+    required bool editable,
+  }) {
+    final row = Container(
+      // 缩进一格，视觉上挂在「解压上限」那一项底下。
+      padding: const EdgeInsets.fromLTRB(60, 11, 16, 11),
+      decoration: BoxDecoration(
+        color: AppTheme.glass,
+        border: Border(
+          bottom: BorderSide(color: Colors.white.withValues(alpha: 0.03)),
         ),
-        child: Row(
-          children: [
-            Expanded(
-              child: Text(
-                field.label,
-                style: const TextStyle(
-                  fontSize: 12,
-                  color: AppTheme.textSecondary,
-                ),
-              ),
-            ),
-            Text(
-              field.display(state.limits),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              field.label,
               style: const TextStyle(
                 fontSize: 12,
-                fontFamily: 'monospace',
-                color: AppTheme.neonPurple,
+                color: AppTheme.textSecondary,
               ),
             ),
+          ),
+          Text(
+            field.display(state.limits),
+            style: TextStyle(
+              fontSize: 12,
+              fontFamily: 'monospace',
+              color: editable ? AppTheme.neonPurple : AppTheme.textSecondary,
+            ),
+          ),
+          if (editable) ...[
             const SizedBox(width: 6),
             const Icon(Icons.edit_outlined, size: 12, color: AppTheme.textDim),
           ],
-        ),
+        ],
       ),
     );
+
+    // 只读的行不接点击：接了却什么都不发生，比不接更让人困惑。
+    // 想改数值就点右边的档位 chip 走到「自定义」，那一档会保留当前这组
+    // 数字（见 `AppState.setLimitPreset`），是从这一档微调出去的。
+    if (!editable) return row;
+    return GestureDetector(onTap: () => _editLimit(context, field), child: row);
   }
 
   Future<void> _editLimit(BuildContext context, LimitField field) async {
