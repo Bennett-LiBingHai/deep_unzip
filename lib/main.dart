@@ -86,8 +86,10 @@ class _MainShellState extends State<MainShell> {
   // `late` 而非直接初始化：它要读 `widget`，而字段初始化器跑在 `widget` 就位
   // 之前。`late` 把它推迟到 `initState` 里第一次访问时，那里两者都在了。
   late final AppState _state = AppState(
-    blockedPrompt: const DialogBridge().askArchiveBlocked,
-    errorPrompt: const DialogBridge().askExtractError,
+    // 一个回调管两档：闸门拦下和解压出错共用同一个「继续 / 停止」弹窗
+    // （见 services/prompts.dart 的表）。原先这里是两个，后者那条能「暂停」
+    // 的路已按用户要求去掉。
+    prompt: const DialogBridge().askCantExtract,
     formatPrompt: const DialogBridge().askFormatDetect,
     persistStore: widget.store,
     restore: widget.snapshot,

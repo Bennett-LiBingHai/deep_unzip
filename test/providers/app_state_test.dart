@@ -74,9 +74,6 @@ void main() {
   /// 不用「等固定轮数」：批次里每包一次 `await`，包数变了轮数就变了。
   /// **没有竞态**——`_runExtractBatch` 的同步前缀在 `startExtract()` 返回前
   /// 就跑完了，所以第一次检查 `extracting` 时它必然是 true。
-  ///
-  /// 暂停时 [AppState.extracting] 会一直为 true，所以暂停的用例必须先
-  /// `resumeExtract()` 再调这里。
   Future<void> drainExtract(AppState state, {int budget = 500}) async {
     for (var i = 0; i < budget; i++) {
       if (!state.extracting) return;
@@ -604,10 +601,11 @@ void main() {
       expect(state.progress, 1.0);
     });
 
-    t('暂停停在包与包之间，继续后跑完', () async {
-      final root = tempRoot('as_pause');
+    t('停止解压：当前包解完后停下，剩下的包不再开工', () async {
+      final root = tempRoot('as_stop');
       put(root, 'a.zip', realZip({'x': 'y'}));
       put(root, 'b.zip', realZip({'x': 'y'}));
+      put(root, 'c.zip', realZip({'x': 'y'}));
 
       final gate = Completer<void>();
       final engine = FakeEngine()
@@ -621,23 +619,20 @@ void main() {
       state.startExtract();
       await settle();
 
-      state.pauseExtract();
-      expect(state.paused, isTrue);
-      expect(state.extracting, isTrue, reason: '暂停不等于结束');
-      expect(state.toastMsg, contains('解完后暂停'), reason: '粒度要如实说，别让人以为按下去就冻住');
+      state.stopExtract();
+      expect(state.extracting, isTrue, reason: '停止不等于立刻结束：要等当前这个包解完');
+      expect(state.toastMsg, contains('解完后停止'),
+          reason: '粒度要如实说，别让人以为按下去就冻住');
 
       gate.complete(); // 第一个包解完
-      await settle();
-
-      expect(engine.rounds, 1, reason: '闸门应该卡在第二个包之前');
-      expect(state.paused, isTrue);
-
-      state.resumeExtract();
-      expect(state.paused, isFalse);
       await drainExtract(state);
 
-      expect(engine.rounds, 2);
-      expect(state.completed, isTrue);
+      expect(engine.rounds, 1, reason: '剩下两个包不该再开工 —— 停止没有「继续」');
+      expect(state.extracting, isFalse);
+      expect(state.completed, isFalse, reason: '中止不是完成');
+      // 中止**不消费**这份快照：主按钮要能回到「开始智能解压」。锁住的话用户
+      // 就被困在「剩下的包解不了、也重跑不了」的死角里（见 finally 里那段）。
+      expect(state.batchRun, isFalse);
     });
 
     t('解压中再点开始不重复起任务', () async {
@@ -662,13 +657,11 @@ void main() {
       await drainExtract(state);
     });
 
-    t('暂停 / 继续在无任务时都是空操作', () {
+    t('没在解压时点「停止」是空操作', () {
       final state = booted();
-      state.pauseExtract();
-      expect(state.paused, isFalse);
-
-      state.resumeExtract();
-      expect(state.paused, isFalse);
+      state.stopExtract();
+      expect(state.extracting, isFalse);
+      expect(state.toastMsg, isNull, reason: '没活儿在跑就不该冒一句「将在…停止」出来');
     });
 
     t('解压途中被 dispose：不崩，批次正常收尾', () async {
@@ -702,8 +695,11 @@ void main() {
       );
     });
 
-    t('暂停中被 dispose：闸门被放行，批次不会永远挂着', () async {
-      final root = tempRoot('as_dispose_paused');
+    t('停止之后又被 dispose：不崩，也不会卡住', () async {
+      // 这条原先守的是「dispose 必须放行暂停闸门，否则那一帧永远悬着」。
+      // 暂停闸门已经随「不要暂停」一起删了，但这两个动作凑在一起仍然是
+      // 用户真会走到的路径（按了停止、随即离开页面），值得留一条守着。
+      final root = tempRoot('as_dispose_stopped');
       put(root, 'a.zip', realZip({'x': 'y'}));
       put(root, 'b.zip', realZip({'x': 'y'}));
 
@@ -718,21 +714,16 @@ void main() {
       state.startExtract();
       await settle();
 
-      state.pauseExtract();
+      state.stopExtract();
       gate.complete();
       await settle();
-      expect(state.paused, isTrue, reason: '闸门应该已经卡在第二个包之前');
+      expect(state.extracting, isFalse, reason: '停止请求发出后当前包解完就该收尾');
 
       state.dispose();
       await settle(60);
 
-      // `_paused` 不会被重置，所以卡住与否只能看 `extracting`。
-      expect(
-        state.extracting,
-        isFalse,
-        reason: 'dispose 必须放行暂停闸门，否则那一帧永远悬着',
-      );
-      expect(engine.rounds, 1);
+      expect(state.extracting, isFalse);
+      expect(engine.rounds, 1, reason: '停止之后剩下的包不该再开工');
     });
 
     t('AppState 把自己接上了两条 tick 回调', () async {
@@ -1109,8 +1100,13 @@ void main() {
       message: '解压后需要 12.0 GB，设备只剩 3.2 GB，装不下，已放弃',
     );
 
-    /// 记下每次被问到的 (文件名, 原因)。
-    final asked = <({String name, LimitBreach breach})>[];
+    /// 记下每次被问到的 (文件名, 原因那句话)。
+    ///
+    /// 原因是个**字符串**而不是 `LimitBreach`：弹窗只渲染这一句话，让它多拿
+    /// 一个用不上的对象等于给「弹窗开始按 kind 分支」留了个口子（见
+    /// `prompts.dart` 里 `ArchivePrompt` 的说明）。所以这里也顺带钉住
+    /// 「闸门那一路传的确实是 breach.message」。
+    final asked = <({String name, String reason})>[];
 
     setUp(asked.clear);
 
@@ -1148,9 +1144,9 @@ void main() {
       final engine = gatedEngine();
       final state = AppState(
         engine: engine,
-        blockedPrompt: (name, b) async {
-          asked.add((name: name, breach: b));
-          return BlockedDecision.skip;
+        prompt: (name, reason) async {
+          asked.add((name: name, reason: reason));
+          return ArchiveDecision.skip;
         },
       );
       addTearDown(state.dispose);
@@ -1160,8 +1156,9 @@ void main() {
       await drainExtract(state);
 
       expect(asked.single.name, 'a.zip');
-      expect(asked.single.breach.kind, LimitKind.diskSpace,
-          reason: '弹窗要拿到完整的 breach，否则正文没法写');
+      // 闸门那一路要把 `breach.message` 传下去，不能糊一句泛泛的「解压失败」
+      // —— 弹窗正文就是这句话，它得说清是「装不下」还是「包太大」。
+      expect(asked.single.reason, breach.message);
       expect(engine.rounds, 2, reason: '跳过 ≠ 停批');
       final byName = {for (final l in state.logs) l.name: l};
       expect(byName['a.zip']!.tags, contains('空间不足'));
@@ -1173,7 +1170,7 @@ void main() {
       final engine = gatedEngine();
       final state = AppState(
         engine: engine,
-        blockedPrompt: (name, b) async => BlockedDecision.stop,
+        prompt: (name, reason) async => ArchiveDecision.stop,
       );
       addTearDown(state.dispose);
 
@@ -1195,7 +1192,7 @@ void main() {
       final engine = gatedEngine();
       final state = AppState(
         engine: engine,
-        blockedPrompt: (name, b) async => null,
+        prompt: (name, reason) async => null,
       );
       addTearDown(state.dispose);
       final toasts = toastTrail(state);
@@ -1211,14 +1208,14 @@ void main() {
           reason: '没弹成 = 用户什么都没看见，必须给一条提示');
     });
 
-    t('普通失败（没有 breach）**不落进闸门那个弹窗**', () async {
-      // 这条原来叫「普通失败不弹窗」，理由是「损坏、密码不匹配这些没有第二
-      // 选择」。那个理由已经不作数了：需求 3 要的就是这些也问一句，由
-      // `errorPause` 管着（见「解压出错弹窗」那一组）。
+    t('普通失败（没有 breach）走同一个弹窗，正文是引擎给的原因', () async {
+      // 这条原先叫「普通失败不弹窗」，后来又改成「不落进闸门那个弹窗」——
+      // 两版的区别都建立在「闸门和出错是两条线」上。现在合并成一条了
+      // （见 `prompts.dart` 的表），所以它验的是**剩下的那点差别**：正文。
       //
-      // 现在它验的是**另一件事**：这股失败不该被喂给闸门那条线。闸门弹窗的
-      // 左边那颗是「停止这批」，会丢掉剩余队列；一个坏包触发它的话，用户
-      // 会在一件本来只影响一个包的事情上看到一颗不可恢复的按钮。
+      // 正文由 `breach?.message ?? e.message` 一句决定。写反成 `??` 左边优先，
+      // 弹窗上就会给一个坏包配一句与它无关的「设备只剩 3.2 GB」，而用户会
+      // 真的去清磁盘。
       final root = tempRoot('as_prompt_plain');
       put(root, 'a.zip', realZip({'x': 'y'}));
 
@@ -1228,9 +1225,9 @@ void main() {
         };
       final state = AppState(
         engine: engine,
-        blockedPrompt: (name, b) async {
-          asked.add((name: name, breach: b));
-          return BlockedDecision.skip;
+        prompt: (name, reason) async {
+          asked.add((name: name, reason: reason));
+          return ArchiveDecision.skip;
         },
       );
       addTearDown(state.dispose);
@@ -1240,11 +1237,14 @@ void main() {
       state.startExtract();
       await drainExtract(state);
 
-      expect(asked, isEmpty);
-      expect(toasts.join('\n'), contains('坏了'), reason: '没弹窗就得有 toast 兜底');
+      expect(asked.single.name, 'a.zip');
+      expect(asked.single.reason, '坏了', reason: '没有 breach 时用引擎那句');
+      expect(toasts.join('\n'), isNot(contains('坏了')),
+          reason: '弹窗已经把这句给用户看了，不该再补一条一模一样的 toast');
     });
 
     t('没注入 prompt → 与没有这个特性时逐字节一致', () async {
+      // 闸门那一路也走这个（同一条线）：没人可问就只记日志 + toast 兜底。
       final engine = gatedEngine();
       final state = AppState(engine: engine);
       addTearDown(state.dispose);
@@ -1303,16 +1303,16 @@ void main() {
     });
   });
 
-  group('解压出错弹窗（需求 3）', () {
+  group('出错弹窗与 errorPause 开关（需求 3）', () {
     // 这一组盯的是 `errorPause` 那个开关**真的有人读**。加这一组之前它是个
     // 死开关：界面上写着「无法解压时弹窗询问，而非自动跳过」，而全仓库除了
     // 默认值定义和那行 UI，没有任何地方读过它。
     //
-    // 判据全在「暂停」两个字上：这一档的暂停复用 `pauseExtract` 那道闸门，
-    // 队列原封不动、能接着解。所以下面最重要的断言不是「弹了窗」，而是
-    // **暂停之后 `extracting` 还是 true、剩下几个包一个都没动**。
+    // 这一档与「被闸门拦下」共用同一个回调、同一个弹窗（见 `prompts.dart`
+    // 的表）：两边的两个决断含义完全一样，都是「继续 / 停止」。开关只决定
+    // **问不问**，不改变弹窗长什么样。
 
-    /// 只让第一个包炸，第二个照常成 —— 这样「暂停」与「跳过」才分得开。
+    /// 只让第一个包炸，第二个照常成 —— 这样「继续」与「停止」才分得开。
     FakeEngine brokenFirst() => FakeEngine()
       ..behavior = (e, outDir) async {
         if (e.rounds == 1) {
@@ -1336,14 +1336,14 @@ void main() {
       return seen;
     }
 
-    t('开着 errorPause → 出错时问，选「跳过」→ 整批继续', () async {
+    t('开着 errorPause → 出错时问，选「继续」→ 整批继续', () async {
       final engine = brokenFirst();
       final asked = <String>[];
       final state = AppState(
         engine: engine,
-        errorPrompt: (name, reason) async {
+        prompt: (name, reason) async {
           asked.add('$name|$reason');
-          return ExtractErrorDecision.skip;
+          return ArchiveDecision.skip;
         },
       );
       addTearDown(state.dispose);
@@ -1356,34 +1356,30 @@ void main() {
       expect(asked.single, startsWith('a.zip|'));
       expect(asked.single, contains('这个包坏了'),
           reason: '弹窗正文要用引擎给的那句话，不是我们另编一句');
-      expect(engine.rounds, 2, reason: '跳过 ≠ 停批');
-      expect(state.paused, isFalse);
+      expect(engine.rounds, 2, reason: '继续 ≠ 停批');
       expect(state.batchRun, isTrue, reason: '跑完的批次照常消费快照');
     });
 
-    t('选「暂停」→ 批次挂起、剩下的包一个都没动；resume 之后接着解', () async {
+    t('选「停止」→ 剩下的包一个都不跑，且不消费快照', () async {
       final engine = brokenFirst();
       final state = AppState(
         engine: engine,
-        errorPrompt: (name, reason) async => ExtractErrorDecision.pause,
+        prompt: (name, reason) async => ArchiveDecision.stop,
       );
       addTearDown(state.dispose);
 
-      await state.selectFolderPath(twoPacks('as_err_pause').path);
+      await state.selectFolderPath(twoPacks('as_err_stop').path);
       state.startExtract();
-      await settle(30);
-
-      expect(state.paused, isTrue, reason: '选了暂停，批次该挂起');
-      expect(engine.rounds, 1, reason: '挂起之后 b.zip 一个字节都不该动');
-      expect(state.extracting, isTrue,
-          reason: '暂停不是结束 —— 这一条正是它与闸门弹窗那颗「停止这批」的分水岭');
-
-      state.resumeExtract();
       await drainExtract(state);
 
-      expect(engine.rounds, 2, reason: '继续之后剩下的包接着解');
-      expect(state.batchRun, isTrue,
-          reason: '暂停可恢复，所以这批照常算是跑过了（不消费快照的是「停止这批」那条路）');
+      // 这条就是这次改动的要害：从前这一档选的是「暂停」，批次挂起、resume
+      // 之后还能接着解；现在它和闸门那颗「停止」是同一条不可恢复的路，剩下
+      // 的包直接丢掉。
+      expect(engine.rounds, 1, reason: '停了就不该接着解 b.zip');
+      expect(state.extracting, isFalse);
+      expect(state.completed, isFalse);
+      expect(state.batchRun, isFalse, reason: '不消费快照，主按钮必须能再点');
+      expect(state.completeDetail, contains('已中止'));
     });
 
     t('关掉 errorPause → 不问了，照旧记一条失败接着跑', () async {
@@ -1391,9 +1387,9 @@ void main() {
       final asked = <String>[];
       final state = AppState(
         engine: engine,
-        errorPrompt: (name, reason) async {
+        prompt: (name, reason) async {
           asked.add(name);
-          return ExtractErrorDecision.pause;
+          return ArchiveDecision.stop;
         },
       );
       addTearDown(state.dispose);
@@ -1407,13 +1403,12 @@ void main() {
       await drainExtract(state);
 
       expect(asked, isEmpty, reason: '关掉了就别再打扰用户');
-      expect(state.paused, isFalse);
       expect(engine.rounds, 2);
       expect(toasts.join('\n'), contains('这个包坏了'),
           reason: '不问不等于不报 —— 得有 toast 兜底');
     });
 
-    t('没注入 errorPrompt → 与加这个特性之前一致', () async {
+    t('没注入 prompt → 与加这个特性之前一致', () async {
       final engine = brokenFirst();
       final state = AppState(engine: engine);
       addTearDown(state.dispose);
@@ -1424,18 +1419,18 @@ void main() {
       await drainExtract(state);
 
       expect(engine.rounds, 2);
-      expect(state.paused, isFalse);
       expect(state.batchRun, isTrue);
       expect(toasts.join('\n'), contains('这个包坏了'));
     });
 
-    t('弹窗没弹成（决断为 null）→ 补一条 toast，既不暂停也不当跳过', () async {
+    t('弹窗没弹成（决断为 null）→ 补一条 toast，也不该少解一个包', () async {
       // DialogBridge 拿不到 BuildContext 时就是这么返回的。用户什么都没看见，
-      // 那不是他的决定 —— 当暂停会凭空停住整批，当跳过会凭空少一个包。
+      // 那不是他的决定 —— 当成「停止」会凭空停住整批，当成「继续」倒还好，
+      // 但两者都不该由我们替他选，所以只补一条 toast。
       final engine = brokenFirst();
       final state = AppState(
         engine: engine,
-        errorPrompt: (name, reason) async => null,
+        prompt: (name, reason) async => null,
       );
       addTearDown(state.dispose);
       final toasts = toastTrail(state);
@@ -1444,16 +1439,18 @@ void main() {
       state.startExtract();
       await drainExtract(state);
 
-      expect(state.paused, isFalse, reason: '没弹成不该被当成用户选了暂停');
-      expect(engine.rounds, 2, reason: '也不该少解一个包');
+      expect(engine.rounds, 2, reason: '没弹成不该少解一个包');
+      expect(state.batchRun, isTrue);
       expect(toasts.join('\n'), contains('这个包坏了'),
           reason: '没弹成 = 用户什么都没看见，必须给一条提示');
     });
 
-    t('被闸门拦下时走闸门那条线，**不**落进 errorPause 这条', () async {
-      // 两档的另一边不一样（一个停得回来、一个停不回来），所以是两个回调。
-      // 这条钉的是「别把闸门的异常喂给错误弹窗」—— 那样用户会看到一颗写着
-      // 「暂停任务」的按钮，按下去整批却没了。
+    t('关掉 errorPause 也挡不住闸门那一路 —— 它永远问', () async {
+      // 两档合并成一条线之后，最容易写坏的就是这个条件：写成只判断
+      // `pauseOnError`，闸门就会跟着开关一起沉默 —— 而我们是在「主动放弃一个
+      // 其实可能解得开的包」，这种事不该因为用户关了另一个开关就悄悄发生。
+      //
+      // 顺带钉住正文的来路：闸门这档要传 `breach.message`，不是兜底那句。
       const breach = LimitBreach(
         kind: LimitKind.entryCount,
         tag: '条目数超限',
@@ -1463,27 +1460,25 @@ void main() {
         ..behavior = (e, outDir) async {
           throw EngineException(breach.message, breach: breach);
         };
-      final blockedAsked = <String>[];
-      final errorAsked = <String>[];
+      final asked = <({String name, String reason})>[];
       final state = AppState(
         engine: engine,
-        blockedPrompt: (name, b) async {
-          blockedAsked.add(name);
-          return BlockedDecision.skip;
-        },
-        errorPrompt: (name, reason) async {
-          errorAsked.add(name);
-          return ExtractErrorDecision.skip;
+        prompt: (name, reason) async {
+          asked.add((name: name, reason: reason));
+          return ArchiveDecision.skip;
         },
       );
       addTearDown(state.dispose);
+
+      state.toggleSetting('errorPause'); // 关掉
 
       await state.selectFolderPath(twoPacks('as_err_breach').path);
       state.startExtract();
       await drainExtract(state);
 
-      expect(blockedAsked, hasLength(2));
-      expect(errorAsked, isEmpty, reason: '闸门的裁决不该落到错误弹窗上');
+      expect(asked, hasLength(2), reason: '两个包都被闸门拦下，两个都要问');
+      expect(asked.first.reason, breach.message,
+          reason: '闸门那档的正文是 breach.message，不是兜底文案');
     });
   });
 

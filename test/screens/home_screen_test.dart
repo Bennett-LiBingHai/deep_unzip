@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:deep_unzip/engine/controller.dart';
@@ -67,6 +68,19 @@ void main() {
   /// 定时器不排空的话，`testWidgets` 收尾会判定「还有未完成的定时器」而失败。
   Future<void> drainTimers(WidgetTester tester) =>
       tester.pump(const Duration(seconds: 3));
+
+  /// 手动推 [n] 帧，每帧 100ms。
+  ///
+  /// 解压中那颗转圈的 `CircularProgressIndicator`（`home_screen.dart:662`，
+  /// 没给 `value` → 无限动画）会一直排下一帧，只要它在屏幕上 `pumpAndSettle`
+  /// 就永远等不到头。批次跑得快时面板会自己消失、侥幸能 settle；一旦用例
+  /// 故意把引擎卡住，面板就赖着不走，`pumpAndSettle` 必超时。这些用例只能
+  /// 用固定帧数推进 —— 够走完弹窗那 ~250ms 的收场动画即可。
+  Future<void> pumpFrames(WidgetTester tester, [int n = 8]) async {
+    for (var i = 0; i < n; i++) {
+      await tester.pump(const Duration(milliseconds: 100));
+    }
+  }
 
   group('未选文件夹', () {
     late AppState state;
@@ -212,6 +226,50 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(engine.rounds, rounds, reason: '重排队列会往磁盘撒 _1/_2 重复目录');
+
+      await drainTimers(tester);
+    });
+
+    testWidgets('解压中点主按钮 → 请求停止，剩下的包不再开工', (tester) async {
+      // 把批次卡在第一个包上，好让「解压中」这一刻停住 —— 否则整批会在一两个
+      // pump 里跑完，压根没有「正在解压」可观察。
+      final blocked = Completer<void>();
+      engine.behavior = (_, outDir) => blocked.future;
+
+      await pumpHome(tester, state);
+      await tester.tap(find.byType(PrimaryButton));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('确认解压'));
+      // 从这里起进度面板就挂上去了，转圈那颗会一直排帧 —— 不能再 pumpAndSettle。
+      await pumpFrames(tester);
+
+      String label() =>
+          tester.widget<PrimaryButton>(find.byType(PrimaryButton)).label;
+
+      expect(state.extracting, isTrue);
+      expect(label(), '停止解压');
+
+      // 点一下 = 请求停止。**不是暂停** —— 这一档不可恢复，当前包解完就收摊，
+      // 队列里剩下的直接丢掉，所以按钮写的就是「停止」这两个字。从前这里
+      // 是「暂停 / 继续」两颗交替，用户明确要求去掉：弹窗里那颗「继续」已经
+      // 承担了「接着跑」的意思，主按钮再留一个「继续」就重了。
+      await tester.tap(find.byType(PrimaryButton));
+      await pumpFrames(tester, 4);
+
+      // 停止的粒度是「当前包解完之后」，所以按下这一刻批次还没结束，按钮也
+      // 不变 —— 它只是不再重复发请求（`stopExtract` 开头就挡了回去）。
+      expect(state.extracting, isTrue, reason: '当前包还在解，不能硬杀');
+      expect(label(), '停止解压');
+
+      // 放行第一个包 —— 引擎到这里才走完一轮，批次的收尾逻辑这才轮得到跑。
+      blocked.complete();
+      await pumpFrames(tester);
+
+      expect(state.extracting, isFalse);
+      expect(engine.rounds, 1, reason: '停止之后 b.zip 一个字节都不该动');
+      expect(state.batchRun, isFalse,
+          reason: '中止的批次不算「这批用掉了」，主按钮得能再点');
+      expect(label(), '开始智能解压');
 
       await drainTimers(tester);
     });

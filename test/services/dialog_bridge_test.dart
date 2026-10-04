@@ -1,5 +1,4 @@
 import 'package:deep_unzip/app_navigator.dart';
-import 'package:deep_unzip/engine/limits.dart';
 import 'package:deep_unzip/services/prompts.dart';
 import 'package:deep_unzip/services/dialog_bridge.dart';
 import 'package:flutter/material.dart';
@@ -12,11 +11,10 @@ import 'package:flutter_test/flutter_test.dart';
 /// `.then` 里的兜底，`Completer` 就永远悬着 —— 表现是整批解压停在原地，
 /// 而且没有任何报错。所以「滑走」这条用例是这组里最重要的一个。
 void main() {
-  const breach = LimitBreach(
-    kind: LimitKind.diskSpace,
-    tag: '空间不足',
-    message: '解压后需要 12.0 GB，设备只剩 3.2 GB，装不下，已放弃',
-  );
+  // 闸门拦下时那句话由 `LimitBreach.message` 给，解压出错时由引擎给 ——
+  // 桥接两边都只当字符串转发，所以这里各挑一句代表，验的是「原样摆出来」。
+  const breachReason = '解压后需要 12.0 GB，设备只剩 3.2 GB，装不下，已放弃';
+  const errorReason = '解压失败：CRC 校验失败（文件已损坏）';
 
   /// 挂一个带 [AppNavigator.key] 的壳 —— 桥接就是靠它拿 context 的。
   ///
@@ -33,125 +31,92 @@ void main() {
   /// 返回的 future 此刻**还没完成**（要等对话框上的点击），调用方点完再 await
   /// 它。`await` 的这个 helper 只等服务弹窗动画结束 —— 别把这两件事写混了，
   /// 混了就会撞上 `pumpAndSettle` 未完成又调 `expect` 的 guarded conflict。
-  Future<Future<BlockedDecision?>> askAndSettle(WidgetTester tester) async {
-    final decision = const DialogBridge().askArchiveBlocked('a.zip', breach);
+  Future<Future<ArchiveDecision?>> askAndSettle(
+    WidgetTester tester, {
+    String reason = breachReason,
+  }) async {
+    final decision = const DialogBridge().askCantExtract('a.zip', reason);
     await tester.pumpAndSettle();
     return decision;
   }
 
-  testWidgets('点「停止这批」→ stop', (tester) async {
-    await mount(tester);
-    final future = await askAndSettle(tester);
+  group('一个包处理不了（闸门拦下 / 解压出错共用）', () {
+    testWidgets('点「停止」→ stop', (tester) async {
+      await mount(tester);
+      final future = await askAndSettle(tester);
 
-    expect(find.text('a.zip'), findsOneWidget, reason: '爆的是哪个包要写在弹窗上');
-    expect(find.text(breach.message), findsOneWidget);
-    // 左边那颗**不能**叫「暂停任务」：暂停是可恢复的，而这一档把剩余队列丢掉。
-    expect(find.text('暂停任务'), findsNothing);
+      expect(find.text('a.zip'), findsOneWidget, reason: '爆的是哪个包要写在弹窗上');
+      expect(find.text(breachReason), findsOneWidget);
 
-    await tester.tap(find.text('停止这批'));
-    await tester.pumpAndSettle();
+      await tester.tap(find.text('停止'));
+      await tester.pumpAndSettle();
 
-    expect(await future, BlockedDecision.stop);
-  });
+      expect(await future, ArchiveDecision.stop);
+    });
 
-  testWidgets('点「跳过继续」→ skip', (tester) async {
-    await mount(tester);
-    final future = await askAndSettle(tester);
+    testWidgets('点「继续」→ skip', (tester) async {
+      await mount(tester);
+      final future = await askAndSettle(tester);
 
-    await tester.tap(find.text('跳过继续'));
-    await tester.pumpAndSettle();
+      await tester.tap(find.text('继续'));
+      await tester.pumpAndSettle();
 
-    expect(await future, BlockedDecision.skip);
-  });
+      expect(await future, ArchiveDecision.skip,
+          reason: '继续 = 这个包不要了、接着解下一个，不是「留着这个包等下再试」');
+    });
 
-  testWidgets('点遮罩滑走 → 兜底成 skip，future 不会永远悬着', (tester) async {
-    await mount(tester);
-    final future = await askAndSettle(tester);
+    testWidgets('两颗按钮的字：左边「停止」、右边「继续」，且没有「暂停」', (tester) async {
+      await mount(tester);
+      await askAndSettle(tester);
 
-    // 遮罩铺在弹窗上方，点最上角必中遮罩。
-    await tester.tapAt(const Offset(10, 10));
-    await tester.pumpAndSettle();
+      expect(find.text('停止'), findsOneWidget);
+      expect(find.text('继续'), findsOneWidget);
+      // 这一条钉的是这次改动的**目的**：界面上不该再出现「暂停」。左边的
+      // 那颗停下去队列就没了，叫「暂停任务」会让人以为自己还能回来 ——
+      // 那正是用户要求消掉的误会。
+      expect(find.text('暂停任务'), findsNothing);
+      expect(find.text('继续解压'), findsNothing);
+    });
 
-    expect(find.text('停止这批'), findsNothing, reason: '前提：弹窗真的被关掉了');
-    expect(await future, BlockedDecision.skip,
-        reason: '误滑一下不该废掉整批 —— 所以兜底是继续跑，不是停');
-  });
+    testWidgets('出错那一路：同样的两颗按钮，reason 原样摆出来', (tester) async {
+      await mount(tester);
+      final future = await askAndSettle(tester, reason: errorReason);
 
-  testWidgets('拿不到 context → 返回 null，不弹也不等', (tester) async {
-    // MaterialApp 没挂 AppNavigator.key 时 currentContext 恒为 null。
-    await mount(tester, withKey: false);
+      // 出错与闸门共用同一个方法、同一个弹窗。这条防的是「哪天有人给其中
+      // 一路换回旧文案/旧判定」—— 两档的决断语义现在完全一样。
+      expect(find.text('broken.zip'), findsNothing, reason: '文件名是参数，这里是 a.zip');
+      expect(find.text(errorReason), findsOneWidget);
 
-    // 外层的 await 只等挂载，内层那个才是决断 —— 而它应当**已经**是 null，
-    // 不是悬着的（context 拿不到时桥接直接返回，不弹也不等）。
-    final decision = await (await askAndSettle(tester));
+      await tester.tap(find.text('继续'));
+      await tester.pumpAndSettle();
+      expect(await future, ArchiveDecision.skip);
+    });
 
-    expect(decision, isNull,
-        reason: 'null = 没弹。调用方据此补 toast，而不是当成用户选了某一项');
-    expect(find.text('跳过继续'), findsNothing);
-  });
+    testWidgets('点遮罩滑走 → 兜底成 skip，future 不会永远悬着', (tester) async {
+      await mount(tester);
+      final future = await askAndSettle(tester);
 
-  // -------------------------------------------------------------------------
-  // 解压出错（需求 3）。与上面那个共用 ErrorModal，只有左边那颗的字不一样，
-  // 而那个区别正是全部要害：「暂停任务」停得回来，「停止这批」停不回来。
-  // -------------------------------------------------------------------------
+      // 遮罩铺在弹窗上方，点最上角必中遮罩。
+      await tester.tapAt(const Offset(10, 10));
+      await tester.pumpAndSettle();
 
-  Future<Future<ExtractErrorDecision?>> askErrorAndSettle(
-    WidgetTester tester,
-  ) async {
-    final decision =
-        const DialogBridge().askExtractError('broken.zip', '文件损坏，读不出来');
-    await tester.pumpAndSettle();
-    return decision;
-  }
+      expect(find.text('停止'), findsNothing, reason: '前提：弹窗真的被关掉了');
+      expect(await future, ArchiveDecision.skip,
+          reason: '误滑一下不该废掉整批 —— 所以兜底是继续跑，不是停');
+    });
 
-  testWidgets('出错弹窗：左边那颗是「暂停任务」，且点了真的回 pause', (tester) async {
-    await mount(tester);
-    final future = await askErrorAndSettle(tester);
+    testWidgets('拿不到 context → 返回 null，不弹也不等', (tester) async {
+      // MaterialApp 没挂 AppNavigator.key 时 currentContext 恒为 null。
+      await mount(tester, withKey: false);
 
-    expect(find.text('broken.zip'), findsOneWidget, reason: '要说清是哪个包');
-    expect(find.text('文件损坏，读不出来'), findsOneWidget);
-    expect(find.text('暂停任务'), findsOneWidget);
-    // 这一档的暂停是**可恢复**的（复用 pauseExtract 那道闸门），所以绝不能
-    // 复用闸门弹窗那颗「停止这批」—— 那两个弹窗长得一模一样，只有字不一样。
-    expect(find.text('停止这批'), findsNothing);
+      // 外层的 await 只等挂载，内层那个才是决断 —— 而它应当**已经**是 null，
+      // 不是悬着的（context 拿不到时桥接直接返回，不弹也不等）。
+      final decision = await (await askAndSettle(tester));
 
-    await tester.tap(find.text('暂停任务'));
-    await tester.pumpAndSettle();
-
-    expect(await future, ExtractErrorDecision.pause);
-  });
-
-  testWidgets('出错弹窗：点「跳过继续」→ skip', (tester) async {
-    await mount(tester);
-    final future = await askErrorAndSettle(tester);
-
-    await tester.tap(find.text('跳过继续'));
-    await tester.pumpAndSettle();
-
-    expect(await future, ExtractErrorDecision.skip);
-  });
-
-  testWidgets('出错弹窗：滑走 → 兜底成 pause', (tester) async {
-    await mount(tester);
-    final future = await askErrorAndSettle(tester);
-
-    await tester.tapAt(const Offset(10, 10));
-    await tester.pumpAndSettle();
-
-    expect(find.text('暂停任务'), findsNothing, reason: '前提：弹窗真的被关掉了');
-    // 与闸门弹窗**相反**的兜底，而且这不是笔误：那一档的另一边是丢了队列的
-    // 停止，误滑代价太大所以兜「继续跑」；这一档的暂停队列还在、点一下就回来，
-    // 所以兜「可恢复的那个」。判据是同一个 —— 默认挑不会丢东西的。
-    expect(await future, ExtractErrorDecision.pause);
-  });
-
-  testWidgets('出错弹窗：拿不到 context → null', (tester) async {
-    await mount(tester, withKey: false);
-
-    final decision = await (await askErrorAndSettle(tester));
-
-    expect(decision, isNull);
-    expect(find.text('暂停任务'), findsNothing);
+      expect(decision, isNull,
+          reason: 'null = 没弹。调用方据此补 toast，而不是当成用户选了某一项');
+      expect(find.text('继续'), findsNothing);
+    });
   });
 
   // -------------------------------------------------------------------------

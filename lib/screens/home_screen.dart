@@ -38,13 +38,12 @@ class HomeScreen extends StatelessWidget {
             ],
             if (state.hasScanned &&
                 !state.extracting &&
-                !state.paused &&
                 !state.completed &&
                 !state.scanning) ...[
               const SizedBox(height: 16),
               _buildScanResult(),
             ],
-            if (state.extracting || state.paused) ...[
+            if (state.extracting) ...[
               const SizedBox(height: 16),
               _buildProgressPanel(),
             ],
@@ -65,36 +64,39 @@ class HomeScreen extends StatelessWidget {
     );
   }
 
-  /// 主按钮的文案。五态：扫描中 / 解压中 / 已暂停 / 这批已跑过 / 待启动。
+  /// 主按钮的文案。四态：扫描中 / 停止解压 / 这批已跑过 / 待启动。
+  ///
+  /// **没有「继续」这一态。** 界面上唯一会「停下来」的地方是错误弹窗，而那
+  /// 个弹窗自己带着「继续 / 停止」两颗按钮 —— 用户在那儿点「继续」就等于
+  /// 继续了，主按钮没有任何机会需要承担这个语义（见 `app_state.dart` 的
+  /// `stopExtract`）。所以解压中这颗唯一有意义的动作是**停下**。
   ///
   /// 「这批已跑过」必须单独一态：那批扫描结果一旦解过，再点不会「重新解一遍」
   /// —— 输出目录重名会追加 `_1`/`_2`（见 `output_paths.dart`），等于往磁盘里
   /// 撒重复目录。所以按钮改成「换个文件夹」，让它去干真正有用的事。
   String get _primaryLabel {
     if (state.scanning) return '正在扫描...';
-    if (state.extracting) return '解压中...';
-    if (state.paused) return '继续解压';
+    if (state.extracting) return '停止解压';
     if (state.batchRun) return '换个文件夹';
     return '开始智能解压';
   }
 
   IconData get _primaryIcon {
-    if (state.extracting) return Icons.pause;
-    if (state.batchRun && !state.paused) return Icons.folder_open;
+    // `stop` 而不是 `pause`：这一颗按下去队列就丢了，画成两根竖条会让人以为
+    // 还能接回来（见 [_primaryLabel]）。
+    if (state.extracting) return Icons.stop;
+    if (state.batchRun) return Icons.folder_open;
     return Icons.play_arrow;
   }
 
-  /// 运行 / 暂停的状态灯颜色。
-  Color get _liveColor =>
-      state.paused ? AppTheme.neonOrange : AppTheme.neonGreen;
 
-  /// 扫描中不能重复触发；暂停时反而必须可点（那就是「继续」）。
+  /// 扫描中不能重复触发（解压中那颗是「停止」，恰恰必须可点）。
   ///
   /// 「换个文件夹」永远可点 —— 它是脱困路径，禁用它等于把用户困在一批
   /// 已经跑过的结果里。
   bool get _primaryDisabled {
     if (state.scanning) return true;
-    if (state.extracting || state.paused) return false;
+    if (state.extracting) return false;
     if (state.batchRun) return false;
     return !state.hasScanned;
   }
@@ -592,28 +594,28 @@ class HomeScreen extends StatelessWidget {
                       vertical: 3,
                     ),
                     decoration: BoxDecoration(
-                      color: _liveColor.withValues(alpha: 0.15),
+                      color: AppTheme.neonGreen.withValues(alpha: 0.15),
                       borderRadius: BorderRadius.circular(10),
                     ),
-                    child: Row(
+                    child: const Row(
                       children: [
-                        Icon(Icons.circle, size: 4, color: _liveColor),
-                        const SizedBox(width: 4),
+                        Icon(Icons.circle, size: 4, color: AppTheme.neonGreen),
+                        SizedBox(width: 4),
                         Text(
-                          state.paused ? 'PAUSED' : 'LIVE',
+                          'LIVE',
                           style: TextStyle(
                             fontSize: 9,
                             fontFamily: 'monospace',
-                            color: _liveColor,
+                            color: AppTheme.neonGreen,
                           ),
                         ),
                       ],
                     ),
                   ),
                   const SizedBox(width: 8),
-                  Text(
-                    state.paused ? '已暂停' : '正在解压',
-                    style: const TextStyle(
+                  const Text(
+                    '正在解压',
+                    style: TextStyle(
                       fontSize: 14,
                       fontWeight: FontWeight.w600,
                       color: AppTheme.textPrimary,
@@ -817,11 +819,7 @@ class HomeScreen extends StatelessWidget {
   /// 通过 `AppNavigator` 弹），而不是由定时器按秒表演一遍。
   Future<void> _onStart(BuildContext context) async {
     if (state.extracting) {
-      state.pauseExtract();
-      return;
-    }
-    if (state.paused) {
-      state.resumeExtract();
+      state.stopExtract();
       return;
     }
     // 这批已经跑过一轮。按钮的语义是「换个文件夹」，不是「再来一遍」——

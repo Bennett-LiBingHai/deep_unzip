@@ -46,15 +46,14 @@ import '../services/disk_space.dart';
 /// - `engine/` 里没有 `package:flutter`，所以引擎能跑在 isolate 里；
 ///   这一层是唯一允许把两者接起来的地方。
 class AppState extends ChangeNotifier {
-  // 参数名故意与字段名（`_onBlocked`）**不止差一个下划线**：Dart 不允许私有
-  // 具名参数，所以 `this._onBlocked` 这种初始化形参在这里根本写不出来，
+  // 参数名故意与字段名（`_onPrompt`）**不止差一个下划线**：Dart 不允许私有
+  // 具名参数，所以 `this._onPrompt` 这种初始化形参在这里根本写不出来，
   // 而 `prefer_initializing_formals` 只比对「去掉下划线之后是否同名」——
-  // 叫 `onBlocked` 会换来一条改不掉的假警告。叫 `blockedPrompt` 就绕开了。
+  // 叫 `onPrompt` 会换来一条改不掉的假警告。叫 `prompt` 就绕开了。
   AppState({
     EngineController? engine,
     DiskSpaceProbe? diskSpace,
-    ArchiveBlockedPrompt? blockedPrompt,
-    ArchiveErrorPrompt? errorPrompt,
+    ArchivePrompt? prompt,
     FormatDetectPrompt? formatPrompt,
     // 参数名与字段名（`_store`）**不止差一个下划线** —— 与上面那条同因：
     // 叫 `store` 会换来一条 Dart 根本没法照做的假警告。
@@ -62,8 +61,7 @@ class AppState extends ChangeNotifier {
     AppSnapshot? restore,
   })  : _injectedEngine = engine,
         _diskSpace = diskSpace ?? DiskSpaceProbe(),
-        _onBlocked = blockedPrompt,
-        _onError = errorPrompt,
+        _onPrompt = prompt,
         _onFormatDetect = formatPrompt,
         _store = persistStore {
     // 出厂值在字段初始化时就位了（见下方 `_settings` 等），这里把磁盘上读回来
@@ -89,7 +87,11 @@ class AppState extends ChangeNotifier {
   /// 的 `CmdExtract.availableBytes`）。
   final DiskSpaceProbe _diskSpace;
 
-  /// 被炸弹/空间闸门拦下时问用户一句话。
+  /// 一个包处理不了时问用户「继续 / 停止」。
+  ///
+  /// 两档共用这一个回调：炸弹/空间闸门拦下，和解压出错。原先是两个（`_onBlocked`
+  /// / `_onError`），分开的理由是后者能「暂停」、停得回来 —— 那条路已经按用户
+  /// 要求去掉了，剩下的两个决断在两边含义完全一样，见 `prompts.dart` 的表。
   ///
   /// 为 null 时行为与没有这个特性时**逐字节一致**：只记日志 + toast，不弹窗。
   /// 单元测试默认就是这一档 —— 真弹窗要 `MaterialApp` 挂上 `AppNavigator.key`，
@@ -97,14 +99,7 @@ class AppState extends ChangeNotifier {
   ///
   /// 类型是纯 Dart 的（见 `services/prompts.dart`），所以这一层不必
   /// import 任何 widget，`app_state.dart:43` 那条边界不破。
-  final ArchiveBlockedPrompt? _onBlocked;
-
-  /// 解压出错时问用户「暂停 / 跳过」（需求 3）。同上，为 null 时退回
-  /// 「记一条失败日志、接着解下一个」。
-  ///
-  /// 与 [_onBlocked] 分家的理由见 `prompts.dart` 开头那张表：这两档的另一边
-  /// 一个停得回来、一个停不回来，共用一个回调迟早会有人接错那根线。
-  final ArchiveErrorPrompt? _onError;
+  final ArchivePrompt? _onPrompt;
 
   /// 后缀被篡改时问用户「按真实格式解吗」（需求 5）。同上，为 null 时
   /// 静默按真实格式解 —— 那正是加这个弹窗之前的行为。
@@ -158,7 +153,6 @@ class AppState extends ChangeNotifier {
 
   // 解压状态
   bool _extracting = false;
-  bool _paused = false;
   double _progress = 0.0;
   String _currentFile = '';
   int _doneCount = 0;
@@ -188,9 +182,6 @@ class AppState extends ChangeNotifier {
   /// 当前包内正在处理的条目名。UI 暂未使用，留着给进度面板做副标题。
   String _entryName = '';
 
-  /// 暂停闸门。非 null 表示正挂在一个暂停上。
-  Completer<void>? _resumeGate;
-
   bool get extracting => _extracting;
   double get progress => _progress;
   String get currentFile => _currentFile;
@@ -208,9 +199,6 @@ class AppState extends ChangeNotifier {
   /// 这批扫描结果已经解压过了（无论成败）。为真时主按钮应换成「换个文件夹」，
   /// 不能再是「开始智能解压」—— 理由见 [_batchRun]。
   bool get batchRun => _batchRun;
-
-  /// 暂停中。区别于 [extracting]：暂停时 `extracting` 为 false 但任务还在。
-  bool get paused => _paused;
 
   // 密码库。**空库起步** —— 之前从 mock 数据播种是为了演示观感，但那会让
   // 用户第一次打开就看到四条「别人的」密码（还带假的命中次数）。真实做法是
@@ -642,7 +630,6 @@ class AppState extends ChangeNotifier {
   /// 上一个目录的数字，看起来像是新任务立刻跑到那儿了。
   void _resetExtractState() {
     _extracting = false;
-    _paused = false;
     _progress = 0.0;
     _currentFile = '';
     _doneCount = 0;
@@ -659,7 +646,7 @@ class AppState extends ChangeNotifier {
   /// 输出目录与源同级（`A/B/c.zip` → `A/B/c/`），重名追加 `_1`。递归解压
   /// （解出来的包里还有包）是 P2，这里只处理顶层的一批。
   void startExtract() {
-    if (_extracting || _paused) return;
+    if (_extracting) return;
     if (_archives.isEmpty) {
       showToast('先选择一个文件夹并完成扫描', type: 'warn');
       return;
@@ -675,44 +662,24 @@ class AppState extends ChangeNotifier {
     unawaited(_runExtractBatch());
   }
 
-  /// 暂停。**粒度是「包与包之间」**，不是条目级。
+  /// 停下这一批。**粒度是「包与包之间」**，不是条目级。
   ///
   /// 之所以做不到条目级：`duz_extract_all` 是一次同步 FFI 调用，跑起来就
   /// 不回头，中途没有任何 Dart 代码能被执行（见 [CmdExtract] 的说明）。
   /// 能做到的是「当前这个包解完就停」。对多数场景够用，但一个大包可能要
   /// 等上几十秒才真的停下来 —— UI 上要如实说这一点，别让用户以为按下去
-  /// 就立刻冻结了。
-  void pauseExtract() {
-    if (!_extracting || _paused) return;
-    _paused = true;
-    _notify();
-    showToast('将在当前压缩包解完后暂停');
-  }
-
-  /// 从暂停处继续。
-  void resumeExtract() {
-    if (!_paused) return;
-    _paused = false;
-    final gate = _resumeGate;
-    _resumeGate = null;
-    gate?.complete();
-    _notify();
-    showToast('继续解压');
-  }
-
-  /// 包与包之间的暂停闸门：暂停时在这里挂起，继续时放行。
+  /// 就立刻停了（那颗按钮的文案因此是「停止解压」而不是「已停止」）。
   ///
-  /// 用 `while` 而不是一次 `await`：用户可能在放行的一瞬间又按了暂停，
-  /// 那时 `_paused` 又是 true，必须重新挂起而不是漏过去。
-  ///
-  /// 条件里必须带 `!_disposed`：`dispose()` 会把 `_resumeGate` 补完放行，
-  /// 但 `_paused` 仍然是 true —— 只看 `_paused` 的话会立刻建一个新闸门
-  /// 重新挂上，等于没放行。
-  Future<void> _waitWhilePaused() async {
-    while (_paused && !_disposed) {
-      final gate = _resumeGate ??= Completer<void>();
-      await gate.future;
-    }
+  /// **停下就是停下，没有「继续」。** 剩下没解的包直接丢掉，用户想接着来
+  /// 只能重新选文件夹（那会重新扫描，拿到一份新快照）。原先这里是一对
+  /// `pauseExtract`/`resumeExtract`，暂停闸门让队列原封不动地等着；用户
+  /// 明确要求「不需要暂停，要么继续、要么停止」，于是收敛成这一条不可恢复
+  /// 的停止 —— 与弹窗里那颗「停止」走的是同一条路（都是 `_cancelRequested`）。
+  void stopExtract() {
+    if (!_extracting || _cancelRequested) return;
+    _cancelRequested = true;
+    _notify();
+    showToast('将在当前压缩包解完后停止');
   }
 
   /// 逐个解压。批次开始时给扫描结果拍一张快照，之后**只往里追加** ——
@@ -746,7 +713,6 @@ class AppState extends ChangeNotifier {
     final pauseOnError = setting('errorPause');
 
     _extracting = true;
-    _paused = false;
     _completed = false;
     _completeDetail = '';
     _cancelRequested = false;
@@ -768,9 +734,9 @@ class AppState extends ChangeNotifier {
       final engine = await _ensureEngine();
 
       while (queue.isNotEmpty) {
-        await _waitWhilePaused();
-        // 释放之后没必要再往下跑：引擎已经没了，剩下的每个包都会以
-        // 「控制器已释放」失败，白记一屏失败日志。
+        // 用户按了「停止解压」或弹窗里那颗「停止」，就到这儿为止。
+        // `_disposed` 那一半是另一回事：释放之后没必要再往下跑，引擎已经没了，
+        // 剩下的每个包都会以「控制器已释放」失败，白记一屏失败日志。
         if (_cancelRequested || _disposed) break;
 
         final task = queue.removeFirst();
@@ -901,40 +867,34 @@ class AppState extends ChangeNotifier {
           // 弹窗真的弹出来了就不再补 toast —— 那句话用户刚在弹窗里看过。
           var shown = false;
 
-          if (breach != null) {
-            // **被闸门拦下永远问**，与 `errorPause` 无关。那是「我们主动放弃
-            // 了一个其实可能解得开的包」，用户有权当场知道并决定；而且它给出
-            // 的两个选项里有一个是**不可恢复**的停止，更不该由我们替他选。
-            final ask = _onBlocked;
-            if (ask != null) {
-              final decision = await ask(item.fileName, breach);
-              if (decision == BlockedDecision.stop) {
-                // 复用 `_cancelRequested`：收尾那块已经按它算 `cancelled`，
-                // 于是文案换成「已中止」，而且**不消费**这批快照（见 finally）
-                // —— 剩下的包还等着解，主按钮必须能再点。
-                _cancelRequested = true;
-                break;
-              }
-              // null = 弹窗没弹成（拿不到 BuildContext）。那不是用户的决定，
-              // 用户什么都没看到，得补一条 toast 兜底。
-              shown = decision != null;
+          // 什么时候问：
+          //
+          // - **被闸门拦下永远问**，与 `errorPause` 无关。那是「我们主动放弃了
+          //   一个其实可能解得开的包」，用户有权当场知道并决定。
+          // - 普通解压失败（损坏 / 密码不匹配 / 格式不认）看 `errorPause` ——
+          //   关着的时候引擎自己决断：记一条失败日志、接着解下一个，不打扰用户。
+          //
+          // 两档共用同一个弹窗与同一组按钮（「继续 / 停止」）。原先后者问的是
+          // 「暂停 / 跳过」，走 `pauseExtract` 那道闸门、停得回来；用户明确要求
+          // 去掉暂停，于是两边合并 —— 详见 `prompts.dart` 那张表。
+          final ask = _onPrompt;
+          if ((breach != null || pauseOnError) && ask != null) {
+            final decision = await ask(
+              item.fileName,
+              breach?.message ?? e.message,
+            );
+            if (decision == ArchiveDecision.stop) {
+              // 复用 `_cancelRequested`：收尾那块已经按它算 `cancelled`，
+              // 于是文案换成「已中止」，而且**不消费**这批快照（见 finally）
+              // —— 剩下的包还等着解，主按钮必须能再点。
+              //
+              // 失败的这个包本身不重试：「停止」是关于整批的，不是「留着这个
+              // 包等下再试」，它已经记了一条失败日志。
+              _cancelRequested = true;
+              break;
             }
-          } else if (pauseOnError && _onError != null) {
-            // 需求 3：解不开时让用户选「暂停 / 跳过」。
-            //
-            // 走这条路的是「解了但没成」—— 包损坏、密码不匹配、格式不认。
-            // 与上面那档的关键区别在「暂停」这两个字：这里暂停的是**队列**，
-            // 用的是 `pauseExtract` 那道闸门，队列原封不动、「继续解压」接得
-            // 回来。所以**绝不能**复用 `_cancelRequested`，那条路会把剩下的
-            // 包全丢掉（见 finally 里 `_batchRun = !cancelled` 那段）。
-            //
-            // 失败的这个包本身不重试 —— 暂停是关于整批的，不是「留着这个包
-            // 等下再试」，它已经记了一条失败日志。
-            final decision = await _onError(item.fileName, e.message);
-            if (decision == ExtractErrorDecision.pause && !_paused) {
-              _paused = true;
-              showToast('已暂停，处理完后点「继续解压」');
-            }
+            // null = 弹窗没弹成（拿不到 BuildContext）。那不是用户的决定，
+            // 用户什么都没看到，得补一条 toast 兜底。
             shown = decision != null;
           }
           if (!shown) {
@@ -949,10 +909,6 @@ class AppState extends ChangeNotifier {
       showToast(e is EngineException ? e.message : '解压失败：$e', type: 'warn');
     } finally {
       _extracting = false;
-      _paused = false;
-      final gate = _resumeGate;
-      _resumeGate = null;
-      gate?.complete(); // 别把挂着的调用方永远留在那儿
 
       final cancelled = _cancelRequested;
       // 分母取**最终**的 `_batchTotal` 而不是开头那张快照：递归跑出来的
@@ -1159,13 +1115,6 @@ class AppState extends ChangeNotifier {
     // 而重复释放的路径是真实存在的（页面 dispose + 应用级清理），所以自己守。
     if (_disposed) return;
     _disposed = true;
-
-    // 放行挂着的暂停闸门。不放行的话 `_waitWhilePaused()` 会永远等在一个
-    // 再也不会有人 complete 的 Completer 上 —— 批次循环那一帧泄漏掉，
-    // 而且它持有对 `this` 的引用，整个 AppState 都回收不了。
-    final gate = _resumeGate;
-    _resumeGate = null;
-    gate?.complete();
 
     // 引擎的 dispose 会把在跑的任务以异常结束，那条异常会走到
     // `_runExtractBatch` 的 catch 里记一条日志 —— 所以 `_disposed` 必须
