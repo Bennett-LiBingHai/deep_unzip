@@ -3,7 +3,7 @@
 /// ## 为什么是 Completer 而不是让弹窗返回值
 ///
 /// `ErrorModal.show` 返回 `Future<void>`，用户的选择只通过
-/// `onStop`/`onContinue` 两个回调传出来（见 `error_modal.dart`）。要 await
+/// `onStop`/`onSkip` 两个回调传出来（见 `error_modal.dart`）。要 await
 /// 一个结果，就得自己拿 `Completer` 把回调转成 future。
 ///
 /// 而**光包一层 Completer 会挂死**：`showBottomModal` 没设
@@ -33,13 +33,13 @@ class DialogBridge {
   /// 加特性之前的样子 —— 比卡住好。
   BuildContext? get _context => AppNavigator.context;
 
-  /// 弹「这个包处理不了」，等用户选「继续」还是「停止」。
+  /// 弹「这个包处理不了」，等用户选「跳过」还是「停止」。
   ///
   /// 闸门拦下（炸弹 / 空间不够）和解压出错共用这一个弹窗、同一组按钮 ——
   /// 那两种情况下两个决断的含义完全一样（见 `prompts.dart` 的表）。区别只在
   /// [reason] 那句话由谁给：前者是 `LimitBreach.message`，后者是引擎的失败原因。
   ///
-  /// ## 滑走默认 = **继续**，不是停止
+  /// ## 滑走默认 = **跳过**，不是停止
   ///
   /// 主计划最早写的是「默认暂停（保守、可恢复）」，那时候左边那颗叫「暂停」，
   /// 按下去队列还在、点一下就回来。现在它叫「停止」，而且**停掉这一批会把剩余
@@ -62,11 +62,11 @@ class DialogBridge {
       context: context,
       fileName: fileName,
       reason: reason,
-      // 「停止」在左、暖色，「继续」在右、主色渐变。两颗字号一样，只有颜色与
-      // 两个字不同 —— 点了哪颗决定了整批活儿还在不在，所以左边那颗刻意不叫
-      // 「跳过」而叫「停止」：它代价大，名字要吓人一点。
+      // 「停止」在左、暖色，「跳过」在右、主色渐变。两颗字号一样，只有颜色与
+      // 两个字不同 —— 点了哪颗决定了整批活儿还在不在，所以左边那颗刻意叫
+      // 「停止」不叫别的：它代价大，名字要吓人一点。
       onStop: () => finish(ArchiveDecision.stop),
-      onContinue: () => finish(ArchiveDecision.skip),
+      onSkip: () => finish(ArchiveDecision.skip),
     ).then((_) => finish(ArchiveDecision.skip)));
 
     return completer.future;

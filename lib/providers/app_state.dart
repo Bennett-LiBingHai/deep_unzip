@@ -26,6 +26,20 @@ import '../models/password_entry.dart';
 import '../services/prompts.dart';
 import '../services/disk_space.dart';
 
+/// 这一批是**怎么停下来的**。
+///
+/// 只有「停下」这一个维度：没被停过的批次是 `null`（跑完了，中间可能有失败
+/// 或跳过）。总结卡片靠它换标题与配色 —— 一个被停掉的批次摆出「全部解压完成」
+/// 那张绿卡片会直接骗人：剩下的包一个都没解，用户却看到「完成」。
+enum StopSource {
+  /// 主按钮那颗「停止解压」。
+  user,
+
+  /// 「解不开」弹窗里那颗「停止」。这一档**总是**伴随一次解压失败 ——
+  /// 弹窗就是被那个失败引爆的。
+  error,
+}
+
 /// 全局应用状态。
 ///
 /// ## 它现在的角色：引擎的**瘦适配层**
@@ -162,14 +176,27 @@ class AppState extends ChangeNotifier {
   bool _completed = false;
   String _completeDetail = '';
 
-  /// 当前这份扫描结果**已经被解压过一轮了**（成功、失败、取消都算）。
+  /// 这一批是怎么停的；`null` = 没被停过。见 [StopSource]。
+  StopSource? _stopReason;
+
+  /// 当前这份扫描结果**已经被解压过一轮了**（成功、失败、停止都算）。
   ///
-  /// 和 [_completed] 是两件事，别合并：`_completed` 说的是「全部成功」，
-  /// 有任何一个包失败它就是 false；而这里说的是「这份快照用掉了」。
   /// 界面要靠它决定主按钮该不该还是「开始智能解压」—— 一旦这批跑过，
   /// 再点就等于把同一个队列重排一遍，而输出目录重名会追加 `_1`/`_2`
   /// （见 output_paths.dart），结果不是「重新解一遍」而是往磁盘里撒重复目录。
+  ///
+  /// **停止也算跑过了**（原先是例外，真机验收时改的）：停下来的那一批现在
+  /// 会落在总结卡片上，卡片上写清「手动停止 · 已完成 1/3 个压缩包」，主按钮
+  /// 是「换个文件夹」—— 那是一条明确的出路。留着「开始智能解压」反而像什么都
+  /// 没发生过，用户会以为按下就能接着解剩下那两个，实际却是把已解过的重解一遍。
   bool _batchRun = false;
+
+  /// 用户在弹窗里明确放掉的包数（「跳过」/ 格式弹窗的「取消」）。
+  ///
+  /// 与自动跳过（自引用、超出递归深度）分开数：前者是用户做的决定，写进总结
+  /// 是「手动跳过 N 个」；后者是我们自己拦的。混成一句的话，用户没法知道
+  /// 这批里有几个包是自己放掉的。见 [_summarize]。
+  int _manualSkips = 0;
 
   // 解压批次（一次 startExtract 覆盖的一整批包）
   //
@@ -195,6 +222,11 @@ class AppState extends ChangeNotifier {
   String get eta => _eta;
   bool get completed => _completed;
   String get completeDetail => _completeDetail;
+
+  /// 这一批是怎么停的；`null` = 跑完了（中途可能有失败或跳过）。
+  ///
+  /// 总结卡片靠它选标题与配色：被停掉的批次绝不能显示「全部解压完成」。
+  StopSource? get stopReason => _stopReason;
 
   /// 这批扫描结果已经解压过了（无论成败）。为真时主按钮应换成「换个文件夹」，
   /// 不能再是「开始智能解压」—— 理由见 [_batchRun]。
@@ -639,6 +671,8 @@ class AppState extends ChangeNotifier {
     _completed = false;
     _completeDetail = '';
     _batchRun = false;
+    _stopReason = null;
+    _manualSkips = 0;
   }
 
   /// 开始把扫描到的压缩包逐个解开。
@@ -678,6 +712,7 @@ class AppState extends ChangeNotifier {
   void stopExtract() {
     if (!_extracting || _cancelRequested) return;
     _cancelRequested = true;
+    _stopReason = StopSource.user;
     _notify();
     showToast('将在当前压缩包解完后停止');
   }
@@ -715,6 +750,8 @@ class AppState extends ChangeNotifier {
     _extracting = true;
     _completed = false;
     _completeDetail = '';
+    _stopReason = null;
+    _manualSkips = 0;
     _cancelRequested = false;
     _batchTotal = queue.length;
     _doneCount = 0;
@@ -794,6 +831,7 @@ class AppState extends ChangeNotifier {
           // 包从批次里抹掉，比多解一个包糟得多，所以按原样解。
           if (confirmed == false) {
             skipped++;
+            _manualSkips++;
             _doneCount++;
             _addLog(buildExtractLog(
               item: item,
@@ -853,7 +891,6 @@ class AppState extends ChangeNotifier {
             );
           }
         } on EngineException catch (e) {
-          failed++;
           _doneCount++;
           // 走到这里说明这个包整个没解开。一个坏包不该让整批停下 ——
           // 先如实记一条失败，再决定要不要问用户。
@@ -874,7 +911,7 @@ class AppState extends ChangeNotifier {
           // - 普通解压失败（损坏 / 密码不匹配 / 格式不认）看 `errorPause` ——
           //   关着的时候引擎自己决断：记一条失败日志、接着解下一个，不打扰用户。
           //
-          // 两档共用同一个弹窗与同一组按钮（「继续 / 停止」）。原先后者问的是
+          // 两档共用同一个弹窗与同一组按钮（「跳过 / 停止」）。原先后者问的是
           // 「暂停 / 跳过」，走 `pauseExtract` 那道闸门、停得回来；用户明确要求
           // 去掉暂停，于是两边合并 —— 详见 `prompts.dart` 那张表。
           final ask = _onPrompt;
@@ -884,18 +921,29 @@ class AppState extends ChangeNotifier {
               breach?.message ?? e.message,
             );
             if (decision == ArchiveDecision.stop) {
-              // 复用 `_cancelRequested`：收尾那块已经按它算 `cancelled`，
-              // 于是文案换成「已中止」，而且**不消费**这批快照（见 finally）
-              // —— 剩下的包还等着解，主按钮必须能再点。
+              // 复用 `_cancelRequested`：收尾那块按它认「这一批被停过」，
+              // 总结卡片据此换成「已停止」而不是「全部解压完成」。
               //
               // 失败的这个包本身不重试：「停止」是关于整批的，不是「留着这个
               // 包等下再试」，它已经记了一条失败日志。
               _cancelRequested = true;
+              _stopReason = StopSource.error;
+              failed++;
               break;
             }
             // null = 弹窗没弹成（拿不到 BuildContext）。那不是用户的决定，
             // 用户什么都没看到，得补一条 toast 兜底。
             shown = decision != null;
+            if (decision == ArchiveDecision.skip) {
+              // 用户明确说了「跳过这个包」，那它记**跳过**而不是失败 ——
+              // 总结里的「1 个失败」读起来像程序坏了，而这里只是我们照用户的
+              // 决定办事。分成两个数，卡片才说得清这批到底怎么了。
+              _manualSkips++;
+            } else {
+              failed++;
+            }
+          } else {
+            failed++;
           }
           if (!shown) {
             showToast('${item.fileName}：${e.message}', type: 'warn');
@@ -914,18 +962,23 @@ class AppState extends ChangeNotifier {
       // 分母取**最终**的 `_batchTotal` 而不是开头那张快照：递归跑出来的
       // 嵌套包也是这一批的活儿，只算开头那 8 个的话，收尾会出现
       // 「已解 12 个 / 共 8 个」这种自相矛盾的文案。
-      _completed = !cancelled && failed < _batchTotal;
-      // 跑完的（无论成败）都算这份快照用掉了 —— 界面据此把主按钮换成
-      // 「换个文件夹」，而不是留着「开始智能解压」等着被再点一次（见
-      // [_batchRun]）。
       //
-      // **中止是例外**：用户在半路按了「停止这批」，队列里剩下的包一个都
-      // 没解。这时候还锁住快照，就等于把人困在「剩下的包解不了、也重跑不了」
-      // 的死角里。放开它，主按钮回到「开始智能解压」。
+      // **被停掉的那批也显示总结卡片**。原先中止是例外：`_completed` 为假，
+      // 界面上什么都不留，主按钮回到「开始智能解压」，看起来像什么都没发生过。
+      // 真机验收时用户点了出来 —— 半路停下的那批更需要那行字说清楚「已经解了
+      // 几个、还剩几个」，以及一颗明确的「换个文件夹」。
       //
-      // 代价要说清楚：重跑会把**已经解好的**再解一遍，输出目录重名时撒出
+      // 卡片**标题**由 [stopReason] 决定（见 `home_screen.dart` 的
+      // `_bannerTitle`），所以「停」这一档不会顶着「全部解压完成」那张绿卡片。
+      // 全线失败仍然不出卡片（`failed < _batchTotal` 为假），那条老行为没动。
+      _completed = cancelled || failed < _batchTotal;
+      // 跑完的（无论成败、也包括被停掉的）都算这份快照用掉了，主按钮一律换成
+      // 「换个文件夹」（见 [_batchRun]）。停掉之后想接着解剩下那几个，就重新
+      // 选一次目录 —— 那会重新扫描、拿到一份新快照。
+      //
+      // 代价说清楚：重新选目录会把**已经解好的**再解一遍，输出目录重名时撒出
       // `_1`/`_2` 的重复目录。真正的续传要等 journal（条目 3）。
-      _batchRun = !cancelled;
+      _batchRun = true;
       final elapsed = _batchStart == null
           ? Duration.zero
           : DateTime.now().difference(_batchStart!);
@@ -934,6 +987,7 @@ class AppState extends ChangeNotifier {
         done: _doneCount,
         failed: failed,
         skipped: skipped,
+        manualSkips: _manualSkips,
         elapsed: elapsed,
         cancelled: cancelled,
       );
@@ -1004,10 +1058,17 @@ class AppState extends ChangeNotifier {
     ));
   }
 
-  /// 收尾文案，保持既有形状：`N 个压缩包 · 耗时 Xs · F 个失败`。
+  /// 收尾文案：`N 个压缩包 · 耗时 Xs [· F 个失败] [· 手动跳过 N 个] [· N 个自动跳过]`。
   ///
-  /// [skipped] 只在非零时才出现，且单独成段 —— 它是「我们主动没解」，
-  /// 与失败不是一回事，混在失败里会让人以为程序坏了。
+  /// 被停掉的那批第一段换成 `已完成 N/M 个压缩包` —— 停下来的时候「还剩几个
+  /// 没动」本身就是用户最想知道的那个数，只说「共 3 个包」等于没说。
+  ///
+  /// [skipped] 是**总数**，[manualSkips] 是其中用户自己放掉的；两者之差就是
+  /// 我们拦下的（自引用、超出递归深度）。分开列而不是合并成「N 个已跳过」：
+  /// 用户按过「跳过」的包和程序不认识的包，对他来说完全是两件事。
+  ///
+  /// [done] 是**处理过的包数**（成 / 败 / 跳过都算），所以真正解开的个数是
+  /// 它减掉失败与跳过 —— 别拿 [done] 当「成功数」用。
   String _summarize({
     required int total,
     required int done,
@@ -1015,13 +1076,16 @@ class AppState extends ChangeNotifier {
     required Duration elapsed,
     required bool cancelled,
     int skipped = 0,
+    int manualSkips = 0,
   }) {
+    final autoSkips = skipped - manualSkips;
     final parts = <String>[
-      if (cancelled) '已中止：$done/$total 个压缩包'
+      if (cancelled) '已完成 ${done - failed - skipped}/$total 个压缩包'
       else '$total 个压缩包',
       '耗时 ${formatDuration(elapsed)}',
       if (failed > 0) '$failed 个失败',
-      if (skipped > 0) '$skipped 个已跳过',
+      if (manualSkips > 0) '手动跳过 $manualSkips 个',
+      if (autoSkips > 0) '$autoSkips 个自动跳过',
     ];
     return parts.join(' · ');
   }

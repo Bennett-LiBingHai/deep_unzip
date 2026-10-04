@@ -67,9 +67,9 @@ class HomeScreen extends StatelessWidget {
   /// 主按钮的文案。四态：扫描中 / 停止解压 / 这批已跑过 / 待启动。
   ///
   /// **没有「继续」这一态。** 界面上唯一会「停下来」的地方是错误弹窗，而那
-  /// 个弹窗自己带着「继续 / 停止」两颗按钮 —— 用户在那儿点「继续」就等于
-  /// 继续了，主按钮没有任何机会需要承担这个语义（见 `app_state.dart` 的
-  /// `stopExtract`）。所以解压中这颗唯一有意义的动作是**停下**。
+  /// 个弹窗自己带着「跳过 / 停止」两颗按钮 —— 用户在那儿点「跳过」就等于
+  /// 接着解下一个了，主按钮没有任何机会需要承担这个语义（见 `app_state.dart`
+  /// 的 `stopExtract`）。所以解压中这颗唯一有意义的动作是**停下**。
   ///
   /// 「这批已跑过」必须单独一态：那批扫描结果一旦解过，再点不会「重新解一遍」
   /// —— 输出目录重名会追加 `_1`/`_2`（见 `output_paths.dart`），等于往磁盘里
@@ -272,20 +272,35 @@ class HomeScreen extends StatelessWidget {
               ],
             ),
           ),
+          // 解压中不许换目录。**这是一个真洞**，真机验收时发现的：解压是
+          // `unawaited(_runExtractBatch())` 起的后台流程，跑起来之后谁也拦不住
+          // 它；这时候换目录会把 `_folderPath` 和两条扫描列表全清掉重建，而批次
+          // 还在按**旧**的队列往磁盘上写 —— 进度条、日志、总结卡片说的都是新目录
+          // 的事，实际解的是旧目录的包。想换就等这一批停下来（主按钮左上那颗）。
+          //
+          // 禁用而不是隐藏：按钮忽然消失会让布局跳动，而且用户会以为界面坏了。
+          // 灰掉 + 不响应，配着旁边那颗「停止解压」，路径是清楚的。
           GestureDetector(
-            onTap: () => state.selectFolder(),
+            onTap: state.extracting ? null : () => state.selectFolder(),
             child: Container(
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
               decoration: BoxDecoration(
-                color: AppTheme.neonCyan.withValues(alpha: 0.08),
+                color: AppTheme.neonCyan
+                    .withValues(alpha: state.extracting ? 0.03 : 0.08),
                 borderRadius: BorderRadius.circular(20),
                 border: Border.all(
-                  color: AppTheme.neonCyan.withValues(alpha: 0.3),
+                  color: AppTheme.neonCyan
+                      .withValues(alpha: state.extracting ? 0.1 : 0.3),
                 ),
               ),
-              child: const Text(
+              child: Text(
                 '更换',
-                style: TextStyle(fontSize: 12, color: AppTheme.neonCyan),
+                style: TextStyle(
+                  fontSize: 12,
+                  color: state.extracting
+                      ? AppTheme.textDim
+                      : AppTheme.neonCyan,
+                ),
               ),
             ),
           ),
@@ -714,18 +729,39 @@ class HomeScreen extends StatelessWidget {
     );
   }
 
+  /// 这一批收尾后的总结卡片。
+  ///
+  /// 三档标题，由 [AppState.stopReason] 决定 —— **被停掉的那两档绝不能显示
+  /// 「全部解压完成」**：剩下的包一个都没解，绿卡片上写「完成」是直接骗人。
+  /// 真机验收时用户要求停止后也落在这张卡片上（并且主按钮是「换个文件夹」），
+  /// 说法是「像格式弹窗一样，不管点哪个都能跳到总结页」。
+  String get _bannerTitle {
+    switch (state.stopReason) {
+      case null:
+        return '全部解压完成';
+      case StopSource.user:
+        return '已停止';
+      case StopSource.error:
+        return '解压出错，已停止';
+    }
+  }
+
   Widget _buildCompleteBanner(BuildContext context) {
+    // 停下来用暖色 + 停止图标：绿勾配「已停止」是个自相矛盾的画面。
+    final stopped = state.stopReason != null;
+    final accent = stopped ? AppTheme.neonOrange : AppTheme.neonGreen;
+
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
         gradient: LinearGradient(
           colors: [
-            AppTheme.neonGreen.withValues(alpha: 0.1),
+            accent.withValues(alpha: 0.1),
             AppTheme.neonCyan.withValues(alpha: 0.05),
           ],
         ),
         borderRadius: BorderRadius.circular(18),
-        border: Border.all(color: AppTheme.neonGreen.withValues(alpha: 0.25)),
+        border: Border.all(color: accent.withValues(alpha: 0.25)),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -736,12 +772,12 @@ class HomeScreen extends StatelessWidget {
                 width: 44,
                 height: 44,
                 decoration: BoxDecoration(
-                  color: AppTheme.neonGreen.withValues(alpha: 0.15),
+                  color: accent.withValues(alpha: 0.15),
                   borderRadius: BorderRadius.circular(12),
                 ),
-                child: const Icon(
-                  Icons.check_circle,
-                  color: AppTheme.neonGreen,
+                child: Icon(
+                  stopped ? Icons.stop_circle : Icons.check_circle,
+                  color: accent,
                   size: 24,
                 ),
               ),
@@ -750,12 +786,12 @@ class HomeScreen extends StatelessWidget {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const Text(
-                      '全部解压完成',
+                    Text(
+                      _bannerTitle,
                       style: TextStyle(
                         fontSize: 14,
                         fontWeight: FontWeight.w700,
-                        color: AppTheme.neonGreen,
+                        color: accent,
                       ),
                     ),
                     const SizedBox(height: 2),
@@ -782,24 +818,23 @@ class HomeScreen extends StatelessWidget {
                 width: double.infinity,
                 padding: const EdgeInsets.symmetric(vertical: 12),
                 decoration: BoxDecoration(
-                  color: AppTheme.neonGreen.withValues(alpha: 0.1),
+                  color: accent.withValues(alpha: 0.1),
                   borderRadius: BorderRadius.circular(12),
-                  border: Border.all(
-                    color: AppTheme.neonGreen.withValues(alpha: 0.3),
-                  ),
+                  border: Border.all(color: accent.withValues(alpha: 0.3)),
                 ),
-                child: const Row(
+                // 停下来那两档这条也要留着：已经解好的那部分是真的解好了，
+                // 半路停下的人最想干的事就是去看看到底解出来了什么。
+                child: Row(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
-                    Icon(Icons.folder_open,
-                        size: 16, color: AppTheme.neonGreen),
-                    SizedBox(width: 8),
+                    Icon(Icons.folder_open, size: 16, color: accent),
+                    const SizedBox(width: 8),
                     Text(
                       '打开输出目录',
                       style: TextStyle(
                         fontSize: 13,
                         fontWeight: FontWeight.w700,
-                        color: AppTheme.neonGreen,
+                        color: accent,
                       ),
                     ),
                   ],

@@ -629,10 +629,16 @@ void main() {
 
       expect(engine.rounds, 1, reason: '剩下两个包不该再开工 —— 停止没有「继续」');
       expect(state.extracting, isFalse);
-      expect(state.completed, isFalse, reason: '中止不是完成');
-      // 中止**不消费**这份快照：主按钮要能回到「开始智能解压」。锁住的话用户
-      // 就被困在「剩下的包解不了、也重跑不了」的死角里（见 finally 里那段）。
-      expect(state.batchRun, isFalse);
+      // 停在半路也要出总结卡片，而且标题必须说「停了」而不是「完成了」
+      // （见 `home_screen.dart` 的 `_bannerTitle`）。那句「完成」是假话：三个
+      // 包只解了一个。
+      expect(state.completed, isTrue);
+      expect(state.stopReason, StopSource.user);
+      expect(state.completeDetail, contains('已完成 1/3 个压缩包'));
+      // 停止**也消费**这份快照：主按钮换成「换个文件夹」。真机验收时用户要求的
+      // —— 从前的做法是放开闸门、回到「开始智能解压」，可那看起来像什么都没
+      // 发生过，用户会以为点下去能接着解剩下两个。
+      expect(state.batchRun, isTrue);
     });
 
     t('解压中再点开始不重复起任务', () async {
@@ -1004,7 +1010,10 @@ void main() {
       // 被处理了（处理方式就是「判断出不值得解」），它和「超深被拦在门外」
       // 那条用例的差别正在这里 —— 那个压根没进列表，所以分母只有 1。
       expect(state.completeDetail, contains('2 个压缩包'));
-      expect(state.completeDetail, contains('1 个已跳过'));
+      // 「自动」那半句是钉「这不是用户干的」：自引用是**我们**判出来的，
+      // 用户没在弹窗上按过任何东西。写进「手动跳过」会凭空多出一个他做过的决定。
+      expect(state.completeDetail, contains('1 个自动跳过'));
+      expect(state.completeDetail, isNot(contains('手动跳过')));
       expect(state.completeDetail, isNot(contains('失败')));
     });
 
@@ -1110,7 +1119,7 @@ void main() {
 
     setUp(asked.clear);
 
-    /// 只拦第一个包，第二个照常成功 —— 这样「继续」与「停下」的差别才看得出来。
+    /// 只拦第一个包，第二个照常成功 —— 这样「跳过」与「停止」的差别才看得出来。
     FakeEngine gatedEngine() => FakeEngine()
       ..behavior = (e, outDir) async {
         if (e.rounds == 1) {
@@ -1166,7 +1175,7 @@ void main() {
       expect(state.batchRun, isTrue, reason: '跑完的批次照常消费快照');
     });
 
-    t('停下这批 → 剩余任务一个都不跑，且不消费批次闸门', () async {
+    t('停下来 → 剩余任务一个都不跑，且落在总结页上', () async {
       final engine = gatedEngine();
       final state = AppState(
         engine: engine,
@@ -1180,10 +1189,11 @@ void main() {
 
       expect(engine.rounds, 1, reason: '停了就不该接着解 b.zip');
       expect(state.extracting, isFalse);
-      expect(state.completed, isFalse);
-      expect(state.batchRun, isFalse,
-          reason: '剩下的包还等着解，主按钮必须能再点（收尾注释里那条代价）');
-      expect(state.completeDetail, contains('已中止'));
+      // 停止也要出总结卡片，且 `stopReason` 表明是**哪一档**停的 ——
+      // 弹窗那档总是伴随一次解压失败，标题要写「解压出错」而不是「手动停止」。
+      expect(state.completed, isTrue);
+      expect(state.stopReason, StopSource.error);
+      expect(state.completeDetail, contains('已完成 0/2 个压缩包'));
     });
 
     t('弹窗没弹成（决断为 null）→ 按没问处理，整批继续', () async {
@@ -1309,10 +1319,11 @@ void main() {
     // 默认值定义和那行 UI，没有任何地方读过它。
     //
     // 这一档与「被闸门拦下」共用同一个回调、同一个弹窗（见 `prompts.dart`
-    // 的表）：两边的两个决断含义完全一样，都是「继续 / 停止」。开关只决定
-    // **问不问**，不改变弹窗长什么样。
+    // 的表）：两边的两个决断含义完全一样，都是「跳过 / 停止」—— 右边那颗叫
+    // 过「继续」，真机验收时用户要求改成「跳过」（它的作用是**放掉这个包**，
+    // 不是「再试一次这个包」）。开关只决定**问不问**，不改变弹窗长什么样。
 
-    /// 只让第一个包炸，第二个照常成 —— 这样「继续」与「停止」才分得开。
+    /// 只让第一个包炸，第二个照常成 —— 这样「跳过」与「停止」才分得开。
     FakeEngine brokenFirst() => FakeEngine()
       ..behavior = (e, outDir) async {
         if (e.rounds == 1) {
@@ -1336,7 +1347,7 @@ void main() {
       return seen;
     }
 
-    t('开着 errorPause → 出错时问，选「继续」→ 整批继续', () async {
+    t('开着 errorPause → 出错时问，选「跳过」→ 整批接着跑', () async {
       final engine = brokenFirst();
       final asked = <String>[];
       final state = AppState(
@@ -1356,11 +1367,11 @@ void main() {
       expect(asked.single, startsWith('a.zip|'));
       expect(asked.single, contains('这个包坏了'),
           reason: '弹窗正文要用引擎给的那句话，不是我们另编一句');
-      expect(engine.rounds, 2, reason: '继续 ≠ 停批');
+      expect(engine.rounds, 2, reason: '跳过 ≠ 停批');
       expect(state.batchRun, isTrue, reason: '跑完的批次照常消费快照');
     });
 
-    t('选「停止」→ 剩下的包一个都不跑，且不消费快照', () async {
+    t('选「停止」→ 剩下的包一个都不跑，落在总结页上', () async {
       final engine = brokenFirst();
       final state = AppState(
         engine: engine,
@@ -1377,9 +1388,36 @@ void main() {
       // 的包直接丢掉。
       expect(engine.rounds, 1, reason: '停了就不该接着解 b.zip');
       expect(state.extracting, isFalse);
-      expect(state.completed, isFalse);
-      expect(state.batchRun, isFalse, reason: '不消费快照，主按钮必须能再点');
-      expect(state.completeDetail, contains('已中止'));
+      // 停在半路也要出总结卡片（真机验收时用户要求的），`stopReason` 指明
+      // 是弹窗那一档 —— 卡片标题据此写「解压出错，已停止」而不是「已停止」。
+      expect(state.completed, isTrue);
+      expect(state.stopReason, StopSource.error);
+      // 炸掉的那个算失败、不算「完成」，所以是 0/2。
+      expect(state.completeDetail, contains('已完成 0/2 个压缩包'));
+      expect(state.completeDetail, contains('1 个失败'));
+      expect(state.batchRun, isTrue, reason: '停止也消费快照，主按钮换成「换个文件夹」');
+    });
+
+    t('选「跳过」→ 记一条**手动跳过**，不算失败，整批接着跑', () async {
+      // 用户明确表过态的东西不该在总结里再算成「程序坏了」—— 那是我们照他的
+      // 决定办事。「手动跳过 N 个」与「N 个失败」是两回事，卡片要分开说。
+      final engine = brokenFirst();
+      final state = AppState(
+        engine: engine,
+        prompt: (name, reason) async => ArchiveDecision.skip,
+      );
+      addTearDown(state.dispose);
+
+      await state.selectFolderPath(twoPacks('as_err_skip2').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(engine.rounds, 2, reason: '跳过 ≠ 停批');
+      expect(state.completeDetail, contains('2 个压缩包'));
+      expect(state.completeDetail, contains('手动跳过 1 个'));
+      expect(state.completeDetail, isNot(contains('失败')));
+      expect(state.completeDetail, isNot(contains('自动跳过')));
+      expect(state.stopReason, isNull, reason: '跑完了就不该有「停下来」这回事');
     });
 
     t('关掉 errorPause → 不问了，照旧记一条失败接着跑', () async {
@@ -1425,7 +1463,7 @@ void main() {
 
     t('弹窗没弹成（决断为 null）→ 补一条 toast，也不该少解一个包', () async {
       // DialogBridge 拿不到 BuildContext 时就是这么返回的。用户什么都没看见，
-      // 那不是他的决定 —— 当成「停止」会凭空停住整批，当成「继续」倒还好，
+      // 那不是他的决定 —— 当成「停止」会凭空停住整批，当成「跳过」倒还好，
       // 但两者都不该由我们替他选，所以只补一条 toast。
       final engine = brokenFirst();
       final state = AppState(

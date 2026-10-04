@@ -3,7 +3,7 @@ import '../../theme/app_theme.dart';
 import 'bottom_modal.dart';
 import 'modal_button.dart';
 
-/// 解压问题弹窗 —— 继续 / 停止
+/// 解压问题弹窗 —— 跳过 / 停止
 ///
 /// 左边那颗是**不可恢复**的停止：停掉这一批，队列里剩下的包全丢（真要续传得
 /// 等 journal）。右边那颗是「这个包不要了，接着解下一个」。
@@ -11,26 +11,28 @@ import 'modal_button.dart';
 /// 两种场景复用同一个形状：炸弹/空间闸门拦下，和解压途中出错 —— 两边的两个
 /// 决断含义完全一样（见 `prompts.dart` 的表），所以文案也一样。
 ///
-/// 回调名从 `onPause`/`onSkip` 改成了 [onStop]/[onContinue]：在这两档里本来
-/// 就没有「暂停」这回事，旧名字会让人以为左边那颗停得回来 —— 那正是这次要
-/// 消掉的误会。文案仍走参数（默认就是「停止 / 继续」），由 `dialog_bridge`
-/// 这边统一给，改一处即可。
+/// 回调名一路从 `onPause`/`onSkip` 改到 [onStop]/[onSkip]，是跟着**语义**
+/// 走的：先是「暂停」没了（那颗停得回来是错觉），剩下的那颗就从「继续」
+/// 改叫「跳过」—— 它从来不是「继续解这个包」，而是**放掉这个包**。叫「继续」
+/// 会让人以为再试一次说不定就好了，真机上验收时用户就是这么反馈的。
+///
+/// 文案仍走参数（默认就是「跳过 / 停止」），由 `dialog_bridge` 那边统一给。
 class ErrorModal extends StatelessWidget {
   final String fileName;
   final String reason;
   final VoidCallback onStop;
-  final VoidCallback onContinue;
+  final VoidCallback onSkip;
   final String stopLabel;
-  final String continueLabel;
+  final String skipLabel;
 
   const ErrorModal({
     super.key,
     required this.fileName,
     required this.reason,
     required this.onStop,
-    required this.onContinue,
+    required this.onSkip,
     this.stopLabel = '停止',
-    this.continueLabel = '继续',
+    this.skipLabel = '跳过',
   });
 
   static Future<void> show({
@@ -38,9 +40,9 @@ class ErrorModal extends StatelessWidget {
     required String fileName,
     required String reason,
     required VoidCallback onStop,
-    required VoidCallback onContinue,
+    required VoidCallback onSkip,
     String stopLabel = '停止',
-    String continueLabel = '继续',
+    String skipLabel = '跳过',
   }) {
     return showBottomModal(
       context: context,
@@ -48,9 +50,9 @@ class ErrorModal extends StatelessWidget {
         fileName: fileName,
         reason: reason,
         onStop: onStop,
-        onContinue: onContinue,
+        onSkip: onSkip,
         stopLabel: stopLabel,
-        continueLabel: continueLabel,
+        skipLabel: skipLabel,
       ),
     );
   }
@@ -121,11 +123,11 @@ class ErrorModal extends StatelessWidget {
               const SizedBox(width: 10),
               Expanded(
                 child: ModalButton(
-                  label: continueLabel,
+                  label: skipLabel,
                   gradient: AppTheme.primaryGradient,
                   onTap: () {
                     Navigator.pop(context);
-                    onContinue();
+                    onSkip();
                   },
                 ),
               ),

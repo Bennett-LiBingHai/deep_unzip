@@ -267,9 +267,56 @@ void main() {
 
       expect(state.extracting, isFalse);
       expect(engine.rounds, 1, reason: '停止之后 b.zip 一个字节都不该动');
-      expect(state.batchRun, isFalse,
-          reason: '中止的批次不算「这批用掉了」，主按钮得能再点');
-      expect(label(), '开始智能解压');
+
+      // 停在半路也要落在**总结页**上（真机验收时用户要求的）：卡片标题写
+      // 「已停止」，主按钮换成「换个文件夹」。从前这里退回「开始智能解压」，
+      // 看起来像什么都没发生过 —— 用户会以为点下去能接着解剩下那个，
+      // 而实际是把已经解好的重解一遍、撒出 `_1` 目录。
+      expect(find.text('已停止'), findsOneWidget);
+      expect(find.text('全部解压完成'), findsNothing,
+          reason: '只解了一个包却写「全部完成」是假话');
+      expect(find.textContaining('已完成 1/2 个压缩包'), findsOneWidget);
+      expect(label(), '换个文件夹');
+
+      await drainTimers(tester);
+    });
+
+    testWidgets('解压中「更换」按不动，跑完才解禁', (tester) async {
+      // 解压是 `unawaited(_runExtractBatch())` 起的后台流程，跑起来之后谁也拦
+      // 不住；这时候换目录会把 `_folderPath` 和扫描列表全清掉重建，而批次还在
+      // 按**旧**队列往磁盘上写。真机验收时发现「解压的时候可以点更换」。
+      final blocked = Completer<void>();
+      engine.behavior = (_, outDir) => blocked.future;
+
+      await pumpHome(tester, state);
+      await tester.tap(find.byType(PrimaryButton));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('确认解压'));
+      await pumpFrames(tester);
+
+      // 前提：此刻「更换」还在屏幕上，只是不响应 —— 藏起来会让布局跳动。
+      expect(find.text('更换'), findsOneWidget);
+      final before = state.folderPath;
+      await tester.tap(find.text('更换'));
+      await pumpFrames(tester, 2);
+      expect(state.folderPath, before, reason: '解压中换目录会把批次和界面对不上');
+      expect(state.extracting, isTrue, reason: '更不该顺手把批次停掉');
+
+      blocked.complete();
+      await pumpFrames(tester);
+      await drainTimers(tester); // 先让收尾那条 toast 过期，免得下面认错人
+
+      // 跑完之后它得真的活过来 —— 检查一遍「只会禁用、忘了解禁」那种写法。
+      //
+      // 这里看的是 toast 而不是「弹出了目录选择器」：选目录走 `FilePicker` 的
+      // 平台通道，`flutter test` 里没有实现，`getDirectoryPath` 必抛。所以
+      // 「按下去真的进了 `_pickFolderAndScan`」的可观察后果，就是那条
+      // 「打开目录选择器失败：…」—— 恰好证明这一下没被禁用挡回去。
+      expect(state.toastMsg, isNull, reason: '前提：上一条 toast 已经过期');
+      await tester.tap(find.text('更换'));
+      await pumpFrames(tester, 2);
+      expect(state.toastMsg, contains('目录选择器'),
+          reason: '跑完之后「更换」要能按 —— 禁用只说了一半，还得会解禁');
 
       await drainTimers(tester);
     });

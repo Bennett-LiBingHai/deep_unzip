@@ -54,27 +54,33 @@ void main() {
       expect(await future, ArchiveDecision.stop);
     });
 
-    testWidgets('点「继续」→ skip', (tester) async {
+    testWidgets('点「跳过」→ skip', (tester) async {
       await mount(tester);
       final future = await askAndSettle(tester);
 
-      await tester.tap(find.text('继续'));
+      await tester.tap(find.text('跳过'));
       await tester.pumpAndSettle();
 
       expect(await future, ArchiveDecision.skip,
-          reason: '继续 = 这个包不要了、接着解下一个，不是「留着这个包等下再试」');
+          reason: '跳过 = 这个包不要了、接着解下一个，不是「留着这个包等下再试」');
     });
 
-    testWidgets('两颗按钮的字：左边「停止」、右边「继续」，且没有「暂停」', (tester) async {
+    testWidgets('两颗按钮的字：左边「停止」、右边「跳过」，且没有「暂停」/「继续」',
+        (tester) async {
       await mount(tester);
       await askAndSettle(tester);
 
       expect(find.text('停止'), findsOneWidget);
-      expect(find.text('继续'), findsOneWidget);
-      // 这一条钉的是这次改动的**目的**：界面上不该再出现「暂停」。左边的
-      // 那颗停下去队列就没了，叫「暂停任务」会让人以为自己还能回来 ——
-      // 那正是用户要求消掉的误会。
+      expect(find.text('跳过'), findsOneWidget);
+      // 这一条钉的是两次改动合起来的**目的**，真机验收时各被用户点过一次：
+      //
+      // - 不该再出现「暂停」：左边那颗停下去队列就没了，叫「暂停任务」会让
+      //   人以为自己还能回来。
+      // - 右边那颗也不该叫「继续」：它做的事是**放弃这个包**，而「继续」读起来
+      //   像「再试一次说不定就好了」。用户的原话是「把继续改成跳过好像更符合
+      //   语义」。
       expect(find.text('暂停任务'), findsNothing);
+      expect(find.text('继续'), findsNothing);
       expect(find.text('继续解压'), findsNothing);
     });
 
@@ -87,7 +93,7 @@ void main() {
       expect(find.text('broken.zip'), findsNothing, reason: '文件名是参数，这里是 a.zip');
       expect(find.text(errorReason), findsOneWidget);
 
-      await tester.tap(find.text('继续'));
+      await tester.tap(find.text('跳过'));
       await tester.pumpAndSettle();
       expect(await future, ArchiveDecision.skip);
     });
