@@ -1091,12 +1091,6 @@ void main() {
     });
   });
 
-  /// 「这批用掉了」这道闸门。
-  ///
-  /// 它和 [AppState.completed] 是两件事：`completed` 说的是「全部成功」，
-  /// 有任何一个包失败它就是 false。而重跑的危害与成败无关 —— 输出目录重名会
-  /// 追加 `_1`/`_2`（见 output_paths.dart），再点一次不是「重新解一遍」而是
-  /// 往磁盘里撒重复目录。所以闸门必须挂在「跑过」而不是「成功」上。
   group('被拦弹窗与剩余空间', () {
     // 这一组盯的是「闸门之后」那条新加的链：EngineException.breach → 问用户
     // → 用户的决断怎么影响整批。闸门本身住在 native_backend 里（假引擎整个
@@ -1706,6 +1700,12 @@ void main() {
     });
   });
 
+  /// 「这批用掉了」这道闸门。
+  ///
+  /// 它和 [BatchOutcome.clean] 是两件事：`clean` 说的是「一个没失败」，有任何
+  /// 一个包失败它就不成立。而重跑的危害与成败无关 —— 输出目录重名会追加
+  /// `_1`/`_2`（见 output_paths.dart），再点一次不是「重新解一遍」而是往磁盘里
+  /// 撒重复目录。所以闸门必须挂在「跑过」（`batchRun`）而不是「成功」上。
   group('批次用尽（batchRun）', () {
     t('跑完一批 → batchRun 为真、completed 为真', () async {
       final root = tempRoot('as_batchrun_ok');
