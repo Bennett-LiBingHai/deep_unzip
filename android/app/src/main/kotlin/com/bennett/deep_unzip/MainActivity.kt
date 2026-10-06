@@ -1,4 +1,4 @@
-package com.example.deep_unzip
+package com.bennett.deep_unzip
 
 import android.content.ActivityNotFoundException
 import android.content.ComponentName
@@ -67,7 +67,7 @@ class MainActivity : FlutterActivity() {
 
     private companion object {
         /** 方法通道名。**必须与 `file_manager_bridge.dart` 里的逐字一致。** */
-        const val CHANNEL = "com.example.deep_unzip/native"
+        const val CHANNEL = "com.bennett.deep_unzip/native"
 
         /** 系统 ExternalStorageProvider 的 authority。 */
         const val EXTERNAL_STORAGE_AUTHORITY = "com.android.externalstorage.documents"

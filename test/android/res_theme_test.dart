@@ -142,7 +142,7 @@ void main() {
     test('通知小图标是专用的那一张，不是 launcher', () {
       // 拿 `ic_launcher` 当小图标出来的是**一个白方块**：小图标只取 alpha，
       // 而自适应图标的 `<background>` 是铺满的、只有前景会被蒙版裁。
-      final kt = read('android/app/src/main/kotlin/com/example/deep_unzip/'
+      final kt = read('android/app/src/main/kotlin/com/bennett/deep_unzip/'
           'ExtractKeepAliveService.kt');
       expect(kt, contains('val SMALL_ICON_RES = R.drawable.ic_notification'),
           reason: '换了小图标就会变白方块，见那边的注释');

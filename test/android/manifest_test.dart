@@ -35,6 +35,27 @@ void main() {
         reason: '声明了类型却漏了对应权限，同样是启动即抛');
   });
 
+  test('平台通道名两端逐字一致', () {
+    // 这条通道是**三件事共用**的：前台服务保活、剩余空间探测、「打开输出目录」。
+    // 两端写的是各自语言里的字符串常量，没有任何地方保证它们相等 —— 改包名 /
+    // 顺手改名时只改一边，三个功能会**一起静默失效**：保活不起、空间退化成
+    // 「未知」、打开目录退回 generic 那一档。都只影响可用性，不报错。
+    const ktPath = 'android/app/src/main/kotlin/com/bennett/deep_unzip/'
+        'MainActivity.kt';
+    final kt = File(ktPath).readAsStringSync()
+        .replaceAll(RegExp(r'//.*$', multiLine: true), '');
+    final m = RegExp(r'const val CHANNEL = "([^"]+)"').firstMatch(kt);
+    expect(m, isNotNull, reason: '$ktPath 里没找到 CHANNEL');
+
+    final dart = File('lib/services/file_manager_bridge.dart').readAsStringSync();
+    final d = RegExp(r"kFileManagerChannel = '([^']+)'").firstMatch(dart);
+    expect(d, isNotNull, reason: 'file_manager_bridge.dart 里没找到 kFileManagerChannel');
+
+    expect(d!.group(1), m!.group(1),
+        reason: 'Kotlin 是 "${m.group(1)}"，Dart 是 "${d.group(1)}" —— '
+            '对不上的话保活 / 空间探测 / 打开输出目录会一起失效，而且不报错');
+  });
+
   test('源码清单里没有 INTERNET', () {
     // 「不联网、不收集个人信息」是可核查的那句声明，也是「单机应用免备案」
     // 那条判断的依据。

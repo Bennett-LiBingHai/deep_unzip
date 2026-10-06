@@ -19,7 +19,7 @@ import '../support/fake_engine.dart';
 
 /// 给 [FileManagerBridge] 注入用的私有通道名。
 ///
-/// 用独立的名字而不是生产那个 `com.example.deep_unzip/native`：生产名一旦被
+/// 用独立的名字而不是生产那个 `com.bennett.deep_unzip/native`：生产名一旦被
 /// 哪个测试钉上 mock 处理器却又忘了摘，会影响同文件里别的用例，而且看名字
 /// 分不清这是真通道还是假的。
 const MethodChannel _bridgeChannel = MethodChannel('deep_unzip_test/bridge');

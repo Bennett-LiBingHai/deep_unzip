@@ -35,7 +35,7 @@ import 'dart:io';
 import 'package:flutter/services.dart';
 
 /// 原生方法通道名。**必须与 `MainActivity.kt` 里注册的逐字一致。**
-const String kFileManagerChannel = 'com.example.deep_unzip/native';
+const String kFileManagerChannel = 'com.bennett.deep_unzip/native';
 
 /// 打开目录的结果。
 enum OpenFolderResult {

@@ -22,7 +22,7 @@ val releaseStoreFile = keystoreProperties.getProperty("storeFile")
 val hasReleaseKey = !releaseStoreFile.isNullOrBlank()
 
 android {
-    namespace = "com.example.deep_unzip"
+    namespace = "com.bennett.deep_unzip"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
@@ -32,8 +32,16 @@ android {
     }
 
     defaultConfig {
-        // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
-        applicationId = "com.example.deep_unzip"
+        // 应用的**身份**：设备上、应用商店里认的都是它，跟代码结构无关。
+        //
+        // **上架之后终身不可改** —— 改了在商店和用户手机里就是另一个应用（原有
+        // 安装不会被覆盖，评分和用户也带不过去）。所以动它之前先想清楚。
+        //
+        // 旁边那个 `namespace` 可以跟它不同，但**不能随便改**：manifest 里写的是
+        // 相对类名（`.MainActivity`），AGP 拿 `namespace` 去解析，而 Kotlin 文件
+        // 的目录与 `package` 声明必须跟它一致。三者对不上时**编译能过、装上去
+        // 一点就崩**（`ClassNotFoundException`），不是编译错误。
+        applicationId = "com.bennett.deep_unzip"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = flutter.minSdkVersion
