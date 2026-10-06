@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 桌面图标下面那个名字（也是系统任务列表里显示的名字）。
+         写成资源而不是直接在 manifest 里写死，是因为这一处容易被漏改：
+         它必须与「应用商店里的名字」「软著登记的名字」完全一致，而改名时
+         大家通常会去翻 manifest、忘了 Dart 侧还有一份（`lib/app_info.dart`
+         的 `kAppName`，首页标题与「关于」页都用它）。
+
+         注意 manifest 里**不能**写成 `DeepUnzip` 那样的字面量之外再加引号，
+         但也不能留 snake_case 的工程名 —— `deep_unzip` 是包名，不是给人看的。 -->
+    <string name="app_name">DeepUnzip</string>
+</resources>

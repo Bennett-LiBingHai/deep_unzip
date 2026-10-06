@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../app_info.dart';
 import '../engine/format.dart';
 import '../theme/app_theme.dart';
 import '../providers/app_state.dart';
@@ -9,6 +10,7 @@ import '../widgets/glass_card.dart';
 import '../widgets/custom_button.dart';
 import '../widgets/modals/confirm_extract_modal.dart';
 import '../widgets/modals/path_fallback_modal.dart';
+import 'file_browser_screen.dart';
 
 /// 首页 —— 解压中心
 class HomeScreen extends StatelessWidget {
@@ -17,8 +19,21 @@ class HomeScreen extends StatelessWidget {
   /// 打开输出目录要过原生通道。[bridge] 只给测试注入用。
   final FileManagerBridge _bridge;
 
-  HomeScreen({super.key, required this.state, FileManagerBridge? bridge})
-      : _bridge = bridge ?? FileManagerBridge();
+  /// 文件浏览器的可用卷根。**只给测试注入用**（与 [bridge] 同一个规矩）：
+  /// 真机上由浏览器自己去 `/storage` 发现；测试在宿主机上跑，那里没有
+  /// `/storage`，浏览器会退到 `/` 去列宿主机真正的根目录 —— 既不确定也慢。
+  /// 注一个临时目录进去，用例就落在可控的目录树上。
+  // 这个名字**不带下划线**是有意的：Dart 不允许私有具名参数，而
+  // `prefer_initializing_formals` 只比对「去掉下划线后是否同名」—— 叫
+  // `_browserRoots` 会换来一条改不掉的假警告（与 `AppState` 里那几处同因）。
+  final List<String>? browserRoots;
+
+  HomeScreen({
+    super.key,
+    required this.state,
+    FileManagerBridge? bridge,
+    this.browserRoots,
+  }) : _bridge = bridge ?? FileManagerBridge();
 
   @override
   Widget build(BuildContext context) {
@@ -77,12 +92,15 @@ class HomeScreen extends StatelessWidget {
   ///
   /// 「这批已跑过」必须单独一态：那批扫描结果一旦解过，再点不会「重新解一遍」
   /// —— 输出目录重名会追加 `_1`/`_2`（见 `output_paths.dart`），等于往磁盘里
-  /// 撒重复目录。所以按钮改成「换个文件夹」，让它去干真正有用的事。
+  /// 撒重复目录。所以按钮改成「更换目标」，让它去干真正有用的事。
+  ///
+  /// **写「目标」不写「文件夹」**：目标是文件还是文件夹由用户在浏览器里点的是
+  /// 什么决定（见 [_pickTarget]），写成「更换文件夹」对选了文件的人就是句假话。
   String get _primaryLabel {
-    if (state.scanning) return '正在扫描...';
+    if (state.scanning) return '正在扫描…';
     if (state.extracting) return '停止解压';
-    if (state.batchRun) return '换个文件夹';
-    return '开始智能解压';
+    if (state.batchRun) return '更换目标';
+    return '开始解压';
   }
 
   IconData get _primaryIcon {
@@ -93,10 +111,9 @@ class HomeScreen extends StatelessWidget {
     return Icons.play_arrow;
   }
 
-
   /// 扫描中不能重复触发（解压中那颗是「停止」，恰恰必须可点）。
   ///
-  /// 「换个文件夹」永远可点 —— 它是脱困路径，禁用它等于把用户困在一批
+  /// 「更换目标」永远可点 —— 它是脱困路径，禁用它等于把用户困在一批
   /// 已经跑过的结果里。
   bool get _primaryDisabled {
     if (state.scanning) return true;
@@ -111,87 +128,94 @@ class HomeScreen extends StatelessWidget {
       children: [
         Row(
           children: [
-            Container(
+            // 应用标记。**不放渐变底、也不加辉光**：图形自己就带着三张叠起来的
+            // 卡片、底色和阴影，再垫一层 cyan→purple 的圆角块会让两套颜色打架。
+            //
+            // 资源是 `assets/logo.png`，从桌面图标那份原稿导出的 —— Android 侧
+            // `res/` 下的图标 Flutter 读不到，所以另有这一份（见 pubspec 里的
+            // 说明：改了一边要记得重导另一边）。
+            //
+            // `excludeFromSemantics`：它是装饰，右边紧跟着就是应用名，留着会被
+            // 读屏软件多念一遍。
+            Image.asset(
+              'assets/logo.png',
               width: 44,
               height: 44,
-              decoration: BoxDecoration(
-                gradient: AppTheme.primaryGradient,
-                borderRadius: BorderRadius.circular(12),
-                boxShadow: AppTheme.neonGlow(AppTheme.neonCyan),
-              ),
-              child: const Icon(Icons.layers, color: AppTheme.bgDeep, size: 24),
+              filterQuality: FilterQuality.medium,
+              excludeFromSemantics: true,
             ),
             const SizedBox(width: 12),
-            Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                ShaderMask(
-                  shaderCallback: (bounds) =>
-                      AppTheme.primaryGradient.createShader(bounds),
-                  child: const Text(
-                    'DeepUnzip',
-                    style: TextStyle(
-                      fontSize: 20,
-                      fontWeight: FontWeight.w700,
-                      color: Colors.white,
-                    ),
-                  ),
+            ShaderMask(
+              shaderCallback: (bounds) =>
+                  AppTheme.primaryGradient.createShader(bounds),
+              child: const Text(
+                kAppName,
+                style: TextStyle(
+                  fontSize: 22,
+                  fontWeight: FontWeight.w700,
+                  color: Colors.white,
                 ),
-                const Text(
-                  'INTELLIGENT EXTRACTION ENGINE v2.4',
-                  style: TextStyle(
-                    fontSize: 11,
-                    color: AppTheme.textDim,
-                    fontFamily: 'monospace',
-                    letterSpacing: 1,
-                  ),
-                ),
-              ],
+              ),
             ),
           ],
         ),
         const SizedBox(height: 14),
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-          decoration: BoxDecoration(
-            color: AppTheme.neonGreen.withValues(alpha: 0.08),
-            borderRadius: BorderRadius.circular(12),
-            border: Border.all(
-              color: AppTheme.neonGreen.withValues(alpha: 0.2),
-            ),
-          ),
-          child: Row(
-            children: [
-              Container(
-                width: 6,
-                height: 6,
-                decoration: const BoxDecoration(
-                  shape: BoxShape.circle,
-                  color: AppTheme.neonGreen,
-                  boxShadow: [
-                    BoxShadow(color: AppTheme.neonGreen, blurRadius: 8),
-                  ],
-                ),
-              ),
-              const SizedBox(width: 8),
-              const Text(
-                '解压引擎就绪 · 支持 12 种格式 · 递归深度 ∞',
-                style: TextStyle(
-                  fontSize: 12,
-                  fontFamily: 'monospace',
-                  color: AppTheme.neonGreen,
-                ),
-              ),
-            ],
-          ),
-        ),
       ],
     );
   }
 
+  // ---------------------------------------------------------------------------
+  // 选路径：三个动作共用一条流程
+  // ---------------------------------------------------------------------------
+
+  /// **先拿权限，再开浏览器，最后把路径交给 state。**
+  ///
+  /// 顺序不能反：自建的文件浏览器是个普通页面，自己申请不了权限 —— 没权限时
+  /// 它列出来的每个目录都会是「读不了」，用户会以为浏览器坏了。取消（返回
+  /// `null`）则什么都不做。
+  Future<Picked?> _browse(BuildContext context, FileBrowserMode mode) async {
+    if (!await state.ensureStoragePermission()) {
+      state.showToast('需要「所有文件访问权限」才能浏览文件', type: 'warn');
+      return null;
+    }
+    // 权限是个 await，中间用户可能已经离开这个页面（分析器的
+    // `use_build_context_synchronously` 也会拦这道）。
+    if (!context.mounted) return null;
+    return FileBrowserScreen.show(
+      context,
+      mode: mode,
+      roots: browserRoots,
+      startPath: _startDirFor(mode),
+    );
+  }
+
+  /// 从哪儿开始浏览：接着用户当前待的地方，而不是每次都回到卷根。
+  String? _startDirFor(FileBrowserMode mode) {
+    if (mode == FileBrowserMode.pickOutputRoot && state.outputRoot.isNotEmpty) {
+      return state.outputRoot;
+    }
+    return state.folderPath.isEmpty ? null : state.folderPath;
+  }
+
+  /// 选解压目标 —— 一个入口，两种结果，**由用户点的是什么决定**。
+  ///
+  /// 点文件行 → 只解那一个（同目录里没被选的不算，见 `AppState.selectFilePath`）；
+  /// 按「选择此文件夹」 → 递归扫这个目录（`AppState.selectFolderPath`）。
+  /// 浏览器已经把「点的是文件还是文件夹」判断好了（见 `Picked`），这一层不用再
+  /// 拿路径去反推。
+  Future<void> _pickTarget(BuildContext context) async {
+    final picked = await _browse(context, FileBrowserMode.pickTarget);
+    if (picked == null) return;
+    if (picked.isDirectory) {
+      await state.selectFolderPath(picked.path);
+    } else {
+      await state.selectFilePath(picked.path);
+    }
+  }
+
   Widget _buildFolderPicker(BuildContext context) {
     return GlassCard(
-      onTap: () => state.selectFolder(),
+      onTap: () => _pickTarget(context),
       padding: const EdgeInsets.symmetric(vertical: 20),
       radius: 18,
       child: Column(
@@ -214,7 +238,7 @@ class HomeScreen extends StatelessWidget {
             ),
           ),
           const Text(
-            '选择目标文件夹',
+            '选择目标文件 / 文件夹',
             style: TextStyle(
               fontSize: 15,
               fontWeight: FontWeight.w600,
@@ -223,14 +247,51 @@ class HomeScreen extends StatelessWidget {
           ),
           const SizedBox(height: 4),
           const Text(
-            '递归扫描所有压缩包 · 自动识别嵌套结构',
+            '选文件夹递归扫描 · 选单个文件只解它\n自动识别加密 · 分卷 · 伪后缀',
+            textAlign: TextAlign.center,
             style: TextStyle(
               fontSize: 12,
+              height: 1.6,
               color: AppTheme.textDim,
               fontFamily: 'monospace',
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  /// 已选卡片上那颗「更换」。
+  Widget _replaceButton({
+    required IconData icon,
+    required String label,
+    required VoidCallback onTap,
+  }) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        decoration: BoxDecoration(
+          color: AppTheme.neonCyan.withValues(alpha: 0.08),
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(color: AppTheme.neonCyan.withValues(alpha: 0.25)),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 13, color: AppTheme.neonCyan),
+            const SizedBox(width: 6),
+            Text(
+              label,
+              style: const TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+                fontFamily: 'monospace',
+                color: AppTheme.neonCyan,
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -276,6 +337,7 @@ class HomeScreen extends StatelessWidget {
               ],
             ),
           ),
+          const SizedBox(width: 12),
           // 解压中不许换目录。**这是一个真洞**，真机验收时发现的：解压是
           // `unawaited(_runExtractBatch())` 起的后台流程，跑起来之后谁也拦不住
           // 它；这时候换目录会把 `_folderPath` 和两条扫描列表全清掉重建，而批次
@@ -284,30 +346,17 @@ class HomeScreen extends StatelessWidget {
           //
           // 禁用而不是隐藏：按钮忽然消失会让布局跳动，而且用户会以为界面坏了。
           // 灰掉 + 不响应，配着旁边那颗「停止解压」，路径是清楚的。
-          GestureDetector(
-            onTap: state.extracting ? null : () => state.selectFolder(),
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-              decoration: BoxDecoration(
-                color: AppTheme.neonCyan
-                    .withValues(alpha: state.extracting ? 0.03 : 0.08),
-                borderRadius: BorderRadius.circular(20),
-                border: Border.all(
-                  color: AppTheme.neonCyan
-                      .withValues(alpha: state.extracting ? 0.1 : 0.3),
-                ),
-              ),
-              child: Text(
-                '更换',
-                style: TextStyle(
-                  fontSize: 12,
-                  color: state.extracting
-                      ? AppTheme.textDim
-                      : AppTheme.neonCyan,
-                ),
-              ),
+          if (state.extracting)
+            const Text(
+              '更换',
+              style: TextStyle(fontSize: 12, color: AppTheme.textDim),
+            )
+          else
+            _replaceButton(
+              icon: Icons.sync_alt,
+              label: '更换',
+              onTap: () => _pickTarget(context),
             ),
-          ),
         ],
       ),
     );
@@ -407,14 +456,26 @@ class HomeScreen extends StatelessWidget {
   }
 
   Widget _fileItem(ArchiveFile f) {
-    final typeColors = {
-      ArchiveType.zip: AppTheme.neonCyan,
-      ArchiveType.rar: AppTheme.neonPurple,
-      ArchiveType.sevenz: AppTheme.neonOrange,
-      ArchiveType.tar: AppTheme.neonGreen,
-      ArchiveType.unknown: AppTheme.neonRed,
+    // 用 switch 而不是 Map：这张表原先取 `typeColors[f.type]!`，给枚举加值时
+    // 编译期一声不吭、运行期直接 null 崩。switch 表达式会把漏掉的分支变成
+    // 编译错误 —— 下面四种压缩流就是加值的时候被它逼着补上的。
+    final color = switch (f.type) {
+      ArchiveType.zip => AppTheme.neonCyan,
+      ArchiveType.rar => AppTheme.neonPurple,
+      ArchiveType.sevenz => AppTheme.neonOrange,
+      ArchiveType.tar => AppTheme.neonGreen,
+      // 四种单文件压缩流与 tar 同色：颜色在这一行表达的是「非 zip/rar/7z」
+      // 这一组，不是格式本身。
+      ArchiveType.gzip ||
+      ArchiveType.bzip2 ||
+      ArchiveType.xz ||
+      ArchiveType.zstd => AppTheme.neonGreen,
+      // 软件包 / 光盘与磁盘映像这一大批（角标上的字由 `ArchiveFile.badge` 决定）。
+      // 同样归「非 zip/rar/7z」这一组。
+      ArchiveType.other => AppTheme.neonGreen,
+      // 只剩真正认不出的 —— 它进不了扫描结果，红色留给不该出现的情况。
+      ArchiveType.unknown => AppTheme.neonRed,
     };
-    final color = typeColors[f.type]!;
     final flagMap = {
       ArchiveFlag.encrypted: ('加密', AppTheme.neonOrange),
       ArchiveFlag.split: ('分片', AppTheme.neonPurple),
@@ -478,7 +539,12 @@ class HomeScreen extends StatelessWidget {
             ),
           ),
           const SizedBox(width: 8),
+          // 6 与日志页那排 tag 的间距取同一个值：两处的标签是同一种东西（9pt
+          // 等宽、圆角深底），挨在一起看时不该一个松一个紧。一个包可以同时带
+          // 三个角标（加密 + 分片 + 伪后缀），挤成一条就分不清是三个还是一个
+          // 长词了 —— 真机上就是这么被看出来「标签粘在一起」的。
           Row(
+            spacing: 6,
             children: f.flags
                 .map(
                   (fl) =>
@@ -552,7 +618,7 @@ class HomeScreen extends StatelessWidget {
                 const SizedBox(width: 10),
                 Expanded(
                   child: Text(
-                    state.scanCurrent.isEmpty ? '准备中...' : state.scanCurrent,
+                    state.scanCurrent.isEmpty ? '准备中…' : state.scanCurrent,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: const TextStyle(
@@ -739,14 +805,14 @@ class HomeScreen extends StatelessWidget {
   /// 只有 `clean` 那一档配得上「全部解压完成」那张绿卡片；被停掉的、有失败
   /// 的、全砸了的，绿卡片上写「完成」都是直接骗人。
   ///
-  /// 真机验收时用户要求停止后也落在这张卡片上（并且主按钮是「换个文件夹」），
+  /// 真机验收时用户要求停止后也落在这张卡片上（并且主按钮是「更换目标」），
   /// 说法是「像格式弹窗一样，不管点哪个都能跳到总结页」。
   String get _bannerTitle {
     switch (state.outcome) {
       // 卡片只在跑过之后出现（`batchRun`），所以 null 到不了这里。
       // 真到了就给个中性的说法，别写「完成」。
       case null:
-        return '这批已结束';
+        return '本批已结束';
       case BatchOutcome.clean:
         return '全部解压完成';
       case BatchOutcome.partial:
@@ -878,17 +944,37 @@ class HomeScreen extends StatelessWidget {
       state.stopExtract();
       return;
     }
-    // 这批已经跑过一轮。按钮的语义是「换个文件夹」，不是「再来一遍」——
-    // 重跑不覆盖而是追加 `_1`/`_2`，见 [_primaryLabel]。走 selectFolder 而不是
-    // 在这里直接清状态：**先选、选到了再清**，用户取消选择器时原来那批结果
-    // 还在（`selectFolderPath` 内部才 `_resetExtractState`）。
+    // 这批已经跑过一轮。按钮的语义是「换一个」，不是「再来一遍」—— 重跑不覆盖
+    // 而是追加 `_1`/`_2`，见 [_primaryLabel]。走选择流程而不是在这里直接清状态：
+    // **先选、选到了再清**，用户取消选择时原来那批结果还在
+    // （`selectFolderPath`/`selectFilePath` 内部才 `_resetExtractState`）。
     if (state.batchRun) {
-      state.selectFolder();
+      await _pickTarget(context);
       return;
     }
     if (state.archives.isEmpty) {
-      state.showToast('先选择一个文件夹并完成扫描', type: 'warn');
+      state.showToast('请先选择文件夹或文件并完成扫描', type: 'warn');
       return;
+    }
+    // 「自定义输出目录」：**在点开始解压这一刻**才选根目录（不提前、不在设置页）。
+    //
+    // 排在确认弹窗**之前** —— 确认弹窗上那行「输出到」得是真的，否则用户是在
+    // 一个还不知道往哪写的界面上点「确认解压」。先问完位置，再让他确认。
+    //
+    // 从前这里还先出一页说明弹窗（「接下来选的是输出目录」）——那页存在的唯一
+    // 理由是系统选择器上写不了标题。自建浏览器自己有标题、自己在页头写着
+    // 「不想每次都选？可以到设置里关掉」，那一页就多余了，顺手少一次点击。
+    if (state.setting('customOutput')) {
+      final picked = await _browse(context, FileBrowserMode.pickOutputRoot);
+      if (picked == null) {
+        // 取消 = 这批不解。**要出声**：这与「用户主动去选、取消就取消」不是
+        // 一回事 —— 这里是用户按了开始解压、被弹了选择、然后退出来，一声不吭
+        // 的话看着就像按钮坏了。
+        state.showToast('未选择输出目录，本批未执行', type: 'info');
+        return;
+      }
+      state.setOutputRoot(picked.path);
+      if (!context.mounted) return;
     }
     final archives = state.archives;
     final confirmed = await ConfirmExtractModal.show(
@@ -897,9 +983,13 @@ class HomeScreen extends StatelessWidget {
       encryptedCount: archives
           .where((a) => a.flags.contains(ArchiveFlag.encrypted))
           .length,
-      splitCount:
-          archives.where((a) => a.flags.contains(ArchiveFlag.split)).length,
-      folderName: state.folderName,
+      splitCount: archives
+          .where((a) => a.flags.contains(ArchiveFlag.split))
+          .length,
+      // 「输出到」说的是**输出落在哪**：对称输出时是源**所在的目录**。选了单个
+      // 文件时 `folderName` 是文件名，直接传它会让那一行写着「输出到 a.zip」。
+      folderName: state.outputDirName,
+      outputRoot: state.outputRoot,
     );
     // 滑掉 = false（见 ConfirmExtractModal.show）：写盘前手滑关掉不该等于同意。
     if (!confirmed) return;
@@ -908,14 +998,20 @@ class HomeScreen extends StatelessWidget {
 
   /// 请系统文件管理器打开解压出来的那棵树。
   ///
-  /// 输出目录是**每个压缩包各自同级**的，所以没有单一「输出根」；但整个树都在
-  /// 所选根目录底下，打开根目录就能看到。这里传的就是 `state.folderPath`。
+  /// 打开哪个目录取决于输出模式：
+  ///
+  /// - 默认（解到包旁边）：输出是**每个压缩包各自同级**的，没有单一「输出根」，
+  ///   但整棵树都在所选源目录底下，所以打开 `folderPath` 就能看到。
+  /// - 「自定义输出目录」：树在**用户选的根**底下，源目录那边什么都没有 ——
+  ///   还打开 `folderPath` 的话，用户会对着一个空目录找半天。
   ///
   /// 只有 [OpenFolderResult.opened] 是真成功。其余几档都**必须如实告诉用户**，
   /// 尤其是 `openedGeneric` —— 它表示「文件管理器开了，但没跳到那个目录」，
   /// 国产 ROM 上是常态；假装成功的话用户会对着一个不相干的目录找半天。
   Future<void> _openOutputDir(BuildContext context) async {
-    final path = state.folderPath;
+    final path = state.outputRoot.isNotEmpty
+        ? state.outputRoot
+        : state.folderPath;
     if (path.isEmpty) return;
     final result = await _bridge.openFolder(path);
     if (!context.mounted) return;
@@ -925,31 +1021,33 @@ class HomeScreen extends StatelessWidget {
       case OpenFolderResult.openedGeneric:
         await PathFallbackModal.show(
           context: context,
-          headline: '没能定位到目录',
-          detail: '文件管理器已经打开，但这台设备的文件管理器不支持直接跳到指定目录。'
-              '可以复制下面的路径，在里面粘贴访问。',
+          headline: '无法定位到目录',
+          detail:
+              '文件管理器已打开，但该系统不支持直接跳转到指定目录。'
+              '可复制下方路径后粘贴访问。',
           path: path,
         );
       case OpenFolderResult.unsupportedPath:
         await PathFallbackModal.show(
           context: context,
-          headline: '这个位置打不开',
-          detail: '该路径不在外部存储上，系统文件管理器表达不了它。请用下面这个路径访问。',
+          headline: '该位置无法打开',
+          detail: '该路径不在外部存储上，系统文件管理器无法定位。请使用下方路径访问。',
           path: path,
         );
       case OpenFolderResult.noHandler:
         await PathFallbackModal.show(
           context: context,
           headline: '没有可用的文件管理器',
-          detail: '这台设备上找不到能打开文件夹的应用。请用下面这个路径访问。',
+          detail: '本设备上未找到可打开文件夹的应用。请使用下方路径访问。',
           path: path,
         );
       case OpenFolderResult.unavailable:
         await PathFallbackModal.show(
           context: context,
           headline: '当前环境不支持',
-          detail: '打开目录依赖 Android 系统能力，当前环境没有这条通道。'
-              '请用下面这个路径访问。',
+          detail:
+              '打开目录依赖 Android 系统能力，当前环境不支持。'
+              '请使用下方路径访问。',
           path: path,
         );
     }

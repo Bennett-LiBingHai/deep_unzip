@@ -7,9 +7,9 @@ import 'package:shared_preferences/shared_preferences.dart';
 /// `shared_preferences` 落在 Android 上就是一个**明文 XML**，所以这里除了
 /// 往返正确，还要钉住「键怎么摆」以及**两条收敛**：
 ///
-/// 1. `maxDepth` 必须落在 `{0,5,10,20}` 里 —— 表外的值会让设置页的芯片
-///    用 `indexOf` 拿到 -1，再拿去索引标签数组就是越界崩溃。（`maxLogs` 是
-///    自由输入，收敛方式不同：只夹回区间，不吸附到档位。）
+/// 1. `maxDepth` 与 `maxLogs` 都是**自由输入**，收敛方式一样：只夹回区间，
+///    **不吸附到档位**。深度可填 `0`–[kMaxMaxDepth]（`0` = 不递归，是语义
+///    而不是「填错了」），日志可填 [kMinMaxLogs]–[kMaxMaxLogs]。
 /// 2. 非「自定义」档时，阈值**以预设为准**，不信磁盘上那四个数 ——
 ///    否则会出现「chip 写着『严格』、闸门跑的是另一套」这种没人查得出来的错。
 void main() {
@@ -34,27 +34,60 @@ void main() {
       // 新增开关时老用户的档就长这样：没有新键。缺键即默认是这里唯一的
       // 兼容策略（见 settings_repo 的库注释），不写「版本号 + 迁移」。
       SharedPreferences.setMockInitialValues({
-        'toggle.splitMerge': false, // 只有这一个存过
+        'toggle.fakeExtDetect': false, // 只有这一个存过
       });
 
       final data = await repo.load();
 
-      expect(data.toggles['splitMerge'], isFalse, reason: '存过的要读出来');
-      expect(data.toggles['recursive'], isTrue, reason: '没存过的回出厂默认');
+      expect(data.toggles['fakeExtDetect'], isFalse, reason: '存过的要读出来');
+      expect(data.toggles['pwdAutoSave'], isTrue, reason: '没存过的回出厂默认');
       expect(data.toggles.keys, kDefaultToggles.keys,
           reason: '键集必须与出厂表完全一致，不能多也不能少');
+    });
+
+    test('改过名的开关：老键的值跟着过来，用户的取舍不会因为升级而变', () async {
+      // `pwdPrompt` 原叫 `pwdAutoTry`。老用户档里只有旧键 —— 读不到的话这个
+      // 开关会当场跳回出厂默认（true），用户升级一次就发现设置自己变了。
+      SharedPreferences.setMockInitialValues({
+        'toggle.pwdAutoTry': false,
+      });
+
+      final data = await repo.load();
+
+      expect(data.toggles['pwdPrompt'], isFalse,
+          reason: '旧键 = 用户的取舍，要认');
+      expect(data.toggles.keys, kDefaultToggles.keys,
+          reason: '认旧键不等于把旧键搬进结果集 —— 读出来仍然只有新键');
+    });
+
+    test('新旧键并存 → 新键说话', () async {
+      // 只可能是「升级后改过、又用旧版本装回来」这种折腾出来的档。留着旧值
+      // 当判据的话，用户在新版本里点的开关会被一个看不见的幽灵盖掉。
+      SharedPreferences.setMockInitialValues({
+        'toggle.pwdPrompt': true,
+        'toggle.pwdAutoTry': false,
+      });
+
+      final data = await repo.load();
+
+      expect(data.toggles['pwdPrompt'], isTrue);
     });
   });
 
   group('往返', () {
-    test('六个开关 + 深度 + 日志封顶 + 自定义阈值原样回来', () async {
+    // 名字里**不写开关的条数**：这张表加过一次（`pwdAutoSave`），以后再加
+    // 还得改一次名字，而名字跟断言没关系 —— 要钉的是「原样回来」。
+    test('开关 + 深度 + 日志封顶 + 自定义阈值原样回来', () async {
+      // 这份 map 必须**逐个列出全部开关**：`load` 只认 `kDefaultToggles` 里
+      // 那些键，漏写一个就会被补成出厂默认 —— `expect(back.toggles == saved)`
+      // 于是失败在「少写了一个」而不是「存坏了」。等于用一次红灯逼着加开关的人
+      // 回这里报到（`缺一个开关的键` 那条是它的另一面，测的是老用户的档）。
       const saved = SettingsData(
         toggles: {
-          'recursive': false,
-          'symmetricOutput': false,
+          'customOutput': false,
           'fakeExtDetect': true,
-          'splitMerge': false,
-          'pwdAutoTry': false,
+          'pwdPrompt': false,
+          'pwdAutoSave': false,
           'errorPause': true,
         },
         maxDepth: 10,
@@ -97,21 +130,31 @@ void main() {
   });
 
   group('加载时的收敛', () {
-    test('深度落在表外 → 收敛到最近的合法档，不崩溃', () async {
-      // `settings_screen` 的芯片用 `kMaxDepthOptions.indexOf(maxDepth)` 定位，
-      // 拿到 -1 就直接越界崩。所以这条必须在这里就收住。
-      for (final (raw, expected) in [(7, 5), (18, 20), (3, 5), (-9, 0), (99, 20)]) {
+    test('深度是自由输入：区间内的值原样保留，界外才夹', () async {
+      // 与 `maxLogs` 同一条规矩：没有档位表可以让值「最近」到哪儿去 —— 7 就
+      // 该是 7，不该被挪成 5 或 10。只有越界才动它。
+      for (final (raw, expected) in [
+        (0, 0), // 0 = 不递归，是语义而不是「填错了」
+        (7, 7),
+        (19, 19),
+        (kMinMaxDepth, kMinMaxDepth),
+        (kMaxMaxDepth, kMaxMaxDepth),
+        (-9, kMinMaxDepth),
+        (99, kMaxMaxDepth),
+      ]) {
         SharedPreferences.setMockInitialValues({'maxDepth': raw});
         final data = await repo.load();
         expect(data.maxDepth, expected, reason: '$raw 应收敛成 $expected');
-        expect(kMaxDepthOptions.contains(data.maxDepth), isTrue);
       }
     });
 
-    test('深度取最近的合法档而不是无脑归零', () async {
-      // 用户真设过 20 层，值要是落在表外，归零等于把他设的限制悄悄放开。
-      SharedPreferences.setMockInitialValues({'maxDepth': 19});
-      expect((await repo.load()).maxDepth, 20);
+    test('老档里的 0 照读成「不递归」，不替用户翻译', () async {
+      // 旧版本里 0 是「无限制」，而它当时同时是出厂默认值 —— 所以老档里大概率
+      // 就是个 0。这里刻意**不**把它改成别的：磁盘上分不出「旧版写的 0」和
+      // 「用户照着新语义刚设的 0」，而猜错的方向是把人特意关掉的递归又打开。
+      // 真要迁移得换键名（`maxDepthV2`），不是在这一层猜。
+      SharedPreferences.setMockInitialValues({'maxDepth': 0});
+      expect((await repo.load()).maxDepth, 0);
     });
 
     test('日志封顶越界 → 夹回区间，但**不吸附**', () async {
@@ -172,8 +215,15 @@ void main() {
       await repo.save(const SettingsData());
 
       final prefs = await SharedPreferences.getInstance();
-      expect(prefs.getBool('toggle.recursive'), isTrue);
+      expect(prefs.getBool('toggle.customOutput'), isFalse,
+          reason: '「目录对称输出」改名成「自定义输出目录」，出厂关');
+      expect(prefs.getBool('toggle.symmetricOutput'), isNull,
+          reason: '旧键不该再写下去 —— 那颗开关从没被读过，它的值不承载任何意图');
       expect(prefs.getBool('toggle.errorPause'), isTrue);
+      expect(prefs.getBool('toggle.recursive'), isNull,
+          reason: '「递归解压」那颗 2026-10 删了，不该再有键写下去');
+      expect(prefs.getBool('toggle.pwdAutoSave'), isTrue,
+          reason: '手输密码自动入库那颗，默认开');
       expect(prefs.getInt('maxDepth'), kDefaultMaxDepth);
       expect(prefs.getInt('maxLogs'), kDefaultMaxLogs);
       expect(prefs.getInt('limitPreset'), kDefaultLimitPreset);

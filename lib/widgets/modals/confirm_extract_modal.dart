@@ -4,7 +4,7 @@ import '../../theme/app_theme.dart';
 import 'bottom_modal.dart';
 import 'modal_button.dart';
 
-/// 点「开始智能解压」时的确认弹窗。
+/// 点「开始解压」时的确认弹窗。
 ///
 /// 为什么值得挡一道：解压会**真的往磁盘写目录**，而输出目录重名时会追加
 /// `_1`/`_2`（见 `output_paths.dart`）—— 也就是说点错一次不会「覆盖」，而是
@@ -25,12 +25,19 @@ class ConfirmExtractModal extends StatelessWidget {
   /// 用户选的那个根目录，用来说明输出落在哪。
   final String folderName;
 
+  /// 「自定义输出目录」开着时用户选的输出根；空串 = 按老规矩解到包旁边。
+  ///
+  /// 非空时它**顶掉** [folderName] 显示在「输出到」那一行 —— 那一行要说的是
+  /// 「这次会往哪写」，而自定义模式下那个答案是用户刚选的根，不是源目录。
+  final String outputRoot;
+
   const ConfirmExtractModal({
     super.key,
     required this.archiveCount,
     required this.encryptedCount,
     required this.splitCount,
     required this.folderName,
+    this.outputRoot = '',
   });
 
   /// 返回用户是否确认。**滑掉弹窗返回 false**（`showBottomModal` 可被手势
@@ -42,6 +49,7 @@ class ConfirmExtractModal extends StatelessWidget {
     required int encryptedCount,
     required int splitCount,
     required String folderName,
+    String outputRoot = '',
   }) async {
     final result = await showBottomModal<bool>(
       context: context,
@@ -50,6 +58,7 @@ class ConfirmExtractModal extends StatelessWidget {
         encryptedCount: encryptedCount,
         splitCount: splitCount,
         folderName: folderName,
+        outputRoot: outputRoot,
       ),
     );
     return result ?? false;
@@ -64,8 +73,11 @@ class ConfirmExtractModal extends StatelessWidget {
         children: [
           Row(
             children: [
-              const Icon(Icons.inventory_2_outlined,
-                  color: AppTheme.neonCyan, size: 20),
+              const Icon(
+                Icons.inventory_2_outlined,
+                color: AppTheme.neonCyan,
+                size: 20,
+              ),
               const SizedBox(width: 10),
               const Text(
                 '开始解压',
@@ -78,9 +90,14 @@ class ConfirmExtractModal extends StatelessWidget {
             ],
           ),
           const SizedBox(height: 6),
-          const Text(
-            '解压结果会写到每个压缩包旁边，目录结构与源目录一致',
-            style: TextStyle(
+          Text(
+            // 两档各说各的实话。**别把两句合成一句模糊的**：这两档写盘的位置
+            // 完全不同（一个在源目录里、一个在用户选的根下），而下面那行
+            // 「输出到」正是用户用来核对的依据。
+            outputRoot.isEmpty
+                ? '解压结果会写到每个压缩包旁边，目录结构与源目录一致'
+                : '解压结果会按源目录结构，写到你指定的输出目录下面',
+            style: const TextStyle(
               fontSize: 12,
               color: AppTheme.textDim,
               fontFamily: 'monospace',
@@ -94,23 +111,31 @@ class ConfirmExtractModal extends StatelessWidget {
             decoration: BoxDecoration(
               color: AppTheme.neonCyan.withValues(alpha: 0.05),
               borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: AppTheme.neonCyan.withValues(alpha: 0.15)),
+              border: Border.all(
+                color: AppTheme.neonCyan.withValues(alpha: 0.15),
+              ),
             ),
             child: Column(
               children: [
                 _row('待解压', '$archiveCount 个压缩包'),
                 if (encryptedCount > 0) ...[
                   _divider(),
-                  _row('需要密码', '$encryptedCount 个（将自动尝试密码库）',
-                      color: AppTheme.neonOrange),
+                  _row('需要密码', '$encryptedCount 个', color: AppTheme.neonOrange),
                 ],
                 if (splitCount > 0) ...[
                   _divider(),
-                  _row('分片', '$splitCount 个（将自动合并）',
-                      color: AppTheme.neonOrange),
+                  _row('分片', '$splitCount 个', color: AppTheme.neonOrange),
                 ],
                 _divider(),
-                _row('输出到', folderName.isEmpty ? '所选目录' : folderName),
+                // 自定义输出目录时显示**整条路径**（不是 basename）：用户可能
+                // 有好几个都叫 `out` 的目录，只给名字等于没说。那一行自带
+                // `overflow: ellipsis`，长路径会截断，不会撑破弹窗。
+                _row(
+                  '输出到',
+                  outputRoot.isNotEmpty
+                      ? outputRoot
+                      : (folderName.isEmpty ? '所选目录' : folderName),
+                ),
               ],
             ),
           ),
@@ -144,12 +169,15 @@ class ConfirmExtractModal extends StatelessWidget {
       padding: const EdgeInsets.symmetric(vertical: 6),
       child: Row(
         children: [
-          Text(
-            k,
-            style: const TextStyle(
-              fontSize: 12,
-              color: AppTheme.textDim,
-              fontFamily: 'monospace',
+          SizedBox(
+            width: 64,
+            child: Text(
+              k,
+              style: const TextStyle(
+                fontSize: 12,
+                color: AppTheme.textDim,
+                fontFamily: 'monospace',
+              ),
             ),
           ),
           const Spacer(),
@@ -172,5 +200,8 @@ class ConfirmExtractModal extends StatelessWidget {
   }
 
   Widget _divider() => Divider(
-      color: Colors.white.withValues(alpha: 0.04), height: 1, thickness: 1);
+    color: Colors.white.withValues(alpha: 0.04),
+    height: 1,
+    thickness: 1,
+  );
 }

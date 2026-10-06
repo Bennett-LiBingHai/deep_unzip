@@ -20,6 +20,8 @@ import 'package:flutter/widgets.dart';
 import '../app_navigator.dart';
 import '../widgets/modals/error_modal.dart';
 import '../widgets/modals/format_detect_modal.dart';
+import '../widgets/modals/password_attempt_modal.dart';
+import 'password_prompt.dart';
 import 'prompts.dart';
 
 class DialogBridge {
@@ -105,6 +107,44 @@ class DialogBridge {
       onConfirm: () => finish(true),
       onCancel: () => finish(false),
     ).then((_) => finish(true)));
+
+    return completer.future;
+  }
+
+  /// 弹「这个包需要密码，密码库没试出来」（需求 2）。
+  ///
+  /// ## 三条出口，滑走默认 = **跳过**
+  ///
+  /// 与 [askCantExtract] 同一个理由：`showBottomModal` 能被遮罩点击或下滑关掉
+  /// 且不给结果，默认必须取**代价小的那一个**。「停止」会把剩余队列丢掉，
+  /// 手滑一下废掉整批太狠了。
+  ///
+  /// ## 「手动输入」这条出口不在这里收尾
+  ///
+  /// 手输的密码由弹窗自己一验再验（错一次留一次在原地说一句），所以它回调
+  /// [PasswordResolution.manual] 时，密码**已经验证通过、包也已经解完了**
+  /// —— 见 `password_prompt.dart` 里 [PasswordAsk.verify] 那段说明。这里只
+  /// 负责把结果搬回去。
+  ///
+  /// 返回 null = 没弹成（拿不到 context）。调用方按「没弹」处理，不要当成
+  /// 用户按了跳过。
+  Future<PasswordResolution?> askPassword(PasswordAsk ask) async {
+    final context = _context;
+    if (context == null) return null;
+
+    final completer = Completer<PasswordResolution?>();
+
+    void finish(PasswordResolution? resolution) {
+      if (!completer.isCompleted) completer.complete(resolution);
+    }
+
+    unawaited(PasswordAttemptModal.show(
+      context: context,
+      ask: ask,
+      onManual: (password) => finish(PasswordResolution.manual(password)),
+      onSkip: () => finish(const PasswordResolution.skip()),
+      onStop: () => finish(const PasswordResolution.stop()),
+    ).then((_) => finish(const PasswordResolution.skip())));
 
     return completer.future;
   }

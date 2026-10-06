@@ -76,6 +76,32 @@ class DeepUnzipEngineBindings {
   late final _duz_free_entries = _duz_free_entriesPtr
       .asFunction<void Function(ffi.Pointer<duz_entry>, int)>();
 
+  /// 上一次失败是不是「密码不对**或**数据已损坏，这两者分不出来」。1 = 分不出来。
+  ///
+  /// 只有 DUZ_ERR_PASSWORD 这一档才可能为 1，且**只有解压阶段**可能为 1：加密条目
+  /// 的数据压根没解开，而那种加密没有校验字（7z 的 AES 就是个纯 CBC 滤波器、RAR3
+  /// 也没有），错密码和坏数据在解码器眼里长得一模一样。ZIP（AES 的校验字 /
+  /// ZipCrypto 的头校验）和 RAR5 有校验字，7-Zip 亲口报 kWrongPassword，那一档
+  /// 恒为 0 —— 它们是**能确定**的。
+  ///
+  /// 它只影响**说法**，不影响**策略**：DUZ_ERR_PASSWORD 的含义与处置（换下一个
+  /// 候选密码重试 duz_open / 弹密码窗）有它没它完全一样。做成一个单独的位而不是
+  /// 新错误码，正是因为「分不清」不是一个路由概念 —— 写成错误码就等于让每个判
+  /// DUZ_ERR_PASSWORD 的地方都得再多认一个值，漏一处就表现成「加密包不再试密码库」。
+  ///
+  /// 与 duz_last_open_error()/…_code() 同源同生命周期：紧挨着它们读，不要跨
+  /// await，也不要拿一次成功调用的结果去用。
+  int duz_last_error_uncertain() {
+    return _duz_last_error_uncertain();
+  }
+
+  late final _duz_last_error_uncertainPtr =
+      _lookup<ffi.NativeFunction<ffi.Int32 Function()>>(
+        'duz_last_error_uncertain',
+      );
+  late final _duz_last_error_uncertain = _duz_last_error_uncertainPtr
+      .asFunction<int Function()>();
+
   /// 上面失败时的错误文案（线程本地，复制即用，不要 free）。
   ffi.Pointer<ffi.Char> duz_last_open_error() {
     return _duz_last_open_error();
@@ -241,7 +267,7 @@ final class duz_entry extends ffi.Struct {
   @ffi.Int32()
   external int encrypted;
 
-  /// 在归档中的序号，duz_extract_entry 用
+  /// 在归档中的序号（IInArchive 的下标），单条操作时用
   @ffi.Int32()
   external int index;
 }

@@ -128,7 +128,7 @@ void main() {
       await tapFilter(tester, '跳过');
 
       expect(find.text('筛出 0 / 共 2 条'), findsOneWidget);
-      expect(find.text('这个分类下没有记录'), findsOneWidget);
+      expect(find.text('该分类下暂无记录'), findsOneWidget);
       expect(find.text('暂无记录'), findsNothing);
     });
   });
@@ -155,7 +155,7 @@ void main() {
 
       expect(find.byType(ClearLogsModal), findsOneWidget);
       expect(find.text('2 条记录'), findsOneWidget);
-      expect(find.text('这是一份只在本机留存的操作历史，清空后无法恢复'), findsOneWidget);
+      expect(find.text('日志仅保存在本机，清空后无法恢复'), findsOneWidget);
     });
 
     testWidgets('筛选状态下点清空，弹窗报的是**全部**条数', (tester) async {

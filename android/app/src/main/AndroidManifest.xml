@@ -23,10 +23,70 @@
         android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
         tools:ignore="ScopedStorage" />
 
+    <!-- ===== 解压期间的前台服务（保活） =====
+         见 ExtractKeepAliveService：解压是长任务，切后台/锁屏时不给系统一个
+         「我还在干活」的声明，国产 ROM 会直接把进程回收掉，用户看到的是
+         「解到一半什么都没了」。
+
+         按「最小必要」写死：
+         - 只要 FOREGROUND_SERVICE 与它的 dataSync 类型那一份 —— 不碰 camera /
+           location / mediaPlayback 等任何用不到的。
+         - **不声明 RECEIVE_BOOT_COMPLETED**：本应用开机之后没有任何要干的事。 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- Android 13+：通知权限。
+         没有它，前台服务照样起、进程照样保得住 —— 真机实测过：`dumpsys` 里那条
+         通知记录完整地挂在服务上（渠道 `duz_extract_progress`、带
+         ONGOING_EVENT），只是通知栏里不显示。但**锁屏期间用户能看到的只剩这条
+         通知**：界面上的进度条被前后台节流掐掉了（见
+         `EngineController.onExtractTickBackground`），通知再不显示，用户就是
+         完全瞎的 —— 一个跑了十几分钟的活，看起来像是卡住了。
+
+         申请时机是第一次「开始解压」（`AppState._runExtractBatch` 里）：那时用户
+         刚表达完「我要干活了」、应用在前台（弹窗才出得来），而且已经晚于
+         「选择文件夹」那次存储权限申请，所以 9.2 那条「隐私政策同意前不申请任何
+         权限」天然满足。
+
+         申请那一句**放在起前台服务之后、而且不 await** —— 一批的开工不能吊在
+         一次用户交互后面。顺序的代价（这条通知先被系统压住，权限落地后最多两秒
+         才显形）由那边两秒一次的进度推送兜着。
+         拒绝的后果只有一个：少一条通知。解压绝不因此被拦（见
+         `services/notification_permission.dart`）。 -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Android 10（API 29）那一档的存储退路。
+
+         ## 为什么非有不可
+
+         API 29 的位置很尴尬，前后两头都通、就它卡住：
+
+         - 分区存储从 API 29 开始**强制**（targetSdk ≥ 29 就是强制的），所以
+           `dart:io` 不能再随便遍历 `/sdcard` 下的目录；
+         - 真正能自由遍历的那个权限 `MANAGE_EXTERNAL_STORAGE`（「所有文件访问」）
+           **要到 API 30 才有**；
+         - 老的 `READ/WRITE_EXTERNAL_STORAGE` 在分区存储下给不了我们要的
+           「递归读任意目录」。
+
+         这一行就是中间那一档的出路。没有它，本应用在 Android 10 上等于半残。
+
+         ## 它只对 Android 10 生效
+
+         API 30+ 的系统**直接忽略**这个属性（legacy 模式在那边整个没有了）。
+         所以它不会让新系统退回老模型 —— 判断依据是**设备版本**，不是 targetSdk，
+         所以哪怕我们 targetSdk 是 36，在 Android 10 上它照样起作用。
+
+         ## 别顺手删掉
+
+         删了不会有任何编译错误、也不会有测试变红，只在一台 Android 10 手机上
+         表现为「选了目录什么都扫不到」。`test/android/manifest_test.dart` 盯着它。 -->
     <application
-        android:label="deep_unzip"
+        android:label="@string/app_name"
         android:name="${applicationName}"
-        android:icon="@mipmap/ic_launcher">
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:requestLegacyExternalStorage="true">
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -49,6 +109,25 @@
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
+
+        <!-- 解压期间的前台服务。跑在同一个进程里，只是为了让系统别回收它。
+             见 ExtractKeepAliveService.kt。
+
+             - `exported="false"`：只有我们自己起得来。它是 exported=true 的话，
+               任何应用都能拉起一条挂着我们名字的通知。
+             - `foregroundServiceType="dataSync"`：Android 14+ 强制要求声明类型，
+               不声明会在 `startForeground` 时抛 `MissingForegroundServiceTypeException`。
+               选 dataSync 是因为我们干的就是「本地读写数据」，也是商店里解压类
+               应用的通行归类（它对应的 FOREGROUND_SERVICE_DATA_SYNC 权限上面已声明）。
+             - `stopWithTask="true"`：用户从最近任务里划掉应用 → 服务跟着停。
+               与「停止就是停下、没有继续」那条设计一致：进程都没了，队列也没了，
+               留一条还在转的常驻通知才是骗人。 -->
+        <service
+            android:name=".ExtractKeepAliveService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync"
+            android:stopWithTask="true" />
+
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
         <meta-data

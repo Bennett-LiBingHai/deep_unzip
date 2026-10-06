@@ -52,12 +52,32 @@ android {
         }
     }
 
+    defaultConfig {
+        minSdk = 24
+
+        externalNativeBuild {
+            cmake {
+                // **必须 `c++_shared`，不是默认的 `c++_static`。**
+                //
+                // 引擎拆成 libduz7zip.so + libdeep_unzip_engine.so 之后，有 C++
+                // 对象跨 .so 边界：`UString` 的布局、`CArchiveLink` 的 vtable、
+                // 以及 7-Zip 抛出来由我们接的异常。
+                //
+                // 默认的 `c++_static` 会让**每个 .so 各嵌一份 libc++**，同一个类型
+                // 的 typeinfo 于是有两个互不相等的地址，跨边界的 `catch` 接不住
+                // （`dynamic_cast` 同理）。症状是随机的：某些包解到一半崩，而不是
+                // 编译期报错。
+                //
+                // 换了之后 AGP 会把 `libc++_shared.so` 一并打进 APK（每个 ABI 约
+                // 1 MB）。这既是 NDK 文档对「多个共享库跨边界传 C++ 对象」的标准
+                // 要求，也是这次拆分的前提。
+                arguments += "-DANDROID_STL=c++_shared"
+            }
+        }
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
-    }
-
-    defaultConfig {
-        minSdk = 24
     }
 }

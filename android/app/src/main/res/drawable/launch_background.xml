@@ -1,12 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Modify this file to customize your launch splash screen -->
-<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
-    <item android:drawable="@android:color/white" />
+<!-- 与 `drawable-v21/launch_background.xml` 内容一致。
 
-    <!-- You can insert your own image assets here -->
-    <!-- <item>
+     **这一份在 minSdk 24 下永远轮不到**（`-v21` 那版总是在前面）。留着只是为了
+     与 Flutter 模板的形状一致 —— 改的时候两份都改，别只改一份。 -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:drawable="@color/duz_background" />
+
+    <item>
         <bitmap
             android:gravity="center"
-            android:src="@mipmap/launch_image" />
-    </item> -->
+            android:src="@drawable/splash_logo" />
+    </item>
 </layer-list>

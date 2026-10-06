@@ -1,0 +1,49 @@
+# 发布签名材料的模板。**这个文件本身没有密钥，可以入库**；
+# 照它复制出一份 `key.properties`（已在 .gitignore 里，不会进 git）再填真值。
+#
+#     cp android/key.properties.example android/key.properties
+#
+# ## 生成 keystore
+#
+#     keytool -genkeypair -v \
+#       -keystore "$HOME/keystores/deep_unzip.jks" \
+#       -storetype PKCS12 \
+#       -keyalg RSA -keysize 2048 -validity 10000 \
+#       -alias deepunzip
+#
+# `keytool` 在 Android Studio 自带的 JRE 里，没配 PATH 的话用全路径：
+# Windows 是 `%LOCALAPPDATA%\..\AndroidStudio\jbr\bin\keytool.exe`，
+# 本机实测在 `D:\MySoftware\AndroidStudio\jbr\bin\keytool.exe`。
+#
+# 三个参数为什么是这几个数：
+# - `PKCS12` 而不是老的 `JKS`：JDK 9 起就是默认，各工具链都认。
+# - `validity 10000`（约 27 年）：应用商店要求签名在可预见的将来一直有效，
+#   上游 Flutter 文档用的也是这个数。
+# - `RSA 2048`：Google Play 从 2021 起强制要求，国内商店也在跟。
+#
+# **`-alias` 记牢**，各商店提审时有时要填。本文件里写的是 `deepunzip`。
+#
+# ## keystore 放哪
+#
+# 放在**仓库外面**（上面那条命令放的是 `$HOME/keystores/`）。放仓库里再靠
+# .gitignore 挡是能挡住的，但一次 `git add -f`、一次改错 .gitignore 就漏了，
+# 而漏了的代价是换密钥 + 换包名 + 重新上架。放在外面就没有这个风险。
+#
+# ## 这两条别丢
+#
+# - **密码**：丢了就永远签不出能覆盖已上架版本的包，用户只能卸载重装。
+# - **keystore 文件本身**：同上。**换机器、重装系统之前先备份**。
+
+# ---------------------------------------------------------------------------
+# 下面填真值。等号两边不要留空格。
+# ---------------------------------------------------------------------------
+
+# keystore 的**绝对路径**。
+#
+# **必须用正斜杠，或者把每个反斜杠写两遍**：properties 文件里 `\` 是转义字符，
+# 写成 `D:\keys\x.jks` 会被读成 `D:keysx.jks`，而报错要等到打包签名那一步才出现。
+storeFile=/absolute/path/to/deep_unzip.jks
+
+storePassword=
+keyAlias=deepunzip
+keyPassword=

@@ -4,6 +4,7 @@ import '../theme/app_theme.dart';
 import '../providers/app_state.dart';
 import '../models/password_entry.dart';
 import '../widgets/glass_card.dart';
+import '../widgets/modals/delete_password_modal.dart';
 
 /// 密码库页面
 class VaultScreen extends StatefulWidget {
@@ -37,12 +38,12 @@ class _VaultScreenState extends State<VaultScreen> {
             const SizedBox(height: 16),
             _buildAddForm(),
             const SizedBox(height: 16),
-            ...widget.state.passwords.asMap().entries.map((e) {
+            ...widget.state.passwords.map((p) {
               return Padding(
                 padding: const EdgeInsets.only(bottom: 10),
-                child: _pwdItem(e.value, e.key),
+                child: _pwdItem(p),
               );
-            }).toList(),
+            }),
           ],
         );
       },
@@ -79,19 +80,18 @@ class _VaultScreenState extends State<VaultScreen> {
   }
 
   Widget _buildSummary() {
-    // 右边那格原本是写死的 `87%`（标签「历史匹配率」）—— 纯装饰。密码库改成
-    // 空库起步之后，那个数字跟左边的「0 已保存密码」直接打架，所以换成真的：
-    // 库里各条 hitCount 之和。P4 接上真实匹配计数后这里会更有意义。
-    final hits =
-        widget.state.passwords.fold<int>(0, (sum, p) => sum + p.hitCount);
+    final hits = widget.state.passwords.fold<int>(
+      0,
+      (sum, p) => sum + p.hitCount,
+    );
 
     return GlassCard(
       padding: const EdgeInsets.all(16),
       child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        mainAxisAlignment: MainAxisAlignment.spaceAround,
         children: [
           Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
+            crossAxisAlignment: CrossAxisAlignment.center,
             children: [
               Text(
                 '${widget.state.passwords.length}',
@@ -110,12 +110,12 @@ class _VaultScreenState extends State<VaultScreen> {
             ],
           ),
           Column(
-            crossAxisAlignment: CrossAxisAlignment.end,
+            crossAxisAlignment: CrossAxisAlignment.center,
             children: [
               Text(
                 '$hits',
                 style: const TextStyle(
-                  fontSize: 18,
+                  fontSize: 28,
                   fontWeight: FontWeight.w700,
                   fontFamily: 'monospace',
                   color: AppTheme.neonGreen,
@@ -145,7 +145,7 @@ class _VaultScreenState extends State<VaultScreen> {
               color: AppTheme.textPrimary,
             ),
             decoration: InputDecoration(
-              hintText: '输入密码...',
+              hintText: '输入密码',
               hintStyle: const TextStyle(
                 fontSize: 13,
                 fontFamily: 'monospace',
@@ -200,7 +200,7 @@ class _VaultScreenState extends State<VaultScreen> {
     );
   }
 
-  Widget _pwdItem(PasswordEntry p, int index) {
+  Widget _pwdItem(PasswordEntry p) {
     return GlassCard(
       padding: const EdgeInsets.all(14),
       child: Row(
@@ -262,7 +262,7 @@ class _VaultScreenState extends State<VaultScreen> {
             ),
           ),
           GestureDetector(
-            onTap: () => widget.state.deletePassword(index),
+            onTap: () => _confirmDelete(p),
             child: Container(
               width: 30,
               height: 30,
@@ -283,6 +283,21 @@ class _VaultScreenState extends State<VaultScreen> {
         ],
       ),
     );
+  }
+
+  /// 删之前先弹确认（见 [DeletePasswordModal]）。
+  ///
+  /// 确认回来之后**按值重新定位，而不是直接用传进来的 `index`**：弹窗是 await
+  /// 的，中间隔着用户点一下的时长，而这期间解压可能正好命中一条密码 ——
+  /// `_markVaultHit` 会把 `_passwords` 里那一条换成新对象（顺序没变，但「列表
+  /// 还是当初那个列表」已经不是白给的了）。值在库里唯一（`addPassword` 拒重复），
+  /// 所以按值找得到就一定是它；找不到就是那条已经不在了，此时**什么都不做** ——
+  /// 拿一个过期的下标去 `removeAt`，删掉的是下一条。
+  Future<void> _confirmDelete(PasswordEntry p) async {
+    if (!await DeletePasswordModal.show(context: context, entry: p)) return;
+    final at = widget.state.passwords.indexWhere((x) => x.value == p.value);
+    if (at < 0) return;
+    widget.state.deletePassword(at);
   }
 
   void _add() {

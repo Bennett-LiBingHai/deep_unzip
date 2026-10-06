@@ -21,37 +21,90 @@ import '../models/archive_file.dart';
 
 /// 由文件头（魔术字节）判定出的**真实**格式。
 ///
-/// 比 `ArchiveType` 细：`ArchiveType` 只有 5 个值且是给 UI 显示用的，这里
-/// 需要区分 RAR4/RAR5、以及各种压缩包装容器，因为它们的解压路径不同。
+/// 比 `ArchiveType` 细：`ArchiveType` 是给 UI 显示用的粗分类，这里需要区分
+/// RAR4/RAR5、以及各种压缩包装容器，因为它们的解压路径不同。
+///
+/// ## 这张表与引擎的关系
+///
+/// 引擎（内置的 7-Zip 核心）打开时**不限格式**，会把编进去的 handler 逐个试
+/// 一遍；真正的闸门在 Dart 这边 —— 嗅探认不出的文件，扫描时根本不会送到引擎
+/// （`SniffResult.isArchive` 为假，`scanner._emitPlain` 直接丢掉）。所以「app
+/// 能解哪些格式」＝ **这张表里有哪些值**，不是引擎能做什么。
+///
+/// 收录原则：**有可靠签名的**才收。7-Zip 还编进了一批没有可靠签名的东西
+/// （FAT / MBR / GPT / ext / HFS / APFS 这类裸分区，签名只有 2 字节且在文件深处；
+/// Base64 / Intel HEX / 裸 LZMA 干脆没有签名；PE / ELF / Mach-O 是可执行文件），
+/// 它们**刻意不收**：收了就会把目录里一大批不相干的文件当成压缩包列出来。
 enum SniffFormat {
-  zip('ZIP 压缩包', ArchiveType.zip),
-  rar4('RAR 压缩包', ArchiveType.rar),
-  rar5('RAR5 压缩包', ArchiveType.rar),
-  sevenZ('7-Zip 压缩包', ArchiveType.sevenz),
-  tar('TAR 归档', ArchiveType.tar),
-  gzip('GZIP 压缩', ArchiveType.tar),
-  bzip2('BZIP2 压缩', ArchiveType.tar),
-  xz('XZ 压缩', ArchiveType.tar),
-  zstd('ZSTD 压缩', ArchiveType.tar),
-  cab('CAB 归档', ArchiveType.unknown),
-  lzh('LHA 归档', ArchiveType.unknown),
-  arj('ARJ 归档', ArchiveType.unknown),
-  cpio('CPIO 归档', ArchiveType.unknown),
-  unknown('未知格式', ArchiveType.unknown);
+  // ---- 压缩包 / 压缩流 ----
+  zip('ZIP 压缩包', 'ZIP', ArchiveType.zip),
+  rar4('RAR 压缩包', 'RAR', ArchiveType.rar),
+  rar5('RAR5 压缩包', 'RAR', ArchiveType.rar),
+  sevenZ('7-Zip 压缩包', '7Z', ArchiveType.sevenz),
+  tar('TAR 归档', 'TAR', ArchiveType.tar),
+  gzip('GZIP 压缩', 'GZIP', ArchiveType.gzip),
+  bzip2('BZIP2 压缩', 'BZIP2', ArchiveType.bzip2),
+  xz('XZ 压缩', 'XZ', ArchiveType.xz),
+  zstd('ZSTD 压缩', 'ZSTD', ArchiveType.zstd),
+  cab('CAB 归档', 'CAB', ArchiveType.other),
+  lzh('LHA 归档', 'LHA', ArchiveType.other),
+  arj('ARJ 归档', 'ARJ', ArchiveType.other),
+  cpio('CPIO 归档', 'CPIO', ArchiveType.other),
+  z('Unix compress 压缩', 'Z', ArchiveType.other),
+  ppmd('PPMd 压缩', 'PMD', ArchiveType.other),
+  mslz('MS 压缩（SZDD）', 'SZDD', ArchiveType.other),
+  // ---- 软件包 / 安装包 / 文档包 ----
+  rpm('RPM 软件包', 'RPM', ArchiveType.other),
+  ar('AR / DEB 归档', 'AR', ArchiveType.other),
+  xar('XAR 归档', 'XAR', ArchiveType.other),
+  chm('CHM / LIT 电子书', 'CHM', ArchiveType.other),
+  wim('WIM 系统映像', 'WIM', ArchiveType.other),
+  // ---- 光盘 / 磁盘映像 ----
+  iso('ISO 光盘映像', 'ISO', ArchiveType.other),
+  udf('UDF 光盘映像', 'UDF', ArchiveType.other),
+  dmg('DMG 磁盘映像', 'DMG', ArchiveType.other),
+  squashfs('SquashFS 映像', 'SQFS', ArchiveType.other),
+  cramfs('CramFS 映像', 'CRFS', ArchiveType.other),
+  qcow('QCOW 磁盘映像', 'QCOW', ArchiveType.other),
+  vdi('VDI 磁盘映像', 'VDI', ArchiveType.other),
+  vmdk('VMDK 磁盘映像', 'VMDK', ArchiveType.other),
+  vhd('VHD 磁盘映像', 'VHD', ArchiveType.other),
+  vhdx('VHDX 磁盘映像', 'VHDX', ArchiveType.other),
+  sparse('Android Sparse 映像', 'SPRS', ArchiveType.other),
+  ntfs('NTFS 卷映像', 'NTFS', ArchiveType.other),
+  unknown('未知格式', 'UNKNOWN', ArchiveType.unknown);
 
-  const SniffFormat(this.label, this.archiveType);
+  const SniffFormat(this.label, this.badge, this.archiveType);
 
   /// 给 `FormatDetectModal` 的 `realFormat` 参数用，例如「ZIP 压缩包」。
   final String label;
 
-  /// 映射回 UI 层已有的 `ArchiveType`（`typeLabel` 会取 name 的大写）。
+  /// 列表里那块 32px 见方的类型角标上的字，**最多 5 个字符**（9px 等宽字，再多
+  /// 就溢出）。与 [archiveType] 分开是因为后者只是粗分类：二十几种「已识别但
+  /// 没有专属类型」的格式都归 [ArchiveType.other]，角标却得各写各的名字。
+  final String badge;
+
+  /// 映射回 UI 层已有的 `ArchiveType`（颜色分组用）。
+  ///
+  /// 多对一是有意为之：rar4/rar5 在列表上都叫 RAR；认得出但没有专属分类的都
+  /// 归 [ArchiveType.other]。压缩类（gzip/bzip2/xz/zstd）曾经也挤在 `tar` 上，
+  /// 2026-10 拆成了各自的值。以后再加格式时，**别往已有的专属值上塞**：那是
+  /// 角标显示错的根源 —— 归 `other`，再给它自己的 [badge]。
+  ///
+  /// 注意 `unknown` 现在**只**留给真正认不出的东西（它在列表里不会出现，只给
+  /// `SniffResult.unknown` 用）；从前 cab/lzh/arj/cpio 也落在它上面，列表里会
+  /// 显示一块红色的「UNKNOWN」，那是在把已识别的格式说成不认识。
   final ArchiveType archiveType;
 }
 
 /// 各类格式「正常」应有的后缀集合，用于判断后缀是否被篡改。
 ///
 /// 故意宽松：把同族后缀都列上，避免把 `tar.gz`、`tgz` 这类正常写法误判成
-/// 篡改而弹窗骚扰用户。没有列出的格式（cab/lzh/...）不做后缀判定。
+/// 篡改而弹窗骚扰用户。没有列出的格式（cab/lzh/arj/cpio/mslz）不做后缀判定。
+///
+/// 新收的那批格式，后缀集合**抄 7-Zip 自己注册的那份**（`REGISTER_ARC_I` 的
+/// 第二个字符串）：官方认的后缀都放行，才不会把合法文件误弹成「后缀被篡改」。
+/// `img` 在多个格式里都出现 —— 那是各家映像工具共用的通名，不是笔误。
 const Map<SniffFormat, Set<String>> kFormatExtensions = {
   SniffFormat.zip: {'zip', 'zipx', 'cbz', 'jar', 'apk'},
   SniffFormat.rar4: {'rar', 'cbr'},
@@ -62,6 +115,27 @@ const Map<SniffFormat, Set<String>> kFormatExtensions = {
   SniffFormat.bzip2: {'bz2', 'tbz', 'tbz2'},
   SniffFormat.xz: {'xz', 'txz'},
   SniffFormat.zstd: {'zst', 'tzst'},
+  SniffFormat.z: {'z', 'taz'},
+  SniffFormat.ppmd: {'pmd'},
+  SniffFormat.rpm: {'rpm', 'srpm'},
+  SniffFormat.ar: {'ar', 'a', 'deb', 'udeb', 'lib'},
+  SniffFormat.xar: {'xar', 'pkg', 'xip'},
+  SniffFormat.chm: {
+    'chm', 'chi', 'chq', 'chw', 'hxs', 'hxi', 'hxr', 'hxq', 'hxw', 'lit',
+  },
+  SniffFormat.wim: {'wim', 'swm', 'esd', 'ppkg'},
+  SniffFormat.iso: {'iso', 'img', 'udf', 'bin'},
+  SniffFormat.udf: {'iso', 'img', 'udf', 'bin'},
+  SniffFormat.dmg: {'dmg'},
+  SniffFormat.squashfs: {'squashfs', 'sqfs', 'sfs', 'img'},
+  SniffFormat.cramfs: {'cramfs', 'img'},
+  SniffFormat.qcow: {'qcow', 'qcow2', 'qcow2c'},
+  SniffFormat.vdi: {'vdi'},
+  SniffFormat.vmdk: {'vmdk'},
+  SniffFormat.vhd: {'vhd'},
+  SniffFormat.vhdx: {'vhdx', 'avhdx'},
+  SniffFormat.sparse: {'simg', 'img'},
+  SniffFormat.ntfs: {'ntfs', 'img'},
 };
 
 /// 嗅探置信度。只有 `medium` 及以上才允许入队解压。
@@ -116,6 +190,7 @@ class SniffResult {
     this.baseOffset = 0,
     this.container = ContainerKind.none,
     this.header = const [],
+    this.encrypted,
   });
 
   /// 供「什么都没读出来」的情况使用。
@@ -139,6 +214,21 @@ class SniffResult {
 
   /// 文件头前若干字节，供 `FormatDetectModal` 的 `hexPreview` 使用。
   final List<int> header;
+
+  /// 这个包要不要密码才解得开。**三态，别压成 `bool`**：
+  ///
+  /// - `true`  —— 确认要（条目加密位、或归档头整体加密到根本打不开）
+  /// - `false` —— 确认不要
+  /// - `null`  —— **没查出来**：没嗅探到能判断的地方，或这会儿问不到引擎
+  ///
+  /// 「不知道」必须能得到表达：压成 `false` 就等于替引擎撒了谎，用户会在
+  /// 首页看到「需密码 0」而那个包其实是锁着的 —— 真机上就是这么被发现的。
+  /// 调用方（`scanner.dart` 的 `_flagsFor`）也只在**确认**为真时才打标，
+  /// `null` 不打。
+  ///
+  /// 谁来填：ZIP 由 `_withContainer` 从中央目录的通用位里白捡（已经在读了），
+  /// 7z / RAR 要真开一次归档，由扫描方注入的探针负责（见 `EncryptedProbe`）。
+  final bool? encrypted;
 
   /// 是否可以作为一个压缩包去解压。
   bool get isArchive =>
@@ -290,7 +380,6 @@ class ExtractOutcome {
 class ScanOptions {
   const ScanOptions({
     this.detectFakeExtension = true,
-    this.mergeSplitVolumes = true,
     this.pruneDirs = kDefaultPruneDirs,
   });
 
@@ -304,8 +393,12 @@ class ScanOptions {
   /// 不是不认。
   final bool detectFakeExtension;
 
-  /// 是否自动合并分卷（对应设置项 `splitMerge`）。
-  final bool mergeSplitVolumes;
+  // 这里曾有一项 `mergeSplitVolumes`（设置页上叫「分片自动合并」），2026-10
+  // 删掉了。分卷**总是**合并：关掉它不是换一种做法，是把 `.zip.002` 当普通
+  // 文件走一遍嗅探、认不出格式就地静默丢掉（`_emitPlain` 的
+  // `if (!sniff.isArchive) return;`，三个计数一个都不记），最后只留一行
+  // 残缺的 `.001` 给用户去解。删它的完整账见 `persist.dart` 的
+  // `kDefaultToggles`。
 
   /// 遍历时直接剪枝的目录名。避免走进回收站、系统目录、依赖缓存。
   final Set<String> pruneDirs;

@@ -68,20 +68,20 @@ class ErrorModal extends StatelessWidget {
             height: 56,
             margin: const EdgeInsets.only(bottom: 16),
             decoration: BoxDecoration(
-              color: AppTheme.neonRed.withOpacity(0.12),
+              color: AppTheme.neonRed.withValues(alpha: 0.12),
               borderRadius: BorderRadius.circular(16),
-              border: Border.all(color: AppTheme.neonRed.withOpacity(0.3)),
+              border: Border.all(color: AppTheme.neonRed.withValues(alpha: 0.3)),
             ),
             child: const Icon(Icons.error_outline,
                 color: AppTheme.neonRed, size: 28),
           ),
-          const Text('解压遇到问题',
+          const Text('解压失败',
               style: TextStyle(
                   fontSize: 17,
                   fontWeight: FontWeight.w700,
                   color: AppTheme.textPrimary)),
           const SizedBox(height: 6),
-          const Text('以下文件无法正常解压',
+          const Text('以下文件无法解压',
               style: TextStyle(
                   fontSize: 12,
                   color: AppTheme.textDim,
@@ -91,9 +91,9 @@ class ErrorModal extends StatelessWidget {
             width: double.infinity,
             padding: const EdgeInsets.all(12),
             decoration: BoxDecoration(
-              color: AppTheme.neonRed.withOpacity(0.06),
+              color: AppTheme.neonRed.withValues(alpha: 0.06),
               borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: AppTheme.neonRed.withOpacity(0.15)),
+              border: Border.all(color: AppTheme.neonRed.withValues(alpha: 0.15)),
             ),
             child: Text(fileName,
                 style: const TextStyle(

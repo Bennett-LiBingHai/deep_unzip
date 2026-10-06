@@ -1,12 +1,29 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Modify this file to customize your launch splash screen -->
-<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
-    <item android:drawable="?android:colorBackground" />
+<!-- Dart 首帧之前铺的那一屏 —— **minSdk 24 下真正生效的就是这一份**
+     （资源限定符 `-v21` 意思是「API 21 及以上」，永远压过 `drawable/` 那一份）。
 
-    <!-- You can insert your own image assets here -->
-    <!-- <item>
+     出厂模板在这里写的是 `?android:colorBackground`，它会跟着主题走：白天
+     `Theme.Light` 解析成**白色**，于是纯深色的界面在冷启动时先闪一下白。改成
+     应用自己的底色 + 居中的 logo，白天夜里都一样。
+
+     底色与 `AppTheme.bgDeep` 是同一个值，见 `values/colors.xml`。 -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:drawable="@color/duz_background" />
+
+    <!-- 居中的 logo：`drawable-*dpi/splash_logo.png`，五档各一份。
+
+         **尺寸是按「可见图形 = 240dp」导出的**，不是按画布。原始稿是一张
+         2048×2048、图形只占中间 48% 的画布（自适应图标那种留白），直接铺上来
+         会比预期小一大圈 —— 所以先按 alpha 裁到图形本身、再按 240dp 出图：
+         mdpi 240 / hdpi 360 / xhdpi 480 / xxhdpi 720 / xxxhdpi 960。
+
+         想改大小就改那个 240：五个像素值都等于它乘 1/1.5/2/3/4。
+
+         为什么不用 `mipmap/ic_launcher` 铺上来：那套是给桌面用的，图形只占
+         画布中间 2/3（自适应图标的安全区），而且没有启动屏需要的尺寸档。 -->
+    <item>
         <bitmap
             android:gravity="center"
-            android:src="@mipmap/launch_image" />
-    </item> -->
+            android:src="@drawable/splash_logo" />
+    </item>
 </layer-list>

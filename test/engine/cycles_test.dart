@@ -107,10 +107,13 @@ void main() {
   });
 
   group('深度顶', () {
-    test('maxDepth = 0（不限）仍受硬顶压制', () {
-      expect(withinDepthLimit(0, 0), isTrue);
-      expect(withinDepthLimit(kHardDepthCeiling, 0), isTrue);
-      expect(withinDepthLimit(kHardDepthCeiling + 1, 0), isFalse);
+    test('maxDepth = 0 → 不递归：任何内层包都进不来', () {
+      // 顶层（depth 0）不由这里管 —— 它本来就要解，这里拦的是解出来的内层包，
+      // 它们的 depth 从 1 起。所以 0 能过而 1 不能，正是「不递归」的形状。
+      expect(withinDepthLimit(0, 0), isTrue, reason: '顶层不受这一档管');
+      expect(withinDepthLimit(1, 0), isFalse);
+      expect(withinDepthLimit(kHardDepthCeiling, 0), isFalse,
+          reason: '0 不是「无限制」，别再放行任何内层包');
     });
 
     test('用户设了几就是几，不会被硬顶抬上去', () {
@@ -118,7 +121,7 @@ void main() {
       expect(withinDepthLimit(6, 5), isFalse);
     });
 
-    test('用户设得比硬顶还大时，取硬顶', () {
+    test('用户设得比硬顶还大时，取硬顶（硬顶不靠调用方自觉）', () {
       expect(withinDepthLimit(kHardDepthCeiling, 9999), isTrue);
       expect(withinDepthLimit(kHardDepthCeiling + 1, 9999), isFalse);
     });

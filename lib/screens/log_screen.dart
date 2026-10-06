@@ -161,7 +161,7 @@ class LogScreen extends StatelessWidget {
             const Icon(Icons.inbox_outlined, size: 48, color: AppTheme.textDim),
             const SizedBox(height: 12),
             Text(
-              filtering ? '这个分类下没有记录' : '暂无记录',
+              filtering ? '该分类下暂无记录' : '暂无记录',
               style: const TextStyle(
                 fontSize: 14,
                 color: AppTheme.textSecondary,
@@ -170,7 +170,7 @@ class LogScreen extends StatelessWidget {
             if (filtering) ...[
               const SizedBox(height: 6),
               const Text(
-                '切到「全部」看其他分类',
+                '切换到「全部」查看其他分类',
                 style: TextStyle(
                   fontSize: 11,
                   color: AppTheme.textDim,

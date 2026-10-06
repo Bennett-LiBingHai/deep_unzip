@@ -5,8 +5,9 @@
 /// - **自引用**：`a.zip` 里装着 `a.zip`（内容一模一样）。解出来又扫到它，
 ///   再解再扫……每一层都在磁盘上留下**一份真实的拷贝**，不是无害的空转。
 /// - **深度炸弹**：`a.zip` 装 `b.zip` 装 `c.zip`……每层都合法，但层数没有
-///   自然上限。用户设置里的 `maxDepth = 0`（无限制）在 UI 上是个合理的
-///   默认值，在实现层却不能真的当「无限制」用。
+///   自然上限。设置页上的 `maxDepth` 就是给它设的闸门（`0` = 不递归），
+///   但它上面还压着 [kHardDepthCeiling] 这道实现层的绝对上限 —— 用户填的
+///   数决定「要不要更深」，不决定「能有多深」。
 ///
 /// 两者都要在**入队前**拦住，不能等跑起来再发现 —— 那时磁盘已经写满了。
 library;
@@ -25,9 +26,12 @@ const int kIdentityHeadBytes = 64 * 1024;
 
 /// 递归深度的**硬顶**，用户设置再大也不能越过。
 ///
-/// 用户设置里的 `maxDepth` 有「0 = 无限制」这一档，但实现层必须有一个
-/// 绝对上限：它同时也是 `scanner.dart` 里 [kMaxScanDepth] 的量级，
-/// 两处对不上会出现「扫描器拒进的深度，解压器还在往里塞任务」。
+/// 它同时也是设置页那个输入框的**上界**（`persist.dart` 的 `kMaxMaxDepth`
+/// 直接引用的就是这一个数）：让「用户能填多少」和「代码真正允许多深」是
+/// 同一个数，省掉两处各写一份、再靠测试盯着别走散的麻烦。
+///
+/// 量级上要对齐 `scanner.dart` 里的 [kMaxScanDepth]，两处对不上会出现
+/// 「扫描器拒进的深度，解压器还在往里塞任务」。
 const int kHardDepthCeiling = 64;
 
 /// 计算一个压缩包的**身份指纹**，用于自引用检测。
@@ -69,14 +73,19 @@ bool isSelfReferential(String identity, Set<String> ancestors) =>
 
 /// 深度 [depth] 的任务允不允许入队。
 ///
-/// [maxDepth] 的语义与设置页保持一致：`<= 0` 表示「不限」，但**不限也要
-/// 服从 [kHardDepthCeiling]**。用户设了 5，就是 5，不会被硬顶抬上去。
-bool withinDepthLimit(int depth, int maxDepth) {
-  final limit = maxDepth <= 0
-      ? kHardDepthCeiling
-      : math.min(maxDepth, kHardDepthCeiling);
-  return depth <= limit;
-}
+/// [maxDepth] 的语义与设置页一致：**`0` 就是不递归**（2026-10 翻的面，
+/// 原是「0 = 无限制」；见 `persist.dart` 的 [kDefaultMaxDepth]）。所以这里
+/// 就是一个直白的 `<=`，不再有「不限」那条要换算成分支。
+///
+/// [depth] 里**目录层级也占额度**，不是只数解了几层包（`ScanItem.depth` =
+/// `baseDepth + 目录层级`，两半都算）—— 有意为之，见 `persist.dart` 那段。
+/// 这个函数不关心它由什么凑出来的，只比大小，所以这里只留一句提醒。
+///
+/// 尽管调用方（`AppState.setMaxDepth` / `coerceMaxDepth`）都已经把值夹进
+/// 范围，**这里仍然再夹一次**：[kHardDepthCeiling] 是那道「任何代码路径都
+/// 越不过去」的绝对上限，把它的正确性寄托在调用方身上，它就不再是硬顶了。
+bool withinDepthLimit(int depth, int maxDepth) =>
+    depth <= math.min(maxDepth, kHardDepthCeiling);
 
 /// 路径末段。不引 `package:path` —— 这里只需要一个「最后一段」，
 /// 而 `output_paths.dart` 已经证明了归一化写法在不同宿主机上更稳。

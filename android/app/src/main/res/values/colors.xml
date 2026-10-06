@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 窗口背景色。
+
+     这个值**必须与 `lib/theme/app_theme.dart` 的 `AppTheme.bgDeep` 保持一致**。
+     原生侧看不到 Dart 里的常量，所以这里只能手抄一份 —— 抄错的症状是「冷启动
+     时先闪一下别的颜色，再跳进真正的界面」：Dart 的首帧之前，屏幕上铺的就是
+     这个颜色（`LaunchTheme` / `NormalTheme` 的 `windowBackground`）。
+
+     `app_theme.dart` 那边是 `Color(0xFF050810)`。 -->
+<resources>
+    <color name="duz_background">#FF050810</color>
+</resources>

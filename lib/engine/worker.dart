@@ -56,6 +56,8 @@ void workerMain(SendPort toMain) {
           return;
         case CmdScan():
           await state.runScan(message);
+        case CmdScanFiles():
+          await state.runScanFiles(message);
         case CmdExtract():
           await state.runExtract(message);
       }
@@ -109,6 +111,54 @@ class _WorkerState {
         baseDepth: cmd.depth,
         onTick: (tick) => toMain.send(EvScanTick(jobId: cmd.jobId, tick: tick)),
         isCancelled: () => epoch != _cancelEpoch,
+        // 7z / RAR 的「要不要密码」只能真开一次归档才知道，ZIP 由嗅探侧白捡
+        // （见 `probeEncrypted` 的说明）。这里注入的是**原生**那一份 ——
+        // 扫描跑在 worker isolate 里，也就在这儿原生库才真的可用。
+        probeEncrypted: probeEncrypted,
+      );
+      toMain.send(EvScanDone(
+        jobId: cmd.jobId,
+        summary: summary,
+        elapsed: watch.elapsed,
+      ));
+    } catch (e, st) {
+      toMain.send(EvFailed(
+        jobId: cmd.jobId,
+        message: '扫描失败：$e',
+        detail: st.toString(),
+      ));
+    } finally {
+      _busy = false;
+    }
+  }
+
+  /// 扫描用户点名的文件。与 [runScan] 结构相同，差别只在下游调哪个入口 ——
+  /// 取消也一样白捡：同一个 `_cancelEpoch` 机制，照抄那个闭包。
+  Future<void> runScanFiles(CmdScanFiles cmd) async {
+    if (_busy) {
+      toMain.send(EvFailed(
+        jobId: cmd.jobId,
+        message: '上一个任务还没结束，拒绝并发扫描',
+      ));
+      return;
+    }
+
+    _busy = true;
+    final epoch = _cancelEpoch;
+    final watch = Stopwatch()..start();
+
+    try {
+      final summary = await scanFileList(
+        cmd.paths,
+        options: cmd.options,
+        // **必须显式传 0**：`scanFileList` 的默认是 1（为嵌套发现调的），
+        // 顶层用默认值会让每一行都带着「嵌套一层」的缩进显示。
+        baseDepth: 0,
+        ignoreContainers: cmd.ignoreContainers,
+        expandSplitVolumes: cmd.expandSplitVolumes,
+        onTick: (tick) => toMain.send(EvScanTick(jobId: cmd.jobId, tick: tick)),
+        isCancelled: () => epoch != _cancelEpoch,
+        probeEncrypted: probeEncrypted,
       );
       toMain.send(EvScanDone(
         jobId: cmd.jobId,
@@ -188,6 +238,9 @@ class _WorkerState {
         code: e is EngineException ? e.code : null,
         // 炸弹裁决也跨过去：主 isolate 要凭它区分「包坏了」和「是炸弹」。
         breach: e is EngineException ? e.breach : null,
+        // 「说不清是密码错还是文件坏」同样跨过去 —— 它不影响路由（弹窗照弹、
+        // 候选照试），但**弹窗上那句话按它分岔**，漏掉就退回到「密码不正确」。
+        uncertain: e is EngineException && e.uncertain,
       ));
     } finally {
       _busy = false;
@@ -221,6 +274,9 @@ class _WorkerState {
       options: cmd.options,
       baseDepth: cmd.depth + 1,
       isCancelled: isCancelled,
+      // 嵌套包也照探：解出来一个带密码的 7z，用户该在列表上直接看见「需密码」，
+      // 而不是等点了「开始解压」才发现。与顶层扫描用的是同一份探针。
+      probeEncrypted: probeEncrypted,
     );
     return summary.items;
   }

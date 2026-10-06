@@ -170,10 +170,10 @@ const String kCustomLimitLabel = '自定义';
 /// [LimitThresholds.ratioFloorBytes]），只有让比值检查更保守的作用，
 /// 摆到用户面前只会多一个看不懂的旋钮。
 enum LimitField {
-  entries('条目数上限', '一个包最多多少个文件'),
-  entryBytes('单文件上限', '单个文件解出来最大多少'),
-  totalBytes('解压总量上限', '一个包解出来一共最大多少'),
-  ratio('压缩比上限', '解压后大小 / 磁盘占用 的封顶倍数');
+  entries('条目数上限', '单个压缩包解出的文件数上限'),
+  entryBytes('单文件上限', '单个解压文件的大小上限'),
+  totalBytes('解压总量上限', '单个压缩包解压后的总量上限'),
+  ratio('压缩比上限', '解压后大小与压缩包大小的比值上限');
 
   const LimitField(this.label, this.hint);
 
@@ -355,7 +355,7 @@ LimitBreach? checkArchiveLimits(
       kind: LimitKind.diskSpace,
       tag: '空间不足',
       message: '解压后需要 ${formatBytes(p.unpackedBytes)}，'
-          '设备只剩 ${formatBytes(availableBytes)}，装不下，已放弃',
+          '设备仅剩 ${formatBytes(availableBytes)}，空间不足，已放弃',
     );
   }
 
@@ -368,7 +368,7 @@ LimitBreach? checkArchiveLimits(
         tag: '炸弹防护',
         message: '${formatBytes(p.compressedBytes)} 的包解出来有 '
             '${formatBytes(p.unpackedBytes)}（${formatCount(ratio)}:1），'
-            '形态像压缩炸弹，已放弃',
+            '疑似压缩炸弹，已放弃',
       );
     }
   }

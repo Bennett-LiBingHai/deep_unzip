@@ -1,8 +1,12 @@
+import 'package:deep_unzip/data/builtin_extractors.dart';
 import 'package:deep_unzip/data/persist.dart';
 import 'package:deep_unzip/engine/limits.dart';
 import 'package:deep_unzip/providers/app_state.dart';
+import 'package:deep_unzip/screens/about_screen.dart';
 import 'package:deep_unzip/screens/settings_screen.dart';
 import 'package:deep_unzip/theme/app_theme.dart';
+import 'package:deep_unzip/widgets/custom_button.dart';
+import 'package:deep_unzip/widgets/modals/value_input_modal.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -34,11 +38,14 @@ void main() {
 
   tearDown(() => state.dispose());
 
-  Future<void> pumpSettings(WidgetTester tester) async {
+  Future<void> pumpSettings(WidgetTester tester, {double height = 2800}) async {
     // 设置页比一屏长得多（递归/识别/错误/炸弹/日志/扩展六组），默认 800×600
     // 会把炸弹防护那组整个挤出视口。调高画布让六组全部落在视口内 ——
     // `ListView` 是按视口惰性挂载的，没进视口的那组连 `find` 都找不到。
-    await tester.binding.setSurfaceSize(const Size(800, 2800));
+    //
+    // 解压方式那一组（十几张卡片）比其余几组加起来还长，盯它的用例得再高一截，
+    // 所以留了这个口子。
+    await tester.binding.setSurfaceSize(Size(800, height));
     addTearDown(() => tester.binding.setSurfaceSize(null));
     await tester.pumpWidget(MaterialApp(
       theme: AppTheme.dark,
@@ -182,7 +189,7 @@ void main() {
     await tester.enterText(find.byType(TextField), '十万');
     await tester.pump();
 
-    expect(find.text('无法识别，改完再试'), findsOneWidget);
+    expect(find.text('无法识别，请修改后重试'), findsOneWidget);
 
     // `warnIfMissed: false` 是**必须**的，不是图省事：置灰的实现是
     // `IgnorePointer`，所以这颗按钮真的收不到指针事件 —— 打不中正是要验的
@@ -305,6 +312,264 @@ void main() {
 
     // 悄悄夹成 5000 会让用户以为自己填的数生效了。
     expect(state.maxLogs, kDefaultMaxLogs);
+    expect(find.byType(TextField), findsOneWidget, reason: '没救回来就不该关弹窗');
+  });
+
+  // ---------------------------------------------------------------------------
+  // 最大递归深度（2026-10 改的）
+  // ---------------------------------------------------------------------------
+  //
+  // 这次一起动了两件事：那颗与它重复的「递归解压」开关撤掉，以及从「在
+  // {0,5,10,20} 上循环」换成自由输入 —— `0` 的含义也从「无限制」翻成
+  // 「不递归」。语义本身由 `cycles_test.dart` / `app_state_test.dart` 钉着，
+  // 这里管的是**用户实际看到的那两颗字**：chip 上写什么、弹窗怎么回话。
+  //
+  // 「0 显示成『不递归』而不是『0 层』」是这截 UI 里唯一有歧义的地方 ——
+  // 「0 层」读起来像是「浅浅地往下一层」，正好是反的。
+
+  /// 「最大递归深度」那一行。
+  Finder depthRow() => find.ancestor(
+        of: find.text('最大递归深度'),
+        matching: find.byType(Row),
+      );
+
+  /// 深度那一行上的三个文本：`[名字, 说明, chip 上的值]`。
+  List<String> depthRowTexts(WidgetTester tester) {
+    final texts = tester
+        .widgetList<Text>(find.descendant(of: depthRow(), matching: find.byType(Text)))
+        .map((t) => t.data)
+        .whereType<String>()
+        .toList();
+    expect(texts, hasLength(3),
+        reason: '深度那一行该有「名字 + 说明 + 值」三个文本，实际是 $texts');
+    return texts;
+  }
+
+  /// 那一行右侧 chip 上的字。
+  ///
+  /// 取**最后一个**文本而不是第二个：与 [rowValue] 那几行不同，这一行有
+  /// 「名字 + 说明 + 值」三个文本（阈值那几行没有说明）。
+  String depthChipLabel(WidgetTester tester) => depthRowTexts(tester).last;
+
+  /// 打开深度的输入框。返回时弹窗开着。
+  Future<void> openDepth(WidgetTester tester) async {
+    await tester.tap(find.text(depthChipLabel(tester)));
+    await tester.pumpAndSettle();
+    expect(find.byType(TextField), findsOneWidget, reason: '深度的弹窗没打开');
+  }
+
+  testWidgets('「递归解压」那颗开关整颗撤掉，取代它的是可填的深度 chip', (tester) async {
+    await pumpSettings(tester);
+
+    // 查的是**界面**而不是 `kDefaultToggles`：键从表里删了但界面还挂着一颗，
+    // 那颗会静默读成 false（也就是「关着」）—— 表那半由 settings_repo_test
+    // 钉，这里钉这一半。
+    expect(find.text('递归解压'), findsNothing,
+        reason: '与深度重复的那颗开关该整颗撤掉，不是只把行为接过去');
+
+    expect(find.text('最大递归深度'), findsOneWidget);
+    expect(depthChipLabel(tester), '$kDefaultMaxDepth 层');
+    expect(pencilIn('最大递归深度'), findsOneWidget, reason: '自由输入的行才带笔');
+  });
+
+  testWidgets('「目录对称输出」换成了「自定义输出目录」，右边不带 chip', (tester) async {
+    await pumpSettings(tester);
+
+    // 旧名字描述的是**布局**（输出与源目录结构一致），而那个布局从来就是唯一
+    // 的行为 —— `resolveOutputDir` 不读任何开关。所以那颗开关的值对磁盘没有
+    // 任何影响，用户却以为自己关掉过什么。
+    expect(find.text('目录对称输出'), findsNothing,
+        reason: '描述「从来就如此」的开关是假开关，该整颗换掉');
+
+    expect(find.text('自定义输出目录'), findsOneWidget);
+    final row = find.ancestor(
+      of: find.text('自定义输出目录'),
+      matching: find.byType(Row),
+    );
+    final texts = tester
+        .widgetList<Text>(find.descendant(of: row, matching: find.byType(Text)))
+        .map((t) => t.data)
+        .whereType<String>()
+        .toList();
+    expect(texts, hasLength(2),
+        reason: '这一行该只有「名字 + 说明」——根目录每次重选、不落盘，'
+            '没有任何值可以摆在右边，别硬加一个显示「未选择」的 chip');
+    expect(texts[1], contains('根目录'));
+    expect(texts[1], contains('同级'), reason: '关掉之后是什么行为也要交代');
+
+    final toggle = find.descendant(of: row, matching: find.byType(NeonToggle));
+    expect(tester.widget<NeonToggle>(toggle).value, isFalse,
+        reason: '出厂关着 —— 也就是升级前**实际**发生的那件事');
+
+    // 接线也要真接上，不能只摆一颗好看的开关。
+    await tester.tap(toggle);
+    await tester.pumpAndSettle();
+    expect(state.setting('customOutput'), isTrue);
+  });
+
+  testWidgets('「支持的格式」默认折叠，只露出一个计数头', (tester) async {
+    await pumpSettings(tester, height: 9000);
+
+    // 三十来种格式、每张卡片三四行，展开就是两三千像素 —— 默认折叠，点开再看。
+    expect(find.text('${BuiltinExtractors.all.length} 种格式'), findsOneWidget);
+    expect(find.text('内置 7-Zip 核心'), findsNothing,
+        reason: '折叠时一张卡片都不该渲染出来');
+  });
+
+  testWidgets('展开后每一条都摆出「识别」和「解压」，且没有 SINGLE/SPLIT', (tester) async {
+    await pumpSettings(tester, height: 9000);
+    await tester.tap(find.text('${BuiltinExtractors.all.length} 种格式'));
+    await tester.pumpAndSettle();
+
+    // 从前每张卡片只有一行被截到 60 字符的示意代码，**解压那栏压根没显示过**
+    // —— 于是表里那句 `unzip -o {file} -d {dir}` 没有任何人会发现。
+    expect(find.text('内置 7-Zip 核心'),
+        findsNWidgets(BuiltinExtractors.all.length),
+        reason: '每一条都该交代自己拿什么解，而答案只有这一个');
+
+    // 那个假的二分整颗拆掉了：分卷是属性，不是跟「单文件」并列的一类。
+    expect(find.text('SINGLE'), findsNothing);
+    expect(find.text('SPLIT'), findsNothing);
+    expect(find.text('单文件'), findsNothing);
+
+    // 真支持的格式要看得见。用 `findsWidgets` 而不是 `findsOneWidget`：TAR 这类
+    // 格式的方框标签跟名字是同一个字符串，会命中两个。
+    expect(find.text('7-Zip'), findsWidgets);
+    expect(find.text('CPIO'), findsWidgets);
+    expect(find.text('ISO'), findsWidgets);
+    expect(find.text('WIM'), findsWidgets);
+    expect(find.text('DMG'), findsWidgets);
+
+    // 再点一下收回去。
+    await tester.tap(find.text('${BuiltinExtractors.all.length} 种格式'));
+    await tester.pumpAndSettle();
+    expect(find.text('内置 7-Zip 核心'), findsNothing);
+  });
+
+  testWidgets('展开状态不被 AppState 的通知冲掉', (tester) async {
+    // `SettingsScreen` 外面套着 `ListenableBuilder`，每次 `AppState` 通知都整段
+    // 重建。折叠位若放在它的方法里，任何一个开关一拨就会被重置回折叠 ——
+    // 用户刚展开想看的东西自己合上了。
+    await pumpSettings(tester, height: 9000);
+    await tester.tap(find.text('${BuiltinExtractors.all.length} 种格式'));
+    await tester.pumpAndSettle();
+    expect(find.text('内置 7-Zip 核心'), findsWidgets);
+
+    state.toggleSetting('errorPause');
+    await tester.pumpAndSettle();
+
+    expect(find.text('内置 7-Zip 核心'), findsWidgets,
+        reason: '拨一个无关的开关，展开状态要原样留着');
+  });
+
+  testWidgets('注册新解压方式的入口已经撤掉', (tester) async {
+    // 那个入口从来没接到引擎上：`addExtractor` 只往列表里加一行，识别靠嗅探表、
+    // 解压靠内置 7-Zip 核心，没有任何一边读它，「已注册」的 toast 是假的。
+    await pumpSettings(tester, height: 9000);
+    await tester.tap(find.text('${BuiltinExtractors.all.length} 种格式'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('注册新的解压方式'), findsNothing);
+    expect(find.text('解压方式扩展'), findsNothing, reason: '旧栏目名');
+    expect(find.text('支持的格式'), findsOneWidget);
+    expect(find.byIcon(Icons.delete_outline), findsNothing,
+        reason: '全部是内置的，没有哪一行删得掉');
+  });
+
+  testWidgets('「关于」入口在设置页最底下，点了能进关于页', (tester) async {
+    // 这个入口不是「看一眼版本」那么简单：开源许可全文只能从这里到达，而那是
+    // LGPL / BSD 要求分发时必须能拿到的东西。
+    await pumpSettings(tester, height: 9000);
+
+    await tester.drag(find.byType(ListView), const Offset(0, -6000));
+    await tester.pumpAndSettle();
+
+    expect(find.text('关于 DeepUnzip'), findsOneWidget);
+    await tester.tap(find.text('关于 DeepUnzip'));
+    await tester.pumpAndSettle();
+
+    expect(find.byType(AboutScreen), findsOneWidget);
+    expect(find.text('不联网 · 不收集个人信息'), findsOneWidget);
+  });
+
+  testWidgets('深度的说明把「子目录」和「嵌套包」两种都写出来', (tester) async {
+    // 曾经只写了后半句（「解压出来的包再往下解几层」），而 `ScanItem.depth`
+    // 实际是 `baseDepth + 目录层级` —— 两种**同等计入**。按那半句理解，用户
+    // 会以为「子目录里的包被少解了一层」，而这其实是有意为之。
+    //
+    // 这条钉的是**说法本身**：字符串没写全就是 bug，不需要行为出错才叫 bug。
+    await pumpSettings(tester);
+
+    final desc = depthRowTexts(tester)[1];
+    expect(desc, contains('子目录'), reason: '说明里少了「进子目录也算一层」这半句：$desc');
+    expect(desc, contains('嵌套包'), reason: '说明里少了「解嵌套包算一层」那半句：$desc');
+
+    await openDepth(tester);
+    // 弹窗那份说明是**另一处**写的（`MaxDepthModal`），不是复用行上这句 ——
+    // 所以两处都得钉。`find.descendant` 是必须的：行上那句还在树里（弹窗是
+    // 浮在它上面的），全页找会同时撞上两个，看不出是哪一处漏了。
+    final subtitle = find.descendant(
+      of: find.byType(ValueInputModal),
+      matching: find.textContaining('层'),
+    );
+    expect(
+      tester.widgetList<Text>(subtitle).map((t) => t.data).join(),
+      allOf(contains('子目录'), contains('嵌套包')),
+      reason: '弹窗的说明与行上那句要写全同两件事',
+    );
+  });
+
+  testWidgets('深度填 0 → chip 与弹窗都说「不递归」，不说「0 层」', (tester) async {
+    await pumpSettings(tester);
+    await openDepth(tester);
+
+    expect(tester.widget<TextField>(find.byType(TextField)).controller!.text,
+        '$kDefaultMaxDepth', reason: '预填当前值');
+
+    await tester.enterText(find.byType(TextField), '0');
+    await tester.pump();
+    expect(find.text('= 不递归'), findsOneWidget,
+        reason: '0 是「关」而不是「浅浅地解一层」，预览行就得这么说');
+
+    await tester.tap(find.text('确定'));
+    await tester.pumpAndSettle();
+
+    expect(find.byType(TextField), findsNothing, reason: '确定之后弹窗该关掉');
+    expect(state.maxDepth, 0);
+    expect(depthChipLabel(tester), '不递归',
+        reason: 'chip 与弹窗必须是同一套说法，不然用户点开前不知道该信哪个');
+  });
+
+  testWidgets('深度是自由输入：填 7 就是 7，不吸附到档位', (tester) async {
+    await pumpSettings(tester);
+    await openDepth(tester);
+
+    await tester.enterText(find.byType(TextField), '7');
+    await tester.pump();
+    expect(find.text('= 最多 7 层'), findsOneWidget);
+
+    await tester.tap(find.text('确定'));
+    await tester.pumpAndSettle();
+
+    expect(state.maxDepth, 7, reason: '不再是 {0,5,10,20} 那张表，7 不该被挪走');
+    expect(depthChipLabel(tester), '7 层');
+  });
+
+  testWidgets('深度填到上界之外：说清上限，不给提交', (tester) async {
+    await pumpSettings(tester);
+    await openDepth(tester);
+
+    await tester.enterText(find.byType(TextField), '${kMaxMaxDepth + 1}');
+    await tester.pump();
+    expect(find.text('最多 $kMaxMaxDepth 层'), findsOneWidget,
+        reason: '越界要在预览行上直说');
+
+    // `warnIfMissed: false` 的理由同上面两条：置灰靠 `IgnorePointer`。
+    await tester.tap(find.text('确定'), warnIfMissed: false);
+    await tester.pumpAndSettle();
+
+    // 悄悄夹成 64 会让用户以为自己填的数生效了。
+    expect(state.maxDepth, kDefaultMaxDepth);
     expect(find.byType(TextField), findsOneWidget, reason: '没救回来就不该关弹窗');
   });
 }

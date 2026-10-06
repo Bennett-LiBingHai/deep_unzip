@@ -1,8 +1,8 @@
 /// 三层节流的第一层：worker 侧的按时间丢样。
 ///
-/// 第二层（主 isolate 的 8Hz 尾沿节流）在 `controller_test.dart` 的
-/// 「节流」组里测 —— 扫描与解压共用同一个泛型 `_TickThrottle`，所以那组用例
-/// 结论对两条路径都成立。
+/// 第二层（主 isolate 的 8Hz 尾沿节流）的**机制**在 `tick_throttle_test.dart`，
+/// 它**接得对不对**在 `controller_test.dart` 的「节流」组里 —— 扫描与解压共用
+/// 同一个泛型 `TickThrottle`，所以那组关于扫描的用例，机制上对解压也成立。
 library;
 
 import 'package:deep_unzip/engine/controller.dart' show kProgressThrottle;

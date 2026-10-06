@@ -48,6 +48,17 @@ class FakeEngine extends EngineController {
   /// 依次收到的 `recursive` 开关，与 [outDirs] 等长同序。
   final List<bool> recursiveSeen = [];
 
+  /// 依次收到的候选密码，与 [outDirs] 等长同序。
+  ///
+  /// 一次 `extract` 就是一次尝试，所以「这个包一共被试着解了几次、按什么顺序
+  /// 试的」全在这张表里 —— 密码库那条链路只有这里能钉住（真引擎要 Android）。
+  ///
+  /// **开局那次「空密码」是空串 `''`，不是 `null`**，整条路也不该出现 `null`
+  /// —— 原生 ZIP 路径上这是两个值两件事（见 `app_state.dart` 的
+  /// `_kEmptyPassword`）。表里留 `String?` 只是不想让「到底送了没送」这件事
+  /// 变得不可断言。
+  final List<String?> passwordsSeen = [];
+
   /// 依次收到的目标卷剩余字节数，与 [outDirs] 等长同序。
   ///
   /// `null` = 那一刻没量到（非 Android、通道没注册），空间检查会被跳过。
@@ -62,6 +73,29 @@ class FakeEngine extends EngineController {
   /// `_findNested`）；这里直接喂，测试就不必去磁盘上真摆一层目录。
   final Map<String, List<ScanItem>> nestedFor = {};
 
+  /// 依次收到的「扫描时要跳过的目录」。
+  ///
+  /// 扫描本身**照跑真的**（见文件头），所以这里只是**记一笔再交给
+  /// `super.scan`** —— 不是把扫描换掉。钉的是「选过输出根之后，它真的随
+  /// 命令传下去了」这条线，也就是防自噬那一半。
+  final List<Set<String>> skipDirsSeen = [];
+
+  @override
+  Future<ScanOutcome> scan({
+    required String rootPath,
+    ScanOptions options = const ScanOptions(),
+    Set<String> skipDirs = const {},
+    int depth = 0,
+  }) {
+    skipDirsSeen.add(skipDirs);
+    return super.scan(
+      rootPath: rootPath,
+      options: options,
+      skipDirs: skipDirs,
+      depth: depth,
+    );
+  }
+
   @override
   Future<ExtractOutcome> extract({
     required List<String> parts,
@@ -75,6 +109,9 @@ class FakeEngine extends EngineController {
   }) async {
     outDirs.add(outDir);
     partsSeen.add(parts);
+    // 记在 `behavior` **之前**：用例要能读到「这一次带的是哪个密码」，
+    // 而抛不抛异常正是 `behavior` 说了算的。
+    passwordsSeen.add(password);
     depthsSeen.add(depth);
     recursiveSeen.add(recursive);
     limitsSeen.add(limits);

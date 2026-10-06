@@ -61,6 +61,73 @@ ArchivePeek peekArchive(List<String> parts, {String? password}) {
   }
 }
 
+/// 扫描期的加密探针，喂给 `scanner.dart` 的 `EncryptedProbe`。
+///
+/// ## 为什么只有 7z 与 RAR 走这里
+///
+/// ZIP **不用问**：它的通用位就摊在中央目录的每条条目上，而扫描期为了认容器
+/// 格式**已经在读**那份条目录了，加密位是白捡的（见 `sniff.dart` 的
+/// `_withContainer`）。
+///
+/// 7z 与 RAR 则**没有**随手可读的加密位：7z 的头自己可能就被 LZMA 压着，
+/// RAR 的头部块要过 CRC 才算得上数。纯 Dart 去认等于手搓半个解析器，而手写
+/// 解析器在这个仓库里已经翻过一次车（`tool/make_password_fixtures.py` 里那套
+/// 自己写的 ZipCrypto）。所以这两种老实开一次归档问引擎 —— 代价是每见到一个
+/// 7z/RAR 就多一次 `duz_open`，但那本来就是列条目级的活，不减压。
+///
+/// 底下那个格式判断是**策略，不是机制**。机制上这条路对谁都成立：加密位来自
+/// 每个条目的 `kpidEncrypted`（见 `duz_engine.cpp` 的 `duz_list`），那是引擎
+/// 的通用属性，ZIP/7z/RAR/CAB… 谁实现了谁有。闸只开给 7z 与 RAR，是因为
+/// **别的格式没验过** —— CAB 与 LZH 规范上也能带密码，但引擎报不报得出加密位、
+/// 报出来准不准，这一格没有夹具可造（本机没有 CAB 写入器），也没在真机上见过
+/// 一个加密 CAB。没验过就先不标：标错的代价是用户看着「需密码」去解压、结果
+/// 根本不问密码；不标的代价只是少一个角标。要扩就是往上面那个条件里加格式，
+/// 但加之前先拿一个真的加密夹具把这两件事都验过。
+///
+/// ## 绝不把异常抛出去
+///
+/// 答不出来时回 `null`（「不知道」），扫描照常继续：**一个包的加密探测失败不该
+/// 把整次扫描带下水**。上层也只认 `true`（`scanner.dart` 的 `_flagsFor` 只在
+/// `encrypted == true` 时打标），所以这里含糊一点是安全的，撒谎才危险。
+///
+/// 同步的 —— 原生 `peekArchive` 本来就是同步的，探针签名也是同步的。别在这里
+/// await：扫描期每条目 await 一次会把并发扫描的节奏全打乱。
+bool? probeEncrypted(List<String> parts, SniffFormat format) {
+  // `rar4` / `rar5` 是两套头结构，但「要不要密码」这一问两边走的是同一条路。
+  if (format != SniffFormat.sevenZ &&
+      format != SniffFormat.rar4 &&
+      format != SniffFormat.rar5) {
+    return null;
+  }
+  if (_engineUnusable) return null;
+  try {
+    return peekArchive(parts).hasEncryptedEntries;
+  } on EngineException catch (e) {
+    if (e.code == DuzErrorCode.password) {
+      // 归档头整体加密时**连打开都打不开**，而那正是「要密码」最硬的证据：
+      // 这种包连条目清单都给不出来。见 `duz_engine.cpp` 的
+      // `DescribeOpenFailure` —— 它把 `PasswordWasAsked ||
+      // kpv_ErrorFlags_EncryptedHeadersError` 映射成 `DUZ_ERR_PASSWORD`。
+      return true;
+    }
+    // `unsupported` = 这个构建压根没编入引擎（宿主机上跑扫描就是这种）。那
+    // 是**整趟**都不成立的前提，记下来别再试；而「包坏了 / 格式不认识」是
+    // **这个包**自己的问题，别的包照样值得一问，所以不能复用那个结论。
+    if (e.code == DuzErrorCode.unsupported) _engineUnusable = true;
+    return null;
+  } catch (_) {
+    // 引擎整个加载不了 —— 宿主机上跑 `flutter test` 就是这种情况，Windows 没有
+    // `libdeep_unzip_engine.so`。置位后这一趟里其余的包就不再白试一遍。
+    _engineUnusable = true;
+    return null;
+  }
+}
+
+/// 原生库加载不了时置位，见 [probeEncrypted]。
+///
+/// 只在 worker isolate 里活 —— 扫描就是在那儿跑的，跨 isolate 也不需要共享。
+bool _engineUnusable = false;
+
 /// 解压 [parts]（顺序已定）到 [outDir]。
 ///
 /// [outDir] 不存在时会被创建 —— 原生侧只往里写、不建目录，而调用方
@@ -185,11 +252,17 @@ engine.DuzArchive _open(List<String> parts, String? password) {
 /// `test/engine/error_codes_test.dart` 保证。
 EngineException _translate(engine.DuzEngineException e) {
   final hint = switch (e.code) {
-    DuzErrorCode.password => '（归档需要密码，或给的密码不对）',
+    // 分不清的那一档（7z 的内容加密、RAR3）不能说成「密码不对」—— 那是把
+    // 我们并不知道的事说成结论。原生文案本来就写着「或加密数据已损坏」，
+    // 这里只把「分不出来」这层补上。
+    DuzErrorCode.password => e.uncertain
+        ? '（可能密码错误，也可能加密数据已损坏，两者无法区分）'
+        : '（归档需要密码，或密码错误）',
     DuzErrorCode.unsupported => '（本构建未编入 7-Zip 核心，或格式不被支持）',
     DuzErrorCode.noMem => '（内存不足）',
-    DuzErrorCode.arg => '（参数非法）',
+    DuzErrorCode.arg => '（参数无效）',
     _ => '',
   };
-  return EngineException('${e.message}$hint', code: e.code);
+  return EngineException('${e.message}$hint',
+      code: e.code, uncertain: e.uncertain);
 }

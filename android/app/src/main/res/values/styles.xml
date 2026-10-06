@@ -1,18 +1,28 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- 窗口主题。
+
+     **这份是白天模式下的那一份，而它就是本应用日常用到的那份。** 界面是纯深色
+     （`main.dart` 只给了 `theme: AppTheme.dark`，没有 `darkTheme` / `themeMode`），
+     所以主题不该再按系统的日夜切换分两套 —— 出厂模板那套「白天 `Theme.Light`、
+     夜间 `Theme.Black`」会让桌面大白天亮着的大多数机器走 Light 分支：冷启动闪
+     白屏、状态栏图标在深色底上变成深色看不见。
+
+     所以这里两件事：
+     1. 父主题统一成 `Theme.Black.NoTitleBar`（系统栏与默认文字色按深色给）。
+     2. `windowBackground` 用应用自己的底色，不用 `?android:colorBackground`。
+
+     与之配套的还有 `values-v31/styles.xml`（Android 12+ 的系统启动画面）与
+     `drawable-v21/launch_background.xml`。 -->
 <resources>
-    <!-- Theme applied to the Android Window while the process is starting when the OS's Dark Mode setting is off -->
-    <style name="LaunchTheme" parent="@android:style/Theme.Light.NoTitleBar">
-        <!-- Show a splash screen on the activity. Automatically removed when
-             the Flutter engine draws its first frame -->
+    <!-- 进程起来之前、到 Dart 首帧为止，屏幕上铺的就是这张。 -->
+    <style name="LaunchTheme" parent="@android:style/Theme.Black.NoTitleBar">
         <item name="android:windowBackground">@drawable/launch_background</item>
     </style>
-    <!-- Theme applied to the Android Window as soon as the process has started.
-         This theme determines the color of the Android Window while your
-         Flutter UI initializes, as well as behind your Flutter UI while its
-         running.
 
-         This Theme is only used starting with V2 of Flutter's Android embedding. -->
-    <style name="NormalTheme" parent="@android:style/Theme.Light.NoTitleBar">
-        <item name="android:windowBackground">?android:colorBackground</item>
+    <!-- 首帧之后窗口的背景色（键盘弹起、转屏、对话框外的边露出来的就是它），
+         也决定 Flutter UI 底下垫的那一层。Flutter 的 Android embedding 靠
+         `io.flutter.embedding.android.NormalTheme` 这个 meta-data 找到它。 -->
+    <style name="NormalTheme" parent="@android:style/Theme.Black.NoTitleBar">
+        <item name="android:windowBackground">@color/duz_background</item>
     </style>
 </resources>

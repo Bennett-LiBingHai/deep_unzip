@@ -69,10 +69,17 @@ final DeepUnzipEngineBindings _b = DeepUnzipEngineBindings(_openLibrary());
 /// 上层靠 [code] 决定策略（换密码重试 / 跳过这个包 / 报错），
 /// [message] 只适合展示。
 class DuzEngineException implements Exception {
-  const DuzEngineException(this.code, this.message);
+  const DuzEngineException(this.code, this.message, {this.uncertain = false});
 
   final int code;
   final String message;
+
+  /// 这次失败**说不清**是密码不对还是数据已损坏（见 `duz_last_error_uncertain`）。
+  ///
+  /// **它不是路由键**：策略仍然只看 [code]，`isPasswordError` 也不看它。有它没它
+  /// 都一样要换下一个候选密码、一样要弹密码窗 —— 它只让上层的说法别在一个我们
+  /// 并不知道的事实上替用户下结论。
+  final bool uncertain;
 
   /// 归档头加密且密码不对 —— 换个候选密码重试 `DuzArchive.open` 就有意义。
   bool get isPasswordError => code == DUZ_ERR_PASSWORD;
@@ -151,7 +158,11 @@ class DuzArchive {
   /// [parts] 是分卷清单：单卷传长度为 1 的数组；多卷按**正确顺序**传全部路径
   /// （顺序由 `lib/engine/split.dart` 决定，原生侧不猜）。多卷必须与首卷同目录。
   ///
-  /// [password] 可为 null。失败抛 [DuzEngineException]；[DuzEngineException.isPasswordError]
+  /// [password] 可为 null，且 **null 与空串是两件事**：`null` 是「给不出密码」，
+  /// `''` 是「密码就是空串」。后者是一个**真候选** —— 条目级加密的 ZIP（AES /
+  /// ZipCrypto）就是靠它试出「这个包要密码」的，别把它当「没传」省掉。
+  ///
+  /// 失败抛 [DuzEngineException]；[DuzEngineException.isPasswordError]
   /// 为真时换下一个候选密码重试本方法即可。
   ///
   /// 注意密码有两种失败方式（见 duz_engine.h）：头加密的包在这里就失败，
@@ -170,16 +181,25 @@ class DuzArchive {
         strings.add(s);
         arr[i] = s.cast<Char>();
       }
-      if (password != null && password.isNotEmpty) {
+      // 只看 null，**不看长度**。这里曾经写的是
+      // `password != null && password.isNotEmpty`，于是上层送下来的空串在这里
+      // 又被折成 nullptr，C 侧 `duz_open` 只好判定「没给密码」，解压时
+      // `CryptoGetTextPassword` 回 E_NOTIMPL、整个 Extract() 被短路 ——
+      // 「需要密码」变成一句笼统的「解压失败」。空串必须原样落到 C 侧。
+      if (password != null) {
         pwd = password.toNativeUtf8();
       }
 
       final ctx = _b.duz_open(arr, parts.length, pwd?.cast<Char>() ?? nullptr);
       if (ctx == nullptr) {
-        // 这两个调用之间**不能有 await**：错误文案是 C++ 侧的 thread_local，
+        // 这几个调用之间**不能有 await**：错误文案是 C++ 侧的 thread_local，
         // 一旦控制权交出去、isolate 有机会换线程，读到的就是别人的错误。
+        //
+        // 只在**失败分支**里读：那条路上 SetOpenError 一定刚跑过，所以读到的
+        // 不是上一次调用留下的值。
         final code = _b.duz_last_open_error_code();
-        throw DuzEngineException(code, _readLastError());
+        throw DuzEngineException(code, _readLastError(),
+            uncertain: _readLastErrorUncertain());
       }
 
       // 原生侧已经把路径拷进自己的 UString 了，下面 finally 里就能安全释放。
@@ -240,7 +260,9 @@ class DuzArchive {
         nullptr,
       );
       if (rc != DUZ_OK) {
-        throw DuzEngineException(rc, _readLastError());
+        // 同 `open`：紧挨着读，且只在失败分支里读。
+        throw DuzEngineException(rc, _readLastError(),
+            uncertain: _readLastErrorUncertain());
       }
     } finally {
       // 先关回调再放路径：duz_extract_all 已经返回，回调不可能再被调用。
@@ -271,6 +293,9 @@ class DuzArchive {
     final count = calloc<Int32>();
     try {
       final rc = _b.duz_list(ctx, out, count);
+      // 这里**不读** uncertain：`duz_list` 失败时压根没碰过那两个 thread_local，
+      // 读到的会是上一次解压失败留下的残留。「分不清」只在解压阶段有意义
+      // （见 duz_engine.h），列条目这一路永远给 false 才是对的。
       if (rc != DUZ_OK) throw DuzEngineException(rc, _readLastError());
 
       final n = count.value;
@@ -321,6 +346,12 @@ String _readLastError() {
   if (p == nullptr) return '未知错误';
   return p.cast<Utf8>().toDartString();
 }
+
+/// thread_local 的「分不清密码错还是数据坏」位（见 `DuzEngineException.uncertain`）。
+///
+/// 与 [_readLastError] 同源同生命周期：**紧挨着它读**，只在失败分支里读 ——
+/// 成功返回时 C++ 侧没有刷新过这个位，读到的会是上一次失败的残留。
+bool _readLastErrorUncertain() => _b.duz_last_error_uncertain() != 0;
 
 /// 引擎版本短查询，不必打开任何归档。
 ///

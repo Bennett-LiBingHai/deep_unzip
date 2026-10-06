@@ -64,6 +64,44 @@ final class CmdScan extends WorkerCmd {
   final int depth;
 }
 
+/// 扫描**用户明确点名的那些文件**，不碰同目录里别的文件。
+///
+/// ## 为什么与 [CmdScan] 分成两个类型，而不是给它加一个可选的清单字段
+///
+/// 那个 `switch (message)` 是对 sealed 类型穷尽匹配的，加子类型会**编译期**
+/// 逼着每个分派点补分支；而塞一个「空列表算哪一种」的可选字段，只会让这件事
+/// 变成要读实现才知道。
+///
+/// 语义差别也不止「输入形状」：这条路上**容器防线让位**（用户点了一个
+/// `.docx` 就是想要它），而且**分卷会在同目录里自动补齐**（`x.zip.001` 单独
+/// 一片在解码器眼里什么都不是）。两个开关都只属于这条路，见
+/// `scanner.dart` 的 `scanFileList`。
+final class CmdScanFiles extends WorkerCmd {
+  const CmdScanFiles({
+    required this.jobId,
+    required this.paths,
+    this.options = const ScanOptions(),
+    this.ignoreContainers = true,
+    this.expandSplitVolumes = true,
+  });
+
+  final int jobId;
+
+  /// 用户点名的绝对路径。目前产品上只有「单选一个文件」，但这里收的是列表
+  /// ——引擎这一层没必要把自己钉死在单选上，而扫描器本来就支持一串。
+  final List<String> paths;
+
+  final ScanOptions options;
+
+  /// 见 `scanFileList(ignoreContainers:)`。默认 true：这条路存在的理由就是
+  /// 「用户明确选了它」。
+  final bool ignoreContainers;
+
+  /// 见 `scanFileList(expandSplitVolumes:)`。默认 true：选了分卷的一片就是想
+  /// 解一整套。
+  final bool expandSplitVolumes;
+}
+
 /// 把一组（已排好序的）分卷解压到 [outDir]。
 ///
 /// 这是**唯一**会长时间阻塞 worker 的命令：`duz_extract_all` 是一次同步
@@ -111,7 +149,7 @@ final class CmdExtract extends WorkerCmd {
   final bool recursive;
 
   /// 嵌套扫描用的扫描参数。与顶层扫描**同一份快照**，否则用户在设置里
-  /// 关掉的开关（`splitMerge` / `fakeExtDetect`）在嵌套这一层会悄悄复活。
+  /// 关掉的开关（如 `fakeExtDetect`）在嵌套这一层会悄悄复活。
   final ScanOptions options;
 
   /// 炸弹防护阈值。跟着命令一起过来，而不是让 worker 自己去读设置 ——
@@ -214,6 +252,7 @@ final class EvFailed extends WorkerEvent {
     this.detail,
     this.code,
     this.breach,
+    this.uncertain = false,
   });
 
   /// 0 表示「不属于任何任务」（例如协议本身出错）。
@@ -233,6 +272,18 @@ final class EvFailed extends WorkerEvent {
   ///
   /// [LimitBreach] 全是 `enum` + `String`，是平凡数据，可以跨 isolate 送。
   final LimitBreach? breach;
+
+  /// 这次失败**说不清**是密码不对还是数据已损坏（见 [EngineException.uncertain]）。
+  ///
+  /// 理由同 [code] 与 [breach]：**它必须显式跨 isolate 传**。它不是路由键，
+  /// 但它是**说法**，而 `EngineException` 是在主 isolate 这头重新组出来的 ——
+  /// 漏掉这一格不会报任何错，只会让弹窗照旧替用户断言「密码不正确」。
+  ///
+  /// 这个坑真踩过：`uncertain` 一开始只加到了 [EngineException] 上，两条
+  /// `EvFailed` 的搬运点都没跟上，于是真机上 `enc7z_content.7z` 走的一直是
+  /// 「密码不正确」那句。单测全绿，因为假引擎直接抛 `EngineException`、
+  /// 压根不过这道 isolate 边界。
+  final bool uncertain;
 }
 
 // ---------------------------------------------------------------------------
@@ -270,7 +321,8 @@ abstract final class DuzErrorCode {
 
 /// 引擎侧失败，由 `EngineController` 的 Future 抛出。
 class EngineException implements Exception {
-  const EngineException(this.message, {this.detail, this.code, this.breach});
+  const EngineException(this.message,
+      {this.detail, this.code, this.breach, this.uncertain = false});
 
   final String message;
   final String? detail;
@@ -292,6 +344,19 @@ class EngineException implements Exception {
   /// 小于 -6 就是 Dart 侧的错误」这种脆弱约定），直接 `breach != null`。
   /// P3 的弹窗要区分「损坏 → 跳过」「炸弹 → 暂停并问用户」，靠的就是它。
   final LimitBreach? breach;
+
+  /// 这次失败**说不清**是密码不对还是数据已损坏。与 [breach] 同一种位置：**刻意
+  /// 不走 [code]**，理由也一样 —— 路由不变，只是多层一个说法。
+  ///
+  /// 只可能在 [code] == [DuzErrorCode.password] 时为真，且只可能来自**解压**：
+  /// 加密条目的数据压根没解开，而那种加密没有校验字（7z、RAR3），错密码和坏数据
+  /// 在解码器眼里一模一样。ZIP / RAR5 有校验字，7-Zip 亲口报 `kWrongPassword`，
+  /// 那两档恒为 false。
+  ///
+  /// **判策略不要看它**：`_PwdAttempt.isPasswordError`、换候选密码、弹密码窗
+  /// 全都不该碰它。它的去处只有一个 —— 说法（弹窗上那句「两者无法区分」、
+  /// 日志标签「密码或损坏」）。
+  final bool uncertain;
 
   @override
   String toString() =>

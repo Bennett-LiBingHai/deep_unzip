@@ -34,7 +34,6 @@ dependencies:
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
-  file_picker: ^13.1.0
   path: ^1.9.1
   path_provider: ^2.1.6
   # 大版本刻意压在 12：permission_handler 13 起依赖 permission_handler_android
@@ -54,7 +53,6 @@ dependencies:
     path: packages/deep_unzip_engine
   shared_preferences: ^2.5.5
   flutter_secure_storage: ^11.2.0
-
 dev_dependencies:
   flutter_test:
     sdk: flutter
@@ -76,6 +74,23 @@ flutter:
   # included with your application, so that you can use the icons in
   # the material Icons class.
   uses-material-design: true
+
+  # 开源许可全文。「关于」页要把它们原样显示出来 —— LGPL-2.1 §6 明说必须附上
+  # 本许可的一份副本，而 APK 里没有第二个地方能放它。
+  #
+  # `7zip.txt` 是 `packages/deep_unzip_engine/third_party/7zip/DOC/License.txt`
+  # 的副本：升级 7-Zip 时**要重新拷一份**（`about_screen_test.dart` 会比对两份
+  # 是否一致，忘了会被拦下来）。
+  #
+  # `logo.png` 是应用标记（首页头部那一块），从桌面图标那份 2048×2048 的原稿
+  # 按 alpha 裁掉留白后导出的 384×384。Android 侧那些 `res/` 下的图标 Flutter
+  # 读不到，所以这份是单独的资源。
+  #
+  # **改了 `res/` 里的图标要顺手重导这一份**，否则首页头部会停在旧图形上 ——
+  # 两处没有自动的关联，`test/android/res_theme_test.dart` 会盯着这件事。
+  assets:
+    - assets/licenses/
+    - assets/logo.png
 
   # To add assets to your application, add an assets section, like this:
   # assets:

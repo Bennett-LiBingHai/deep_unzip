@@ -91,6 +91,7 @@ class _MainShellState extends State<MainShell> {
     // 的路已按用户要求去掉。
     prompt: const DialogBridge().askCantExtract,
     formatPrompt: const DialogBridge().askFormatDetect,
+    passwordPrompt: const DialogBridge().askPassword,
     persistStore: widget.store,
     restore: widget.snapshot,
   );

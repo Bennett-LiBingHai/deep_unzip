@@ -82,6 +82,102 @@ void main() {
       expectFormat([0x2D, 0x6C, 0x68, 0x35, 0x2D], SniffFormat.lzh, at: 2);
     });
 
+    // ---- 软件包 / 光盘与磁盘映像那一批（2026-10 补）-----------------------
+    //
+    // 每一串都照 7-Zip 自己的 `REGISTER_ARC_I`（各 `*Handler.cpp` 的
+    // `k_Signature`）抄。这里**逐格式单独断言**，不写成一个循环：哪个签名抄
+    // 错了，失败信息要能直接指到是哪个格式。
+
+    test('WIM / RPM / AR / XAR', () {
+      expectFormat([0x4D, 0x53, 0x57, 0x49, 0x4D, 0, 0, 0], SniffFormat.wim);
+      expectFormat([0xED, 0xAB, 0xEE, 0xDB], SniffFormat.rpm);
+      expectFormat(
+        [0x21, 0x3C, 0x61, 0x72, 0x63, 0x68, 0x3E, 0x0A],
+        SniffFormat.ar,
+      );
+      expectFormat([0x78, 0x61, 0x72, 0x21, 0x00], SniffFormat.xar);
+    });
+
+    test('CHM 与 LIT 都归 chm', () {
+      expectFormat(
+        [0x49, 0x54, 0x53, 0x46, 3, 0, 0, 0, 0x60, 0, 0, 0],
+        SniffFormat.chm,
+      );
+      expectFormat(
+        [0x49, 0x54, 0x4F, 0x4C, 0x49, 0x54, 0x4C, 0x53, 1, 0, 0, 0, 0x28, 0, 0, 0],
+        SniffFormat.chm,
+      );
+    });
+
+    test('SquashFS 四种写法', () {
+      for (final magic in ['hsqs', 'sqsh', 'shsq', 'qshs']) {
+        expectFormat(magic.codeUnits, SniffFormat.squashfs);
+      }
+    });
+
+    test('QCOW / VMDK / VHD / VHDX / Android Sparse', () {
+      expectFormat([0x51, 0x46, 0x49, 0xFB, 0, 0, 0], SniffFormat.qcow);
+      expectFormat([0x4B, 0x44, 0x4D, 0x56], SniffFormat.vmdk);
+      expectFormat('conectix'.codeUnits + [0, 0], SniffFormat.vhd);
+      expectFormat('vhdxfile'.codeUnits, SniffFormat.vhdx);
+      expectFormat([0x3A, 0xFF, 0x26, 0xED, 1, 0], SniffFormat.sparse);
+    });
+
+    test('PPMd / SZDD / Unix compress', () {
+      expectFormat([0x8F, 0xAF, 0xAC, 0x84], SniffFormat.ppmd);
+      expectFormat(
+        [0x53, 0x5A, 0x44, 0x44, 0x88, 0xF0, 0x27, 0x33, 0x41],
+        SniffFormat.mslz,
+      );
+      expectFormat([0x1F, 0x9D], SniffFormat.z);
+    });
+
+    test('固定偏移的：CramFS 在 16、VDI 在 0x40、NTFS 在 3', () {
+      expectFormat('Compressed ROMFS'.codeUnits, SniffFormat.cramfs, at: 16);
+      expectFormat([0x7F, 0x10, 0xDA, 0xBE], SniffFormat.vdi, at: 0x40);
+      expectFormat('NTFS    '.codeUnits + [0], SniffFormat.ntfs, at: 3);
+    });
+
+    test('偏移上的签名放到偏移 0 不算数', () {
+      // `Compressed ROMFS` 在偏移 0 不是 cramfs —— 位置也是判据的一部分，
+      // 否则任何文本文件里的一句话都会把它判成映像。
+      expectFormat('Compressed ROMFS'.codeUnits, SniffFormat.unknown);
+      expectFormat('NTFS    '.codeUnits + [0], SniffFormat.unknown);
+    });
+
+    test('新收的那批置信度：偏移 0 且够长 → high；2 字节与固定偏移 → medium', () {
+      SniffConfidence conf(List<int> magic, {int at = 0}) =>
+          sniffHeadBytes(head(magic, at: at)).confidence;
+      expect(conf([0xED, 0xAB, 0xEE, 0xDB]), SniffConfidence.high);
+      expect(conf([0x1F, 0x9D]), SniffConfidence.medium);
+      expect(conf('Compressed ROMFS'.codeUnits, at: 16), SniffConfidence.medium);
+      expect(conf([0x7F, 0x10, 0xDA, 0xBE], at: 0x40), SniffConfidence.medium);
+    });
+
+    test('老签名不被新签名抢走', () {
+      // 新表排在最后，且 `1F 9D`（compress）与 `1F 8B`（gzip）只差第二个字节。
+      expectFormat([0x1F, 0x8B], SniffFormat.gzip);
+      expectFormat([0x50, 0x4B, 0x03, 0x04], SniffFormat.zip);
+      expectFormat([0x75, 0x73, 0x74, 0x61, 0x72], SniffFormat.tar, at: 257);
+    });
+
+    test('新格式的后缀判定：官方认的后缀放行，别的才算篡改', () {
+      SniffResult r(SniffFormat f, String ext) => SniffResult(
+            format: f,
+            confidence: SniffConfidence.high,
+            declaredExt: ext,
+          );
+      expect(r(SniffFormat.iso, 'iso').isExtensionSpoofed, isFalse);
+      expect(r(SniffFormat.iso, 'img').isExtensionSpoofed, isFalse,
+          reason: '`img` 是各家映像工具共用的通名');
+      expect(r(SniffFormat.ar, 'deb').isExtensionSpoofed, isFalse);
+      expect(r(SniffFormat.wim, 'esd').isExtensionSpoofed, isFalse);
+      expect(r(SniffFormat.qcow, 'qcow2').isExtensionSpoofed, isFalse);
+      expect(r(SniffFormat.iso, 'zip').isExtensionSpoofed, isTrue,
+          reason: 'ISO 披着 .zip —— 这才是该弹窗问一句的');
+      expect(r(SniffFormat.rpm, 'png').isExtensionSpoofed, isTrue);
+    });
+
     test('偏移 0 的签名优先于固定偏移的签名', () {
       // 造一个开头是 ZIP、257 处又是 ustar 的头 —— 必须判 ZIP。
       final b = Uint8List(512);
@@ -539,6 +635,94 @@ void main() {
       final r = await sniffFile(path);
       expect(r.format, SniffFormat.sevenZ);
       expect(r.isArchive, isTrue);
+    });
+
+    // ---- 头窗口之外的两处：ISO / UDF 的卷描述符，DMG 的文件尾页脚 ----------
+    //
+    // 这两个必须用**真文件**测：它们的全部意义就是「头 512 字节里什么都看不出来」，
+    // 纯函数那一层（`matchVolumeDescriptor` / `matchDmgTrailer`）只能证明字节判对了，
+    // 证明不了 `sniffFile` 真的去读了那两个位置。
+
+    List<int> blob(int length, void Function(List<int> b) poke) {
+      final b = List<int>.filled(length, 0);
+      poke(b);
+      return b;
+    }
+
+    test('ISO：头窗口全是引导码，0x8000 处的 CD001 才是证据', () async {
+      final bytes = blob(0x8000 + 4096, (b) {
+        // 头 512 字节塞满非零垃圾（混合 ISO 的 MBR 引导码），确保它不会被
+        // 头窗口里任何一条签名撞上。
+        for (var i = 0; i < 512; i++) {
+          b[i] = 0xEB;
+        }
+        b.setRange(0x8000, 0x8006, [1, 0x43, 0x44, 0x30, 0x30, 0x31]);
+      });
+      final path = writeTempFile(dir, 'disc.iso', bytes);
+
+      final r = await sniffFile(path);
+      expect(r.format, SniffFormat.iso);
+      expect(r.isArchive, isTrue);
+      expect(r.isExtensionSpoofed, isFalse);
+    });
+
+    test('ISO 改了后缀照样认出来 —— 这是需求 5 在映像上的样子', () async {
+      final bytes = blob(0x8000 + 64, (b) {
+        b.setRange(0x8000, 0x8006, [1, 0x43, 0x44, 0x30, 0x30, 0x31]);
+      });
+      final r = await sniffFile(writeTempFile(dir, 'photo.jpg', bytes));
+      expect(r.format, SniffFormat.iso);
+      expect(r.isExtensionSpoofed, isTrue);
+    });
+
+    test('纯 UDF（没有 ISO 桥）：BEA01', () async {
+      final bytes = blob(0x8000 + 64, (b) {
+        b.setRange(0x8000, 0x8008, [0, 0x42, 0x45, 0x41, 0x30, 0x31, 1, 0]);
+      });
+      final r = await sniffFile(writeTempFile(dir, 'x.udf', bytes));
+      expect(r.format, SniffFormat.udf);
+    });
+
+    test('0x8000 处只有 CD001 的后五个字节、没有类型字节 1 → 不认', () async {
+      final bytes = blob(0x8000 + 64, (b) {
+        b.setRange(0x8000, 0x8006, [0, 0x43, 0x44, 0x30, 0x30, 0x31]);
+      });
+      final r = await sniffFile(writeTempFile(dir, 'x.bin', bytes));
+      expect(r.format, SniffFormat.unknown,
+          reason: '类型字节也是签名的一部分（7-Zip 就是整串比的）');
+    });
+
+    test('文件不足 0x8008 字节 → 不去读那个位置，也不越界', () async {
+      final r = await sniffFile(writeTempFile(dir, 'tiny.iso', [1, 2, 3]));
+      expect(r.format, SniffFormat.unknown);
+    });
+
+    test('DMG：签名在文件尾 512 字节页脚的开头', () async {
+      final bytes = blob(8192, (b) {
+        b.setRange(8192 - 512, 8192 - 512 + 12,
+            [0x6B, 0x6F, 0x6C, 0x79, 0, 0, 0, 4, 0, 0, 2, 0]);
+      });
+      final r = await sniffFile(writeTempFile(dir, 'app.dmg', bytes));
+      expect(r.format, SniffFormat.dmg);
+      expect(r.isExtensionSpoofed, isFalse);
+    });
+
+    test('DMG：只有 koly 四个字母、后面对不上 → 不认', () async {
+      // 文件尾碰巧出现四个字母并不罕见，所以签名取的是完整的 12 字节。
+      final bytes = blob(8192, (b) {
+        b.setRange(8192 - 512, 8192 - 512 + 4, [0x6B, 0x6F, 0x6C, 0x79]);
+      });
+      final r = await sniffFile(writeTempFile(dir, 'x.dat', bytes));
+      expect(r.format, SniffFormat.unknown);
+    });
+
+    test('深探测排在 ZIP 之后：ZIP 里恰好带着 CD001 也还是 ZIP', () async {
+      // 头窗口先认出 ZIP，根本走不到深探测 —— 这条钉住「深探测只给认不出的」。
+      final zip = realZip({'a.txt': 'hi'});
+      final padded = [...zip, ...List<int>.filled(0x9000, 0)];
+      padded.setRange(0x8000, 0x8006, [1, 0x43, 0x44, 0x30, 0x30, 0x31]);
+      final r = await sniffFile(writeTempFile(dir, 'a.zip', padded));
+      expect(r.format, SniffFormat.zip);
     });
 
     test('文件不存在 → 抛 FileSystemException（由调用方计入 unreadable）',

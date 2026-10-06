@@ -91,7 +91,7 @@ class _ParticlePainter extends CustomPainter {
         final dy = particles[i].y - particles[j].y;
         final dist = sqrt(dx * dx + dy * dy);
         if (dist < 0.15) {
-          linePaint.color = AppTheme.neonCyan.withOpacity(0.08 * (1 - dist / 0.15));
+          linePaint.color = AppTheme.neonCyan.withValues(alpha: 0.08 * (1 - dist / 0.15));
           canvas.drawLine(
             Offset(particles[i].x * size.width, particles[i].y * size.height),
             Offset(particles[j].x * size.width, particles[j].y * size.height),
@@ -104,7 +104,7 @@ class _ParticlePainter extends CustomPainter {
     // 画粒子
     for (final p in particles) {
       final paint = Paint()
-        ..color = (p.cyan ? AppTheme.neonCyan : AppTheme.neonPurple).withOpacity(0.5);
+        ..color = (p.cyan ? AppTheme.neonCyan : AppTheme.neonPurple).withValues(alpha: 0.5);
       canvas.drawCircle(
         Offset(p.x * size.width, p.y * size.height),
         p.r,
@@ -141,9 +141,9 @@ class GlowOrb extends StatelessWidget {
         height: size,
         decoration: BoxDecoration(
           shape: BoxShape.circle,
-          color: color.withOpacity(opacity),
+          color: color.withValues(alpha: opacity),
           boxShadow: [
-            BoxShadow(color: color.withOpacity(opacity), blurRadius: 80),
+            BoxShadow(color: color.withValues(alpha: opacity), blurRadius: 80),
           ],
         ),
       ),

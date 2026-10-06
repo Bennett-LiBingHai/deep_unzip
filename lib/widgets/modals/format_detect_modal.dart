@@ -75,7 +75,7 @@ class FormatDetectModal extends StatelessWidget {
             ],
           ),
           const SizedBox(height: 6),
-          const Text('检测到后缀名与真实格式不符，已自动修正',
+          const Text('检测到文件后缀与真实格式不符',
               style: TextStyle(
                   fontSize: 12,
                   color: AppTheme.textDim,
@@ -106,7 +106,7 @@ class FormatDetectModal extends StatelessWidget {
             width: double.infinity,
             padding: const EdgeInsets.all(10),
             decoration: BoxDecoration(
-              color: Colors.black.withOpacity(0.3),
+              color: Colors.black.withValues(alpha: 0.3),
               borderRadius: BorderRadius.circular(8),
             ),
             child: Text(hexPreview,
@@ -120,9 +120,9 @@ class FormatDetectModal extends StatelessWidget {
           Container(
             padding: const EdgeInsets.all(14),
             decoration: BoxDecoration(
-              color: AppTheme.neonCyan.withOpacity(0.05),
+              color: AppTheme.neonCyan.withValues(alpha: 0.05),
               borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: AppTheme.neonCyan.withOpacity(0.15)),
+              border: Border.all(color: AppTheme.neonCyan.withValues(alpha: 0.15)),
             ),
             child: Column(
               children: [
@@ -148,9 +148,9 @@ class FormatDetectModal extends StatelessWidget {
                   child: Container(
                     padding: const EdgeInsets.symmetric(vertical: 14),
                     decoration: BoxDecoration(
-                      color: Colors.white.withOpacity(0.05),
+                      color: Colors.white.withValues(alpha: 0.05),
                       borderRadius: BorderRadius.circular(12),
-                      border: Border.all(color: Colors.white.withOpacity(0.1)),
+                      border: Border.all(color: Colors.white.withValues(alpha: 0.1)),
                     ),
                     alignment: Alignment.center,
                     child: const Text('取消',
@@ -213,5 +213,5 @@ class FormatDetectModal extends StatelessWidget {
   }
 
   Widget _divider() => Divider(
-      color: Colors.white.withOpacity(0.04), height: 1, thickness: 1);
+      color: Colors.white.withValues(alpha: 0.04), height: 1, thickness: 1);
 }

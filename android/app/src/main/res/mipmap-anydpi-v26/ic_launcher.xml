@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 自适应图标（Android 8+）。由 Android Studio 的 Image Asset 向导生成。
+
+     有它之后，`mipmap-*/ic_launcher.png` 那 5 份就只管 API 24 / 25 了 —— 系统
+     在 26 及以上优先取这一份，并且**自己套蒙版**（各家形状不同：原生圆、小米
+     squircle、华为圆……）。
+
+     三层分工：
+     - `<background>`：`@drawable/ic_launcher_background`（一个 135° 的深色渐变，
+       两端正好是 `AppTheme.bgMid` #0A0F1E 与 `bgDeep` #050810）。底色在蒙版
+       之下，**不会被裁**，所以它是铺满的。
+     - `<foreground>`：图形，108dp 画布、内容落在中间 72dp 的安全区里。
+       **只有这一层会被蒙版裁** —— 图往外画的部分各家 ROM 切法不一样。
+     - `<monochrome>`：Android 13「主题图标」用的单色剪影，系统只取 alpha。
+       **刻意没加**：前景图上那张 cyan 卡片本身是不透明的，拿它当剪影出来的
+       是一个圆角方块糊，不是图形。要做主题图标得单独给一份只含图形的剪影版，
+       见交付说明。
+
+     改前景时注意：`@mipmap/ic_launcher_foreground` 是 **mipmap** 不是 drawable
+     （向导这么生成的，5 档尺寸 108/162/216/324/432）。 -->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@drawable/ic_launcher_background"/>
+    <foreground android:drawable="@mipmap/ic_launcher_foreground"/>
+</adaptive-icon>

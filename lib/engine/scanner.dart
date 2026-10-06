@@ -84,6 +84,26 @@ class ScanTick {
 
 typedef ScanTickCallback = void Function(ScanTick tick);
 
+/// 问一句「这个包要不要密码」。
+///
+/// [parts] 是整个分卷清单（单卷就是长度 1 的数组），**不是**只有首卷 ——
+/// ZIP 的中央目录在**末卷**，只给首卷的探针答不出分卷包的事。
+///
+/// 返回三态，`null` = 不知道（见 [SniffResult.encrypted]）。**只有 true 会被
+/// 打上 `ArchiveFlag.encrypted`**，所以探针答不出来时老老实实回 `null`，
+/// 别猜 —— 猜错的代价是首页那个「需密码 N」对着用户撒谎。
+///
+/// ## 为什么是同步的
+///
+/// 扫描的主循环是「一批文件并发嗅探 → 按自然序产出」，产出那一段是纯内存的
+/// 同步循环。把探针做成异步就得把它拆开、让每个条目都能插入一个 await 点，
+/// 而这条路上**已经踩过一次坑**（批次循环里混进真 IO，widget 测试会静默挂死）。
+/// 原生 `peekArchive` 本来就是同步的，保持同步最省事也最安全。
+///
+/// 探针里**不许 await**、不许抛异常出去：引擎开不动、包坏了，都该在探针内部
+/// 消化成 `null`。扫描不该因为一个包的加密探测失败而整个失败。
+typedef EncryptedProbe = bool? Function(List<String> parts, SniffFormat format);
+
 /// 扫描一个目录（递归），返回可解压的条目。
 ///
 /// [skipDirs] 是绝对路径集合，命中的目录整个跳过（journal 记录的历史输出目录）。
@@ -97,13 +117,18 @@ Future<ScanSummary> scanDirectory(
   int baseDepth = 0,
   ScanTickCallback? onTick,
   bool Function()? isCancelled,
+  EncryptedProbe? probeEncrypted,
 }) async {
   final root = Directory(rootPath);
   if (!await root.exists()) {
     return ScanSummary(items: const [], warnings: ['目录不存在：$rootPath']);
   }
 
-  final st = _ScanState(onTick: onTick, isCancelled: isCancelled);
+  final st = _ScanState(
+    onTick: onTick,
+    isCancelled: isCancelled,
+    probeEncrypted: probeEncrypted,
+  );
   // 根目录本身不参与剪枝 —— 用户明确选了它，哪怕它叫 node_modules 也要扫。
   await _visitDir(st, root, '', 0, options, skipDirs, baseDepth);
 
@@ -134,19 +159,34 @@ Future<ScanSummary> scanFileList(
   List<String> paths, {
   ScanOptions options = const ScanOptions(),
   int baseDepth = 1,
+  bool ignoreContainers = false,
+  bool expandSplitVolumes = false,
   ScanTickCallback? onTick,
   bool Function()? isCancelled,
+  EncryptedProbe? probeEncrypted,
 }) async {
-  final st = _ScanState(onTick: onTick, isCancelled: isCancelled);
+  final st = _ScanState(
+    onTick: onTick,
+    isCancelled: isCancelled,
+    probeEncrypted: probeEncrypted,
+  );
+
+  // 用户点名的文件可能是**分卷的第一片**，而其余分片在他没点的那些文件里。
+  // 这一步把它们补进来：解压软件收到 `x.zip.001` 却只解那一片，等于什么都没做。
+  // 只在 `expandSplitVolumes` 时做 —— 嵌套重扫那边整目录本来就都传进来了，
+  // 补一次是空操作。
+  final work =
+      expandSplitVolumes ? await _withSplitSiblings(paths) : paths;
 
   // 按目录分组：分卷只在同一目录内成组。
   final byDir = <String, List<String>>{};
-  for (final p in paths) {
+  for (final p in work) {
     byDir.putIfAbsent(_dirName(p), () => []).add(p);
   }
   for (final dir in byDir.keys) {
     final group = byDir[dir]!..sort(compareNatural);
-    await _processFiles(st, group, options, baseDepth);
+    await _processFiles(st, group, options, baseDepth,
+        ignoreContainers: ignoreContainers);
     if (st.stopped) break;
   }
 
@@ -166,15 +206,68 @@ Future<ScanSummary> scanFileList(
   );
 }
 
+/// 把 [paths] 里属于某个分卷家族的那些，扩成**完整的家族**（同目录里一起找）。
+///
+/// 用户只点得中一个文件，而「选一个分卷」的真实意图必然是「解这一整套」——
+/// `x.zip.001` 单独一片在解码器眼里什么都不是。所以这里补上同目录的其余分片。
+///
+/// ## 只补同一家族，不碰同目录别的包
+///
+/// 判据是复用的 [groupSplitVolumes]：它按目录分组、认四种命名家族、校验序号
+/// 连续。所以同目录里另一个 `y.zip.001`、或者一个不相干的 `z.7z` 都不会被
+/// 捎带进来 —— 那正是「选了文件就只解它，不算上同目录其它文件」这条要求。
+///
+/// 尺寸一律按 0（未知）传：`groupSplitVolumes` 的约定是「0 = 未知，跳过非末卷
+/// 等长检查」。这里为了这一步去 stat 每个兄弟文件不值得 —— 真正的尺寸由
+/// 后面 `_processFiles` 自己取，那一步本来就要读。
+///
+/// 认不出来（不是分卷、或家族校验没通过）就原样返回 —— 交给下面那条正常的
+/// 单文件路径去报它自己的告警，这里不替它下结论。
+Future<List<String>> _withSplitSiblings(List<String> paths) async {
+  final byDir = <String, List<String>>{};
+  for (final p in paths) {
+    byDir.putIfAbsent(_dirName(p), () => []).add(p);
+  }
+
+  final out = <String>{...paths};
+  for (final entry in byDir.entries) {
+    List<FileSystemEntity> entries;
+    try {
+      entries = await Directory(entry.key).list(followLinks: false).toList();
+    } on FileSystemException {
+      continue; // 目录读不了就只留用户点名的那几个，不额外报错
+    }
+    // 与目录扫描同一条规矩：只认真正的文件，符号链接整体忽略。
+    final siblings = [
+      for (final e in entries)
+        if (e is File) e.path,
+    ];
+    if (siblings.length < 2) continue;
+
+    final scan = groupSplitVolumes([
+      for (final p in siblings) (path: p, size: 0),
+    ]);
+    final picked = entry.value.toSet();
+    for (final fam in scan.families) {
+      if (fam.parts.any(picked.contains)) out.addAll(fam.parts);
+    }
+  }
+  return out.toList()..sort(compareNatural);
+}
+
 // ---------------------------------------------------------------------------
 // 遍历
 // ---------------------------------------------------------------------------
 
 class _ScanState {
-  _ScanState({this.onTick, this.isCancelled});
+  _ScanState({this.onTick, this.isCancelled, this.probeEncrypted});
 
   final ScanTickCallback? onTick;
   final bool Function()? isCancelled;
+
+  /// 判断要不要密码的探针，由调用方注入（见 [EncryptedProbe]）。
+  /// 为 null = 这一趟问不到引擎，加密字段就只靠 ZIP 自己那份中央目录。
+  final EncryptedProbe? probeEncrypted;
 
   final List<ScanItem> items = [];
   final List<String> warnings = [];
@@ -269,8 +362,11 @@ Future<void> _processFiles(
   _ScanState st,
   List<String> files,
   ScanOptions options,
-  int baseDepth,
-) async {
+  int baseDepth, {
+  /// 见 [scanFileList] 的同名参数。**默认 false** —— 目录扫描这条最常走的路
+  /// 必须保留那两道容器防线。
+  bool ignoreContainers = false,
+}) async {
   st.syncCancel();
   if (files.isEmpty || st.stopped) return;
 
@@ -299,12 +395,14 @@ Future<void> _processFiles(
   if (st.stopped) return;
 
   // ---- 2. 分卷分组 ----
-  final splitScan = options.mergeSplitVolumes
-      ? groupSplitVolumes([
-          for (final p in work)
-            (path: p, size: (sizes[p] ?? -1) < 0 ? 0 : sizes[p]!),
-        ])
-      : const SplitScan.empty();
+  // 分卷**总是**合并。这里原来是个开关（设置页上的「分片自动合并」，2026-10
+  // 连同它一起删了）—— 关掉它不是「换一种做法」：`.002` 嗅探不出格式，会在
+  // `_emitPlain` 里静默消失，只剩一行残缺的 `.001` 给用户。账见 `persist.dart`
+  // 的 `kDefaultToggles`。
+  final splitScan = groupSplitVolumes([
+    for (final p in work)
+      (path: p, size: (sizes[p] ?? -1) < 0 ? 0 : sizes[p]!),
+  ]);
   // 带上「分卷识别」前缀：这些告警是从文件名推的，可能只是名字碰巧长得像
   // 分卷（同名的两个 `backup.2026`/`backup.2027`）。前缀让用户明白这是
   // 猜测失败而不是真的坏了，且这些文件已经按普通文件处理过了。
@@ -323,7 +421,7 @@ Future<void> _processFiles(
   for (final p in work) {
     if (!splitScan.consumed.contains(p)) need.add(p);
   }
-  await _sniffInto(st, need, sniffed);
+  await _sniffInto(st, need, sniffed, ignoreContainers: ignoreContainers);
 
   // ---- 4. 家族校验 ----
   // 首卷看不出是压缩包 ⇒ 整组否决，分片退回普通文件。必须在产出阶段之前
@@ -341,7 +439,9 @@ Future<void> _processFiles(
       st.warnings.add('${_baseName(fam.entryPath)}：分片首卷不是压缩包，已按普通文件处理');
     }
   }
-  if (rejected.isNotEmpty) await _sniffInto(st, rejected, sniffed);
+  if (rejected.isNotEmpty) {
+    await _sniffInto(st, rejected, sniffed, ignoreContainers: ignoreContainers);
+  }
 
   final familyByEntry = {for (final f in families) f.entryPath: f};
   final consumed = {for (final f in families) ...f.parts};
@@ -370,8 +470,9 @@ Future<void> _processFiles(
 Future<void> _sniffInto(
   _ScanState st,
   List<String> paths,
-  Map<String, SniffResult> out,
-) async {
+  Map<String, SniffResult> out, {
+  bool ignoreContainers = false,
+}) async {
   if (paths.isEmpty) return;
 
   final todo = <String>[
@@ -382,7 +483,11 @@ Future<void> _sniffInto(
   await _forEachBounded(todo, kSniffConcurrency, (path) async {
     if (st.stopped) return;
     try {
-      out[path] = await sniffFile(path, declaredExt: _declaredExtFor(path));
+      out[path] = await sniffFile(
+        path,
+        declaredExt: _declaredExtFor(path),
+        honorContainerSkip: !ignoreContainers,
+      );
     } on FileSystemException {
       // 权限不足 / 文件在扫描途中被删除。`PathNotFoundException` 也是
       // `FileSystemException` 的子类，一并被这条接住。
@@ -410,15 +515,18 @@ void _emitPlain(
   }
   if (!sniff.isArchive) return;
 
+  // 先信嗅探期那份便宜答案（ZIP 的中央目录已经在读了，见 `_withContainer`），
+  // **只有它答不出来**才去劳烦探针 —— 单卷这条路是绝大多数情况，一个明文
+  // tar/gz 不该因为「问一句要不要密码」就去开一次归档。
+  final encrypted = sniff.encrypted ?? st.probeEncrypted?.call([path], sniff.format);
+
   st.items.add(ScanItem(
     entryPath: path,
     parts: [path],
     sniff: sniff,
     sizeBytes: size < 0 ? 0 : size,
-    flags: _flagsFor(sniff, options, isSplit: false),
+    flags: _flagsFor(sniff, options, isSplit: false, encrypted: encrypted),
     depth: depth,
-    // 注：`encrypted` 标记这里给不出来 —— 判断 ZIP 的加密位要读中央目录，
-    // 判断 RAR/7z 的加密头要真的打开。留给 P1 拿到后端句柄时补。
   ));
 }
 
@@ -442,23 +550,46 @@ void _emitFamily(
     st.warnings.add('分卷识别：$w');
   }
 
+  // 分卷这里**探针优先**，和单卷那条顺序相反，是有原因的：`sniff` 只来自
+  // **首卷**，而 ZIP 的中央目录在**末卷**上 —— 首卷那份读出来的 `encrypted`
+  // 是假的（`readZipListing` 读不到中央目录，留在 null）。所以分卷包必须让
+  // 探针拿着**整份 parts** 去开，探针答不出来才退回嗅探期那个可能为 null 的值。
+  //
+  // **已知缺口**：分卷的 **ZIP** 这一格谁都答不上来 —— 原生探针对 ZIP 直接
+  // 回 null（加密位本是白捡的，不必开归档），而「单读末卷的中央目录」也
+  // 走不通：末卷里那些偏移是相对**整个归档开头**算的，脱离前面的卷根本定位
+  // 不到。要补得先有一条跨卷的虚拟拼接读取，那是解压期的东西。所以分卷加密包
+  // 在列表上**没有**「加密」角标，解压时照样会被密码流程接住 —— 少一个徽章，
+  // 不是解不开。
+  final encrypted =
+      st.probeEncrypted?.call(fam.parts, sniff.format) ?? sniff.encrypted;
+
   st.items.add(ScanItem(
     entryPath: fam.entryPath,
     parts: fam.parts,
     sniff: sniff,
     sizeBytes: total,
-    flags: _flagsFor(sniff, options, isSplit: true),
+    flags: _flagsFor(sniff, options, isSplit: true, encrypted: encrypted),
     depth: depth,
     split: fam,
   ));
 }
 
-Set<ArchiveFlag> _flagsFor(SniffResult sniff, ScanOptions options, {required bool isSplit}) {
+Set<ArchiveFlag> _flagsFor(
+  SniffResult sniff,
+  ScanOptions options, {
+  required bool isSplit,
+  bool? encrypted,
+}) {
   final flags = <ArchiveFlag>{};
   if (isSplit) flags.add(ArchiveFlag.split);
   if (options.detectFakeExtension && sniff.isExtensionSpoofed) {
     flags.add(ArchiveFlag.fakeExtension);
   }
+  // **只有确认要密码才打标**。`null`（不知道）不打 —— 打了会让首页那个
+  // 「需密码 N」把不确定说成确定；漏标顶多是少一个徽章，用户解压时照样会被
+  // 问密码，代价小得多。
+  if (encrypted == true) flags.add(ArchiveFlag.encrypted);
   return flags;
 }
 

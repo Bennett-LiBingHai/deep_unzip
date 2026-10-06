@@ -48,13 +48,21 @@
   #define DUZ_HAS_7ZIP 0
 #endif
 
-// 每线程一条错误文案 + 一个错误码，避免调用方 free、也避免跨线程踩踏。
+// 每线程一条错误文案 + 一个错误码 + 一个「分不清」位，避免调用方 free、
+// 也避免跨线程踩踏。
 namespace {
 thread_local char g_openError[512] = "尚未接上 7-Zip 核心";
 thread_local int32_t g_openErrorCode = DUZ_ERR_OPEN;
 
-void SetOpenError(int32_t code, const char* msg) {
+// 「密码不对还是数据坏了，分不出来」—— 见 duz_engine.h 里 duz_last_error_uncertain
+// 的说明。只在解压阶段、且只有 code == DUZ_ERR_PASSWORD 时才可能为 1。
+thread_local int32_t g_errorUncertain = 0;
+
+// uncertain 传 true 的那一处只有解压收尾（见那边的不变量说明）。**每次调用都
+// 赋值**，所以上一次留下的 1 不会漏到下一次错误上。
+void SetOpenError(int32_t code, const char* msg, bool uncertain = false) {
   g_openErrorCode = code;
+  g_errorUncertain = uncertain ? 1 : 0;
   if (!msg) msg = "";
   strncpy(g_openError, msg, sizeof(g_openError) - 1);
   g_openError[sizeof(g_openError) - 1] = '\0';
@@ -86,6 +94,7 @@ duz_ctx* duz_open(const char* const* parts, int32_t n, const char* pwd) {
 
 const char* duz_last_open_error(void) { return g_openError; }
 int32_t duz_last_open_error_code(void) { return g_openErrorCode; }
+int32_t duz_last_error_uncertain(void) { return g_errorUncertain; }
 
 int32_t duz_list(duz_ctx* ctx, duz_entry** out, int32_t* count) {
   (void)ctx;
@@ -268,6 +277,13 @@ class DuzExtractCallback final : public IFolderArchiveExtractCallback,
   std::string CurrentName;  // UTF-8，给 progress 回调用
   UInt32 FailedCount;
   bool SawWrongPassword;
+
+  /// 「密码不对」这一次是**猜**的，不是 7-Zip 说的。
+  ///
+  /// 只有 7z 会走到这里（见 [SetOperationResult] 里那段说明）：它没有密码
+  /// 校验字，错密码和坏数据在解码器眼里一模一样。所以收场时文案要留活口，
+  /// 不能替用户断定是密码错了 —— 那是把一个我们并不知道的事实说成结论。
+  bool SawEncryptedDataError;
   bool Cancelled;
   std::string FirstError;  // UTF-8
 
@@ -291,6 +307,7 @@ class DuzExtractCallback final : public IFolderArchiveExtractCallback,
         UnpackTotal(0),
         FailedCount(0),
         SawWrongPassword(false),
+        SawEncryptedDataError(false),
         Cancelled(false),
         ReportCalls(0) {}
 
@@ -326,6 +343,39 @@ class DuzExtractCallback final : public IFolderArchiveExtractCallback,
 
 }  // namespace
 
+namespace {
+
+/// 打开的归档是哪个格式 —— `CCodecs::Formats[FormatIndex].Name`，也就是 `7z i`
+/// 列出来的那串（`"zip"` / `"7z"` / `"Rar"` / `"Rar5"` …）。认不出来返回空串。
+///
+/// `FormatIndex < 0` 是「Parser」：那种 Arc 是别的 handler 拆出来的子归档，
+/// 不是独立格式，没有名字可给。
+std::string FormatNameOf(const CArchiveLink& link) {
+  if (link.Arcs.IsEmpty()) return std::string();
+  const int fi = link.Arcs.Back().FormatIndex;
+  if (fi < 0) return std::string();
+  CCodecs* codecs = GetCodecs();
+  if (!codecs || (unsigned)fi >= codecs->Formats.Size()) return std::string();
+  return UToUtf8(codecs->Formats[(unsigned)fi].Name);
+}
+
+/// 这个格式**有没有密码校验字** —— 决定 `kCRCError` 该算谁的。
+///
+/// 判据是「**谁会报 `kWrongPassword`**」：全树 grep，生产者只有两处 ——
+/// `Archive/Zip/ZipHandler.cpp`（WinZip AES 的 2 字节校验字、PKWARE AES、
+/// ZipCrypto 的 1 字节头校验）与 `Archive/Rar/Rar5Handler.cpp`（RAR5 的 psw
+/// check）。**7z 与 RAR3/RAR4 一次都不报**，因为它们压根没有校验字。
+///
+/// 认不出来的一律当「没有」。方向是刻意的：把有校验字的误判成没有，代价只是
+/// 白扫一遍密码库、外加一句说得含糊的话；反过来却是**冤枉一个其实解得开的
+/// 包** —— 那正是这次要修的那个 bug。见 `DuzExtractCallback::SetOperationResult`。
+bool HasPasswordCheck(const std::string& formatName) {
+  return StringsAreEqualNoCase_Ascii(formatName.c_str(), "zip") ||
+         StringsAreEqualNoCase_Ascii(formatName.c_str(), "Rar5");
+}
+
+}  // namespace
+
 // ---------------------------------------------------------------------------
 // ctx
 // ---------------------------------------------------------------------------
@@ -336,6 +386,22 @@ struct duz_ctx {
   CIntVector excludedFormats;
   UString filePath;                      // 首卷路径（UString）
   std::string password;                  // UTF-8
+
+  // 打开成功时记下的格式名（见 `FormatNameOf`），空串 = 认不出来。
+  //
+  // 记在这里而不是每次现问：`FormatHasPasswordCheck` 那条判据要在每个条目
+  // 失败时用，而失败回调里再去翻 `arcLink` 是白费力气。也顺带给日志一个
+  // 「这个包到底是什么格式」的落点 —— 以前只能从 `duz_list` 的条目名猜。
+  std::string formatName;
+  // 「调用方**递了**密码参数」—— 空串算递了，`nullptr` 才算没递。
+  //
+  // 这个区分是刻意的，别再退回 `pwd && pwd[0]`：Dart 侧会把「空密码」当成
+  // 一个**真的候选**送下来（见 `app_state.dart` 的 `_kEmptyPassword`），而那
+  // 正是「加密 ZIP 第一次试着解」这一步。把空串折叠成「没给密码」之后，
+  // 解压时 `CryptoGetTextPassword` 会回 E_NOTIMPL，`RINOK` 直接把整个
+  // `Extract()` 短路掉 —— 回调只看到一句笼统的失败，连「密码错」都算不上，
+  // 于是档位从「需要密码」掉成「解压失败」，密码库与弹窗那条路永远进不去。
+  // 真机验收第一次就是栽在这里。
   bool passwordGiven = false;
 
   // duz_list 产出的名字字节；entry.name 指进来，所以必须用地址稳定的容器。
@@ -355,9 +421,15 @@ namespace {
 
 HRESULT DuzOpenCallback::Open_CryptoGetTextPassword(BSTR* password) {
   *password = nullptr;  // 7-Zip 的约定：无论成败都先置空
-  if (!_ctx->passwordGiven) {
-    // 没有候选密码就如实说「没有」。7-Zip 会因此把头加密的包判为打不开，
-    // 我们据此返回 DUZ_ERR_PASSWORD，让 Dart 换下一个候选密码重试。
+  // 这一路仍按老规矩：**没有非空密码**就说「没有」，于是 7-Zip 把头加密的包
+  // 判为打不开，我们据此返回 DUZ_ERR_PASSWORD，让 Dart 换下一个候选重试。
+  //
+  // `passwordGiven` 现在把空串也算作「递了」，所以这里要自己再看一眼非空：
+  // 拿空密码去试着解加密头，失败之后 7-Zip 报的是哪一类错误不如上面那条路
+  // 确定（上面这条真机验过），没必要为了一个「密码就是空串」的边角把已经
+  // 验过的分支搅了。解压那一路才是空串必须被当成真候选的地方，见
+  // `DuzExtractCallback::CryptoGetTextPassword`。
+  if (!_ctx->passwordGiven || _ctx->password.empty()) {
     return E_NOTIMPL;
   }
   return StringToBstr(fs2us(_ctx->password.c_str()), password);
@@ -410,8 +482,65 @@ Z7_COM7F_IMF(DuzExtractCallback::SetOperationResult(Int32 opRes, Int32 encrypted
   DUZ_LOG("SetOperationResult opRes=%d enc=%d name=%s", (int)opRes, (int)encrypted,
           CurrentName.empty() ? "(none)" : CurrentName.c_str());
   if (opRes == NArchive::NExtract::NOperationResult::kOK) return S_OK;
-  if (opRes == NArchive::NExtract::NOperationResult::kWrongPassword)
+
+  // 「密码不对」有三种表现，都要认出来，否则 Dart 那边换不了下一个候选。
+  //
+  // 1. 7-Zip 亲口说 `kWrongPassword`。ZIP（AES 的 2 字节校验字 / ZipCrypto 的
+  //    1 字节头校验）和 RAR5 走这条 —— 它们解密的头几个字节就能认出错密码。
+  // 2. **加密条目的数据压根没解开**（`kDataError` + `encrypted`）。**7z 走的是
+  //    这条**：它的 AES（`Crypto/7zAes.cpp`）就是一个纯 CBC 滤波器，**没有任何
+  //    校验字**，错密码解出来就是噪声，一路漏到 LZMA2 才炸，7-Zip 只能报
+  //    「数据错误」。它自己的 UI 也是这么认的 —— `ExtractCallbackConsole.cpp`
+  //    里有 `kDataErrorEncrypted = "Data Error in encrypted file. Wrong
+  //    password?"`，后面那个问号就是同一种不确定。
+  //
+  // 3. **没有校验字的格式上，CRC 对不上同样是说不清的**（`kCRCError` + 加密）。
+  //    **stored 条目走的是这条**：那种条目没有解码器，走的就是 `CCopyCoder`
+  //    （`Common/CopyCoder.cpp`）—— 透明拷贝、不可能失败，而 AES-CBC 保长，
+  //    于是整段垃圾按声明长度写完就 `S_OK` 返回了，剩下的唯一判据只有 CRC，
+  //    必然是 mismatch。**RAR3 的 stored 条目同理**，它的 CRC 判定在另一份
+  //    代码里（`Archive/Rar/RarHandler.cpp:1745-1747`），结局一模一样。
+  //
+  // 第 3 条是 2026-10-05 本机实测出来的（同一份数据、同一个密码，只差压缩
+  // 方式）：`-mx0`（stored）+ 内容加密，错密码 → `CRC Failed in encrypted
+  // file. Wrong password?`；`-mx5` → `Data Error in encrypted file. Wrong
+  // password?`。7-Zip 自己的 GUI 对所有 encrypted 失败（除 `kWrongPassword`）
+  // 都追加 `"Wrong password?"`（`UI/FileManager/ExtractCallback.cpp:363`），
+  // kCRCError 也在内 —— 它在这条路上同样是猜的。
+  //
+  // 漏掉第 2 条是个真机上很扎眼的 bug：`enc7z_content.7z`（条目加密、头不
+  // 加密）开局那次空密码给出 `DUZ_ERR_EXTRACT`，而 Dart 只有 `DUZ_ERR_PASSWORD`
+  // 才肯换候选，于是密码库一次都没被试过 —— 一个好端端的包直接显示
+  // 「文件已损坏」。logcat 上就是 `opRes=2 enc=1` 紧跟 `code=-5`。漏掉第 3 条
+  // 的后果一模一样，只是 logcat 上换成 `opRes=3 enc=1`。
+  //
+  // **第 3 条只对没有校验字的格式放宽** —— 这是它与前两条唯一的分岔，理由在
+  // 下一段。
+  //
+  // 为什么第 3 条不能一刀切：`kCRCError` 在**有**校验字的格式上是另一回事。
+  // 那里密码错根本走不到 CRC —— 校验字在解码之前就把关掉了（ZIP 的三处都在
+  // `ZipHandler.cpp` 内、`coder->Code()` 之前；RAR5 在 `Rar5Handler.cpp:3296`
+  // 的 `unpacker.Create(..., wrongPassword)`）。所以那种格式上 CRC 失败意味着
+  // **密码已经被证实是对的**、坏的确实是数据 —— 那就既不该白扫一遍密码库，
+  // 也不该对着一个修不好的包弹「分不出来」的窗。
+  //
+  // 第 2 条**不**按格式分岔，这也是刻意的，别顺手「统一」掉：有校验字的格式
+  // 上它同样是「校验字通过之后才炸」，多半是真损坏；但校验字本身有误判率
+  // （WinZip AES 2⁻¹⁶、ZipCrypto 只有 1/256），而这一档偏向「继续试下一个
+  // 候选」恰好能在误判时自愈 —— 代价只是多扫一遍密码库。第 3 条不一样：
+  // 那里判成「损坏」是把用户**挡在一个其实解得开的包外面**，正是这次要修的
+  // 那个 bug；所以宁可在那儿多花一遍扫描。
+  if (opRes == NArchive::NExtract::NOperationResult::kWrongPassword) {
     SawWrongPassword = true;
+  } else if (encrypted != 0 &&
+             (opRes == NArchive::NExtract::NOperationResult::kDataError ||
+              (opRes == NArchive::NExtract::NOperationResult::kCRCError &&
+               (!Ctx || !HasPasswordCheck(Ctx->formatName))))) {
+    DUZ_LOG("加密条目数据没解出来 -> 按密码问题处理（格式=%s 没有校验字，只能猜）",
+            !Ctx || Ctx->formatName.empty() ? "(未知)" : Ctx->formatName.c_str());
+    SawWrongPassword = true;
+    SawEncryptedDataError = true;
+  }
   ++FailedCount;
   if (FirstError.empty()) {
     switch (opRes) {
@@ -419,6 +548,10 @@ Z7_COM7F_IMF(DuzExtractCallback::SetOperationResult(Int32 opRes, Int32 encrypted
         FirstError = "压缩方法不受支持";
         break;
       case NArchive::NExtract::NOperationResult::kCRCError:
+        // 这句能露面时**一定**是真损坏：没有校验字的格式上，上面那段已经
+        // 把 CRC 失败算进「猜」的那一档了，收场走的是密码那条路，这句话
+        // 根本到不了用户眼前。剩下的只有有校验字的格式 —— 那里密码已被
+        // 校验字证实是对的，可以把话说死。
         FirstError = "CRC 校验失败（文件已损坏）";
         break;
       case NArchive::NExtract::NOperationResult::kDataError:
@@ -477,7 +610,18 @@ Z7_COM7F_IMF(DuzExtractCallback::ReportExtractResult(
 
 Z7_COM7F_IMF(DuzExtractCallback::CryptoGetTextPassword(BSTR* password)) {
   *password = nullptr;
-  if (!Ctx->passwordGiven) return E_NOTIMPL;
+  if (!Ctx->passwordGiven) {
+    // 这条日志不是噪音：走到这里意味着本次解压必然以「解压失败」收场（ZipHandler
+    // 的 RINOK 会把整个 Extract() 短路），档位也就掉不出「需要密码」。上一轮
+    // 真机排障只能从 `res=0x80004001` 反推，有这一行就是一眼的事。
+    DUZ_LOG("CryptoGetTextPassword: 调用方没递密码参数 -> E_NOTIMPL，本次解压会被短路");
+    return E_NOTIMPL;
+  }
+  // 空串是**真的候选**（「这个包没设密码」），必须如实回给 7-Zip：它会拿它去
+  // 比 AES 的 2 字节校验字 / ZipCrypto 的 1 字节头校验，对不上就报
+  // kWrongPassword，我们据此返回 DUZ_ERR_PASSWORD —— 密码库与弹窗那条路的入口。
+  // 只记「是不是空串」，不记内容与长度。
+  DUZ_LOG("CryptoGetTextPassword: 递了候选密码 (空串=%d)", Ctx->password.empty() ? 1 : 0);
   return StringToBstr(fs2us(Ctx->password.c_str()), password);
 }
 
@@ -589,8 +733,27 @@ duz_ctx* duz_open(const char* const* parts, int32_t n, const char* pwd) {
   }
 
   duz_ctx* ctx = new duz_ctx;
+  // `parts[1..]` 与 `n` 在往下**再也没有被用过**，这是刻意的，不是漏写。
+  //
+  // 兄弟卷由 7-Zip 自己按名字去找，不经过我们。`.001/.002` 这种裸切分落在
+  // Split 处理器里（`Archive/SplitHandler.cpp`：它只认「扩展名以 01/00 结尾、
+  // 前面全是 0」的命名，再用 `GetNextName` 递增出下一个名字，逐个
+  // `IArchiveOpenVolumeCallback::GetStream` 打开），`x.z01…+x.zip` 与 RAR 的
+  // `.part1.rar`/`.r00` 各自在自家处理器里做同一件事。多个流拼成一条后，
+  // `CArchiveLink::Open2` 会把这条拼接流当 `op.stream` 再把内层归档开一次
+  // （OpenArchive.cpp:3306-3380），所以 `arcLink.Arcs.Back()` 拿到的已经是
+  // 内层那个真归档 —— 下面 `packTotal` 里 `VolumesSize` 的用法就指着这件事。
+  //
+  // 代价：分卷必须与首卷**同目录**且序号连续（7-Zip 是算名字去要，不是从这
+  // 份列表拿）。2026-10-05 真机验过：`.zip.001`(100000 字节，切点落在条目数据
+  // 区正中) + `.zip.002` 解出的 200 KiB payload 与原件 md5 一致。
+  //
+  // **查「裸切分怎么支持的」别去 ZipIn.cpp** —— 那里的 ParseArcName 只认
+  // `zip`/`exe`/`zNN` 三种扩展名，一个 `001` 都碰不到，是另一套（Info-ZIP 跨卷）。
   ctx->filePath = Utf8ToU(parts[0]);
-  if (pwd && pwd[0]) {
+  // `pwd == NULL` 才是「没给密码」；`pwd == ""` 是「密码就是空串」，也是一个
+  // 真候选，必须原样记下来。见 `duz_ctx::passwordGiven` 那段说明。
+  if (pwd) {
     ctx->password = pwd;
     ctx->passwordGiven = true;
   }
@@ -654,11 +817,20 @@ duz_ctx* duz_open(const char* const* parts, int32_t n, const char* pwd) {
   if (fi.Find_FollowLink(us2fs(ctx->filePath))) mainSize = fi.Size;
   ctx->packTotal = mainSize + ctx->arcLink.VolumesSize;
 
+  // 记住是哪个格式 —— 解压阶段判 `kCRCError` 归谁（见 `HasPasswordCheck`）
+  // 要靠它。**必须在这里取**：那是打开之后、`arcLink` 里还有 Arc 的时候，
+  // 而失败回调里再去翻 `Arcs` 就要多一层「这次是不是还开着」的担心。
+  ctx->formatName = FormatNameOf(ctx->arcLink);
+  DUZ_LOG("== duz_open 成功 格式=%s 有校验字=%d",
+          ctx->formatName.empty() ? "(未知)" : ctx->formatName.c_str(),
+          (int)HasPasswordCheck(ctx->formatName));
+
   return ctx;
 }
 
 const char* duz_last_open_error(void) { return g_openError; }
 int32_t duz_last_open_error_code(void) { return g_openErrorCode; }
+int32_t duz_last_error_uncertain(void) { return g_errorUncertain; }
 
 int32_t duz_list(duz_ctx* ctx, duz_entry** out, int32_t* count) {
   if (out) *out = nullptr;
@@ -828,7 +1000,9 @@ int32_t duz_extract_all(duz_ctx* ctx, const char* outDir, duz_progress_cb cb,
     msg = "已取消";
   } else if (spec->SawWrongPassword) {
     code = DUZ_ERR_PASSWORD;
-    msg = "密码错误";
+    // 猜出来的那一档（7z）留活口：错密码和坏数据在里面长得一模一样，硬写
+    // 「密码错误」等于把另一种可能说死。ZIP / RAR5 是 7-Zip 亲口报的，照旧。
+    msg = spec->SawEncryptedDataError ? "密码不对，或加密数据已损坏" : "密码错误";
   } else if (spec->FailedCount > 0) {
     code = DUZ_ERR_EXTRACT;
     msg = spec->FirstError.empty() ? "解压过程中有条目失败" : spec->FirstError;
@@ -847,10 +1021,16 @@ int32_t duz_extract_all(duz_ctx* ctx, const char* outDir, duz_progress_cb cb,
            " 个损坏文件未能删除，请手动清理输出目录";
   }
 
-  if (code != DUZ_OK) SetOpenError(code, msg.c_str());
-  DUZ_LOG("== duz_extract_all 退出 code=%d Report回调=%llu 失败条目=%u",
-          (int)code, (unsigned long long)spec->ReportCalls,
-          (unsigned)spec->FailedCount);
+  // 第三个参数是**说法**，不是策略：它只让 Dart 那边的文案别替用户断定「密码
+  // 不对」。`SawEncryptedDataError` 只在 `SawWrongPassword` 为真时被置位，而上面
+  // 的判定链把 `SawWrongPassword` 排在 `FailedCount` 之前，所以它为真时 code 必然
+  // 是 DUZ_ERR_PASSWORD —— 这条不变量是 duz_engine.h 里那个契约的落点。
+  if (code != DUZ_OK) {
+    SetOpenError(code, msg.c_str(), spec->SawEncryptedDataError);
+  }
+  DUZ_LOG("== duz_extract_all 退出 code=%d uncertain=%d Report回调=%llu 失败条目=%u",
+          (int)code, (int)(code == DUZ_ERR_PASSWORD && spec->SawEncryptedDataError),
+          (unsigned long long)spec->ReportCalls, (unsigned)spec->FailedCount);
   return code;
 }
 

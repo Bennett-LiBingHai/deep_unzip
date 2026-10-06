@@ -51,6 +51,11 @@ class FakeStore implements PersistStore {
   /// 最后一次落盘的日志。
   List<LogEntry>? get lastLogs => logsSaved.isEmpty ? null : logsSaved.last;
 
+  /// 最后一次落盘的整库。没写过则为 null（**不是空库** —— 「没写过」和
+  /// 「写了一份空的」是两件事，删掉最后一条密码要的正是后者）。
+  List<PasswordEntry>? get lastVault =>
+      vaultSaved.isEmpty ? null : vaultSaved.last;
+
   /// 落盘的日志里有没有提到 [path]。
   ///
   /// 给「不存解压过的文件夹」那条产品约束用：日志里会出现**文件夹名**

@@ -117,7 +117,7 @@ class _ValueInputModalState extends State<ValueInputModal> {
   /// 预览行要说的话。null 表示这个值可以提交。
   String? get _error {
     final v = _parsed;
-    if (v == null) return '无法识别，改完再试';
+    if (v == null) return '无法识别，请修改后重试';
     return widget.check?.call(v);
   }
 

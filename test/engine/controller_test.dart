@@ -1,9 +1,12 @@
 import 'dart:io';
+import 'dart:isolate';
 
 import 'package:deep_unzip/engine/controller.dart';
+import 'package:deep_unzip/engine/limits.dart';
 import 'package:deep_unzip/engine/models.dart';
 import 'package:deep_unzip/engine/protocol.dart';
 import 'package:deep_unzip/engine/scanner.dart';
+import 'package:deep_unzip/engine/worker.dart';
 import 'package:deep_unzip/models/archive_file.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
@@ -28,11 +31,44 @@ String put(Directory root, String rel, List<int> bytes) {
 /// 启动一个控制器，测试结束自动释放。
 Future<EngineController> booted({
   Duration throttle = Duration.zero,
+  WorkerEntry entryPoint = workerMain,
 }) async {
-  final c = EngineController(throttle: throttle);
+  final c = EngineController(throttle: throttle, entryPoint: entryPoint);
   addTearDown(c.dispose);
   await c.start();
   return c;
+}
+
+/// 一个不碰引擎的假 worker：握手照做，收到 `CmdExtract` 就回一条**填满可选
+/// 字段**的 [EvFailed]。
+///
+/// 存在的意义只有一个：把 `EvFailed` → `EngineException` 那段搬运放到**真的
+/// isolate 边界**上来验。那段代码曾经漏掉过 `uncertain`（见 `EvFailed.uncertain`），
+/// 而漏掉它的现场表现是「弹窗照旧说密码不正确」—— 编译期合法、单测全绿。
+void _fakeFailingWorker(SendPort toMain) {
+  final inbox = ReceivePort();
+  toMain.send(EvReady(inbox.sendPort));
+  inbox.listen((Object? msg) {
+    switch (msg) {
+      case CmdPing(:final token):
+        toMain.send(EvPong(token));
+      case CmdExtract(:final jobId):
+        toMain.send(EvFailed(
+          jobId: jobId,
+          message: '密码不对，或加密数据已损坏',
+          detail: '假 worker 的堆栈',
+          code: DuzErrorCode.password,
+          breach: const LimitBreach(
+            kind: LimitKind.ratio,
+            tag: '解压炸弹',
+            message: '压缩比 2000:1，像是压缩炸弹',
+          ),
+          uncertain: true,
+        ));
+      case CmdShutdown():
+        inbox.close();
+    }
+  });
 }
 
 void main() {
@@ -70,6 +106,39 @@ void main() {
         await c.ping(i);
       }
       expect(c.isRunning, isTrue);
+    });
+  });
+
+  group('失败字段的搬运（跨 isolate 边界）', () {
+    // 这一组盯的是 `EvFailed` → `EngineException` 那段**复制**。
+    //
+    // 为什么必须用假 worker 走一遍真 isolate：这些字段在同一个 isolate 里
+    // 构造、断言、扔掉时**全都对**，因为根本没过边界。`uncertain` 就这么漏过
+    // 一次（只加到了 `EngineException` 上，两个搬运点没跟上），687 条单测全绿，
+    // 真机上却一直显示「密码不正确」。
+
+    t('三个必须显式搬运的字段一个都不丢', () async {
+      // `code` / `breach` / `uncertain` 是仅有的三个「必须显式跨边界传」的字段
+      // （见 `EvFailed` 上的注释）。假 worker 一次把三个都填满，所以任何一处
+      // 漏读都会在这里现形。
+      final c = await booted(entryPoint: _fakeFailingWorker);
+
+      await expectLater(
+        c.extract(parts: const ['/tmp/a.zip'], outDir: '/tmp/out'),
+        throwsA(
+          isA<EngineException>()
+              .having((e) => e.code, 'code', DuzErrorCode.password)
+              .having((e) => e.uncertain, 'uncertain', isTrue)
+              .having((e) => e.breach?.kind, 'breach.kind', LimitKind.ratio),
+        ),
+      );
+    });
+
+    t('假 worker 的 ping 也照常往返（证明确实起的是这个 worker）', () async {
+      // 上面那条要是因为「假 worker 压根没起来」而失败，会表现成超时，不好读。
+      // 这条先证明假 worker 活着、协议能走通。
+      final c = await booted(entryPoint: _fakeFailingWorker);
+      await c.ping(7);
     });
   });
 

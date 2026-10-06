@@ -6,10 +6,13 @@
 ///
 /// 1. **后缀跳过表**（[kContainerExtensions]）：命中就连文件都不开。一次
 ///    Downloads 扫描里几百个 `.docx`/`.apk` 能省掉几百次 open/read 系统调用。
-/// 2. **偏移 0 的强签名**（[_kSignaturesAtZero]）：绝大多数文件在这里就定了。
+/// 2. **文件头签名**：[_kSignaturesAtZero]（压缩包，绝大多数文件在这里就定了）、
+///    [_kSignaturesOffset]（tar / lzh 的固定偏移）、[_kSignaturesExtra]（软件包与
+///    磁盘映像那一批）。
 /// 3. **兜底**：`MZ` 自解压文件在前 1 MiB 内重扫签名；其余文件从文件尾反向
 ///    找 ZIP EOCD 并反推前置数据长度。两级窗口（先 1 KiB 后 128 KiB）是为了
-///    别让「一个都不认识的目录」付出 128 KiB × N 的读放大。
+///    别让「一个都不认识的目录」付出 128 KiB × N 的读放大。最后才看头窗口
+///    之外的两处：0x8000 的 ISO / UDF 卷描述符，和文件尾的 DMG 页脚。
 ///
 /// ## 不做的事
 ///
@@ -109,6 +112,134 @@ const List<_Signature> _kSignaturesOffset = [
   // LHA：偏移 2 起是 `-lh`，如 `-lh5-`
   _Signature(2, [0x2D, 0x6C, 0x68], SniffFormat.lzh, SniffConfidence.medium),
 ];
+
+/// 软件包 / 光盘与磁盘映像这一批的签名（2026-10 补）。
+///
+/// **签名全部照 7-Zip 自己的 `REGISTER_ARC_I` 抄**（见各 `*Handler.cpp` 的
+/// `k_Signature`），7-Zip 认什么我们就认什么，不自己发明判据。
+///
+/// 与 [_kSignaturesAtZero] **分开放**是有意的：那张表同时喂给 `MZ` 自解压壳的
+/// 「前 1 MiB 内任意位置重扫」，而这批签名拿去在一堆可执行文件的内容里乱扫，
+/// 假阳性没有意义 —— 一个 PE 里恰好出现 `xar!` 并不代表它是 xar 包。这张表
+/// **只在固定位置匹配**（偏移 0 或下面写明的那个偏移）。
+///
+/// 置信度沿用上面的规矩：偏移 0 且 4 字节以上给 `high`，其余 `medium`。
+const List<_Signature> _kSignaturesExtra = [
+  // ---- 偏移 0 ----
+  // WIM：`MSWIM\0\0\0`
+  _Signature(0, [0x4D, 0x53, 0x57, 0x49, 0x4D, 0, 0, 0], SniffFormat.wim,
+      SniffConfidence.high),
+  // RPM：`ED AB EE DB`
+  _Signature(0, [0xED, 0xAB, 0xEE, 0xDB], SniffFormat.rpm, SniffConfidence.high),
+  // AR（含 .deb / .a）：`!<arch>\n`
+  _Signature(0, [0x21, 0x3C, 0x61, 0x72, 0x63, 0x68, 0x3E, 0x0A], SniffFormat.ar,
+      SniffConfidence.high),
+  // XAR：`xar!\0`
+  _Signature(0, [0x78, 0x61, 0x72, 0x21, 0x00], SniffFormat.xar,
+      SniffConfidence.high),
+  // CHM：`ITSF` + 版本 3 + 头长 0x60；LIT 电子书：`ITOLITLS` + …
+  _Signature(0, [0x49, 0x54, 0x53, 0x46, 3, 0, 0, 0, 0x60, 0, 0, 0],
+      SniffFormat.chm, SniffConfidence.high),
+  _Signature(
+      0,
+      [0x49, 0x54, 0x4F, 0x4C, 0x49, 0x54, 0x4C, 0x53, 1, 0, 0, 0, 0x28, 0, 0, 0],
+      SniffFormat.chm,
+      SniffConfidence.high),
+  // SquashFS：四种字节序 / 魔数写法（7-Zip 的 `kMultiSignature` 那四条）
+  _Signature(0, [0x68, 0x73, 0x71, 0x73], SniffFormat.squashfs, SniffConfidence.high), // hsqs
+  _Signature(0, [0x73, 0x71, 0x73, 0x68], SniffFormat.squashfs, SniffConfidence.high), // sqsh
+  _Signature(0, [0x73, 0x68, 0x73, 0x71], SniffFormat.squashfs, SniffConfidence.high), // shsq
+  _Signature(0, [0x71, 0x73, 0x68, 0x73], SniffFormat.squashfs, SniffConfidence.high), // qshs
+  // QCOW：`QFI\xFB\0\0\0`（后面跟版本号）
+  _Signature(0, [0x51, 0x46, 0x49, 0xFB, 0, 0, 0], SniffFormat.qcow,
+      SniffConfidence.high),
+  // VMDK 稀疏扩展：`KDMV`
+  _Signature(0, [0x4B, 0x44, 0x4D, 0x56], SniffFormat.vmdk, SniffConfidence.high),
+  // VHD（动态盘的文件头副本）：`conectix\0\0`。固定盘的页脚只在文件尾，不收。
+  _Signature(0, [0x63, 0x6F, 0x6E, 0x65, 0x63, 0x74, 0x69, 0x78, 0, 0],
+      SniffFormat.vhd, SniffConfidence.high),
+  // VHDX：`vhdxfile`
+  _Signature(0, [0x76, 0x68, 0x64, 0x78, 0x66, 0x69, 0x6C, 0x65],
+      SniffFormat.vhdx, SniffConfidence.high),
+  // Android sparse 映像：`3A FF 26 ED 01 00`
+  _Signature(0, [0x3A, 0xFF, 0x26, 0xED, 1, 0], SniffFormat.sparse,
+      SniffConfidence.high),
+  // PPMd：`8F AF AC 84`
+  _Signature(0, [0x8F, 0xAF, 0xAC, 0x84], SniffFormat.ppmd, SniffConfidence.high),
+  // MS 压缩（`EXPAND` 用的 SZDD）：`SZDD 88 F0 27 33 41`
+  _Signature(0, [0x53, 0x5A, 0x44, 0x44, 0x88, 0xF0, 0x27, 0x33, 0x41],
+      SniffFormat.mslz, SniffConfidence.high),
+  // Unix compress（.Z）：`1F 9D`。2 字节，所以只给 medium。
+  _Signature(0, [0x1F, 0x9D], SniffFormat.z, SniffConfidence.medium),
+  // ---- 固定偏移 ----
+  // CramFS：偏移 16 起是 `Compressed ROMFS`
+  _Signature(
+      16,
+      [0x43, 0x6F, 0x6D, 0x70, 0x72, 0x65, 0x73, 0x73, 0x65, 0x64, 0x20, 0x52,
+       0x4F, 0x4D, 0x46, 0x53],
+      SniffFormat.cramfs,
+      SniffConfidence.medium),
+  // VDI：偏移 0x40 起是 `7F 10 DA BE`
+  _Signature(0x40, [0x7F, 0x10, 0xDA, 0xBE], SniffFormat.vdi, SniffConfidence.medium),
+  // NTFS 卷引导扇区：偏移 3 起是 `NTFS    \0`
+  _Signature(3, [0x4E, 0x54, 0x46, 0x53, 0x20, 0x20, 0x20, 0x20, 0],
+      SniffFormat.ntfs, SniffConfidence.medium),
+];
+
+// ---------------------------------------------------------------------------
+// 深处的签名（要多读一次磁盘）
+// ---------------------------------------------------------------------------
+
+/// ISO 9660 / UDF 的卷描述符区从 0x8000 起（前 32 KiB 是留给引导代码的系统区），
+/// 超出了 [kSniffHeadBytes] 的窗口。
+const int kVolumeDescriptorOffset = 0x8000;
+
+/// DMG 的签名不在文件头，而在**文件尾**那块 512 字节的 `koly` 页脚的开头。
+const int kDmgTrailerBytes = 512;
+
+/// 看 0x8000 处的 [kVolumeDescriptorOffset] 起 8 字节是不是 ISO / UDF 卷描述符。
+///
+/// - ISO 9660：`01 'CD001'`（类型字节 1 = 主卷描述符）
+/// - UDF：`00 'BEA01' 01 00`（纯 UDF 光盘，没有 ISO 桥）
+///
+/// 带光盘引导的混合 ISO 的头 512 字节是 MBR 引导码，**头窗口认不出来**，所以
+/// 才必须走这条深探测。纯函数，不碰磁盘，可单测。
+SniffFormat? matchVolumeDescriptor(Uint8List b) {
+  if (b.length >= 6 &&
+      b[0] == 1 &&
+      b[1] == 0x43 &&
+      b[2] == 0x44 &&
+      b[3] == 0x30 &&
+      b[4] == 0x30 &&
+      b[5] == 0x31) {
+    return SniffFormat.iso;
+  }
+  if (b.length >= 8 &&
+      b[0] == 0 &&
+      b[1] == 0x42 &&
+      b[2] == 0x45 &&
+      b[3] == 0x41 &&
+      b[4] == 0x30 &&
+      b[5] == 0x31 &&
+      b[6] == 1 &&
+      b[7] == 0) {
+    return SniffFormat.udf;
+  }
+  return null;
+}
+
+/// 看文件尾 512 字节页脚的开头 12 字节是不是 DMG 的 `koly` 签名。纯函数。
+///
+/// 签名取 7-Zip 的完整 12 字节（`koly` + 版本 4 + 头长 0x200），不只是 4 个
+/// 字母：文件尾的任意 4 个字节碰巧是 `koly` 并不罕见。
+SniffFormat? matchDmgTrailer(Uint8List b) {
+  const sig = [0x6B, 0x6F, 0x6C, 0x79, 0, 0, 0, 4, 0, 0, 2, 0];
+  if (b.length < sig.length) return null;
+  for (var i = 0; i < sig.length; i++) {
+    if (b[i] != sig[i]) return null;
+  }
+  return SniffFormat.dmg;
+}
 
 /// 表里所有签名的首字节，用于重扫时的快速否决。
 final Uint8List _kFirstByteMask = () {
@@ -224,6 +355,13 @@ bool looksLikeMz(Uint8List head) =>
     }
   }
   for (final s in _kSignaturesOffset) {
+    if (_matchesAt(head, s.offset, s)) {
+      return (format: s.format, confidence: s.confidence);
+    }
+  }
+  // 最后才轮到新收的那批。放最后是因为它们里有 2 字节的 `1F 9D` 和位于偏移
+  // 3 的 `NTFS`：前面那些更强、更老的签名先说话。
+  for (final s in _kSignaturesExtra) {
     if (_matchesAt(head, s.offset, s)) {
       return (format: s.format, confidence: s.confidence);
     }
@@ -365,13 +503,27 @@ ContainerKind detectContainer(List<ZipEntry> entries) {
 ///
 /// 这是扫描期唯一该调用的入口。[declaredExt] 不传就从 [path] 推。
 ///
+/// [honorContainerSkip] 为 false 时**两道容器防线一起让位**：后缀跳过表
+/// （[kContainerExtensions]）与中央目录标记检测（[detectContainer]）。这是给
+/// **用户明确点名的文件**用的 —— 「我就要解这一个 `.docx`」是他的权利，我们
+/// 不该拿一条为「扫一整个 Downloads 目录」设计的防线把他挡回来。
+/// **目录扫描永远用默认的 true**，那条防线在那边不能动。
+///
+/// 注意：让位之后魔术字节照读，所以一个真身是 zip 的 `.docx` 会正常被认成
+/// zip；一个真身不是压缩包的（哪怕是真 docx）仍然会以 `unknown` 被丢掉 ——
+/// 让位的是「按后缀/条目名提前判死」，不是「不看内容就收下」。
+///
 /// IO 异常（权限不足、文件消失）会向上抛 `FileSystemException` —— 由调用方
 /// 计入 `ScanSummary.unreadable`，这里不吞。
-Future<SniffResult> sniffFile(String path, {String? declaredExt}) async {
+Future<SniffResult> sniffFile(
+  String path, {
+  String? declaredExt,
+  bool honorContainerSkip = true,
+}) async {
   final ext = declaredExt ?? extensionOf(path);
 
   // 第一级防御：后缀跳过表。连文件都不开。
-  final fast = kContainerExtensions[ext];
+  final fast = honorContainerSkip ? kContainerExtensions[ext] : null;
   if (fast != null) {
     // 后缀在跳过表里 ⇒ 一定不是待解压的压缩包。format 是纯猜测，
     // 所以 confidence 记 none —— 调用方只会看 container / isArchive。
@@ -405,6 +557,7 @@ Future<SniffResult> sniffFile(String path, {String? declaredExt}) async {
       return await _withContainer(
         raf, size, direct.format, direct.confidence, ext, head,
         baseOffset: 0,
+        honorContainerSkip: honorContainerSkip,
       );
     }
 
@@ -417,6 +570,7 @@ Future<SniffResult> sniffFile(String path, {String? declaredExt}) async {
         return await _withContainer(
           raf, size, embedded.format, embedded.confidence, ext, head,
           baseOffset: embedded.offset,
+          honorContainerSkip: honorContainerSkip,
         );
       }
     }
@@ -427,6 +581,20 @@ Future<SniffResult> sniffFile(String path, {String? declaredExt}) async {
       return await _withContainer(
         raf, size, SniffFormat.zip, tail.confidence, ext, head,
         baseOffset: tail.baseOffset,
+        honorContainerSkip: honorContainerSkip,
+      );
+    }
+
+    // 第 3 级之三：ISO / UDF（卷描述符在 0x8000）与 DMG（签名在文件尾）。
+    // 放最后：前面都认不出才值得多花这两次读 —— 而 ZIP 的尾部探测已经证明
+    // 这个文件不是 ZIP 了，剩下的才是它们。
+    final deep = await _sniffDeep(raf, size);
+    if (deep != null) {
+      return SniffResult(
+        format: deep,
+        confidence: SniffConfidence.medium,
+        declaredExt: ext,
+        header: _preview(head),
       );
     }
 
@@ -439,6 +607,23 @@ Future<SniffResult> sniffFile(String path, {String? declaredExt}) async {
   } finally {
     await raf.close();
   }
+}
+
+/// 头窗口之外的两处签名：0x8000 的卷描述符（ISO / UDF），和文件尾的 `koly`（DMG）。
+///
+/// 两次读都很小（8 字节、12 字节），文件不够长时直接跳过，不越界。
+Future<SniffFormat?> _sniffDeep(RandomAccessFile raf, int size) async {
+  if (size >= kVolumeDescriptorOffset + 8) {
+    final vd = await readFully(raf, kVolumeDescriptorOffset, 8);
+    final f = matchVolumeDescriptor(vd);
+    if (f != null) return f;
+  }
+  if (size >= kDmgTrailerBytes) {
+    final trailer = await readFully(raf, size - kDmgTrailerBytes, 12);
+    final f = matchDmgTrailer(trailer);
+    if (f != null) return f;
+  }
+  return null;
 }
 
 /// 前 1 MiB 内重扫偏移 0 签名集合。只在文件确实是 `MZ` 时调用。
@@ -503,6 +688,10 @@ Future<({int baseOffset, SniffConfidence confidence})?> _findZipByTail(
 }
 
 /// 是 ZIP 就补一次容器标记检测。检测失败不影响嗅探结论。
+///
+/// [honorContainerSkip] 为 false 时**跳过标记检测**（`container` 保持 none），
+/// 但照样把条目列出来读一遍 —— 「要不要密码」是从同一份条目录白捡的，与
+/// 「这算不算容器」是两件事，让位只让后者。见 [sniffFile] 的说明。
 Future<SniffResult> _withContainer(
   RandomAccessFile raf,
   int size,
@@ -511,6 +700,7 @@ Future<SniffResult> _withContainer(
   String ext,
   Uint8List head, {
   required int baseOffset,
+  required bool honorContainerSkip,
 }) async {
   if (format != SniffFormat.zip) {
     return SniffResult(
@@ -523,12 +713,27 @@ Future<SniffResult> _withContainer(
   }
 
   var container = ContainerKind.none;
+  bool? encrypted;
   try {
     final listing = await readZipListing(raf, fileSize: size);
-    if (listing != null) container = detectContainer(listing.entries);
+    if (listing != null) {
+      if (honorContainerSkip) {
+        container = detectContainer(listing.entries);
+      }
+
+      // 「要不要密码」也在这里白捡：通用位留在每条中央目录条目上，bit 0 就是
+      // 「这条加密了」，而 `readZipListing` **已经在读**那份条目录了 ——
+      // 同一个字节流上多看一眼的事，不必为此把引擎开起来（7z / RAR 才要，
+      // 见 `EncryptedProbe`）。ZIP 是用户最常撞上的加密格式，这条最勤的那条
+      // 路不能是贵的。
+      //
+      // 任一条加密就算加密：混装的包（部分条目加密）同样得先问密码才解得完。
+      encrypted = listing.entries.any((e) => e.isEncrypted);
+    }
   } catch (_) {
     // 中央目录坏了 / 被加密 / IO 抖动：退化成「不知道是不是容器」，
     // 交给解压期去发现真正的问题。不要在这里把整个扫描打断。
+    // `encrypted` 也就留在 null 上 —— 「不知道」是诚实的答案，别写成 false。
   }
 
   return SniffResult(
@@ -538,6 +743,7 @@ Future<SniffResult> _withContainer(
     baseOffset: baseOffset,
     container: container,
     header: _preview(head),
+    encrypted: encrypted,
   );
 }
 

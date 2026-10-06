@@ -130,6 +130,37 @@ void main() {
       expect(dirty.tags, contains('2 个不可读'));
     });
 
+    test('有几个包要密码就记几个 —— 与首页那张「需密码」统计卡同一个数', () {
+      // 口径必须与首页一致：两处一旦分家，用户会看到卡片说 4、日志说 3。
+      // 所以两边都只认 `ArchiveFlag.encrypted` 这一个来源。
+      final log = buildScanLog(
+        folderName: '下载',
+        summary: summary(items: [
+          item(flags: {ArchiveFlag.encrypted}),
+          item(),
+          item(flags: {ArchiveFlag.encrypted, ArchiveFlag.fakeExtension}),
+        ]),
+        elapsed: Duration.zero,
+        now: now,
+      );
+
+      expect(log.tags, contains('需密码 2'));
+      expect(log.tags, contains('3 个压缩包'));
+    });
+
+    test('一个都不需要密码时，那一格根本不出现', () {
+      // 写 `需密码 0` 会被读成「有 0 个要密码的包」—— 和「没有这项信息」是
+      // 两件事，与「忽略 0 个容器」同一条规矩。
+      final log = buildScanLog(
+        folderName: 'x',
+        summary: summary(items: [item(), item()]),
+        elapsed: Duration.zero,
+        now: now,
+      );
+
+      expect(log.tags.any((t) => t.contains('需密码')), isFalse);
+    });
+
     test('duration 走 formatDuration，不是裸毫秒数', () {
       final log = buildScanLog(
         folderName: 'x',
@@ -259,6 +290,62 @@ void main() {
 
       expect(log.tags, ['分片 ×2', '嵌套', '加密', '伪后缀', '3 项']);
     });
+
+    test('密码是从哪来的：密码库 / 手输密码', () {
+      for (final (source, label) in [
+        (PasswordSource.vault, '密码库'),
+        (PasswordSource.manual, '手输密码'),
+      ]) {
+        final log = buildExtractLog(
+          item: item(flags: {ArchiveFlag.encrypted}),
+          outcome: const ExtractOutcome(
+            outDir: '/sdcard/a',
+            entryCount: 1,
+            unpackedBytes: 1,
+            elapsed: Duration.zero,
+          ),
+          passwordSource: source,
+          now: now,
+        );
+
+        expect(log.tags, contains(label));
+        expect(log.tags, contains('加密'));
+      }
+    });
+
+    test('没用上密码就不出那一格 —— 不能凭空说「密码库」', () {
+      final log = buildExtractLog(
+        item: item(),
+        outcome: const ExtractOutcome(
+          outDir: '/sdcard/a',
+          entryCount: 1,
+          unpackedBytes: 1,
+          elapsed: Duration.zero,
+        ),
+        now: now,
+      );
+
+      expect(log.tags, ['1 项']);
+    });
+
+    test('「密码库」与「加密」是两件事，分卷包上能只出现前者', () {
+      // 分卷加密包扫描期认不出「加密」（见 scanner.dart 那条已知缺口），
+      // 但它照样要密码才解得开。两个标签分开写，正是为了这种分家：
+      // 只看「加密」那一格，用户会发现日志里一个密码相关的字都没有。
+      final log = buildExtractLog(
+        item: item(split: true, parts: const ['/sdcard/s.zip.001', '/sdcard/s.zip.002']),
+        outcome: const ExtractOutcome(
+          outDir: '/sdcard/s',
+          entryCount: 1,
+          unpackedBytes: 1,
+          elapsed: Duration.zero,
+        ),
+        passwordSource: PasswordSource.vault,
+        now: now,
+      );
+
+      expect(log.tags, ['分片 ×2', '密码库', '1 项']);
+    });
   });
 
   group('buildExtractLog —— 失败', () {
@@ -271,6 +358,39 @@ void main() {
 
       expect(log.status, LogStatus.failed);
       expect(log.duration, '-');
+      expect(log.tags, ['密码未匹配']);
+    });
+
+    test('说不清是密码错还是文件坏 → 「密码或损坏」', () {
+      // 7z 的内容加密 / RAR3：没有校验字，错密码与坏数据在解码器眼里一样。
+      // 「密码未匹配」读起来像在说「你的密码错了」，那是把不知道的事说成结论。
+      final log = buildExtractLog(
+        item: item(),
+        error: const EngineException(
+          '密码不对，或加密数据已损坏',
+          code: DuzErrorCode.password,
+          uncertain: true,
+        ),
+        now: now,
+      );
+
+      expect(log.status, LogStatus.failed);
+      expect(log.tags, ['密码或损坏']);
+    });
+
+    test('能确定的密码错（ZIP-AES / RAR5）照旧记「密码未匹配」', () {
+      // 与上一条并排：这两句的分家就是整个 flag 的用处所在。少了这一条，
+      // 把 `uncertain` 写成恒真也照样全绿。
+      final log = buildExtractLog(
+        item: item(),
+        error: const EngineException(
+          '密码不对',
+          code: DuzErrorCode.password,
+          uncertain: false,
+        ),
+        now: now,
+      );
+
       expect(log.tags, ['密码未匹配']);
     });
 

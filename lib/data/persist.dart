@@ -25,11 +25,13 @@
 /// 单测注入 null 或一个假实现就完全绕开插件。
 library;
 
+import '../engine/cycles.dart';
 import '../engine/limits.dart';
 import '../models/log_entry.dart';
 import '../models/password_entry.dart';
 
-/// 出厂默认的六个开关。
+/// 出厂默认的开关。**故意不在这里写条数** —— 这个数字漂过一次（删 `splitMerge`
+/// 时漏改），而「表就在下面几行」本来也不需要数出来。
 ///
 /// 从 `AppState` 搬到这里，是为了让「默认值」只有一个出处：`AppState` 的
 /// 初值和「第一次启动、磁盘上什么都没有」时必须给出同一套，否则「没存过档」
@@ -44,24 +46,97 @@ import '../models/password_entry.dart';
 /// （`duz_extract_all`）根本没有这个参数，要接得改 C++ 重编 `.so`。
 /// CRC 校验的效果一直在：对不上就是 `EngineException`，走的就是那颗
 /// 「跳过 / 停止」弹窗。
+///
+/// 也没有 `splitMerge`（设置页上叫「分片自动合并」），同样 2026-10 删的，
+/// 但**来路和 crcCheck 正好相反**：它不是死开关，链路一直是通的（扫描分组
+/// → `ScanItem.parts` → `duz_open` 多卷），删掉的是「关」那一档 —— 关掉
+/// 之后 `.zip.002` 会因为嗅探不出格式在 `_emitPlain` 里被静默丢掉
+/// （`unreadable` / `containerSkipped` / `warnings` 一个都不记），只剩一行
+/// 没有分片角标、也没有任何提示的 `.001`，用户点下去解的是残缺的包。
+/// 一个开关的两档不该是「能用 / 悄悄丢一半」。而它本来想防的那种误合并，
+/// `scanner.dart` 的「首卷不是压缩包 ⇒ 整组否决、退回普通文件」已经兜住了。
+///
+/// 也没有 `recursive`（设置页上叫「递归解压」），2026-10 删的。这颗跟上面两颗
+/// 都不一样：它不是死开关，也不是「关掉就丢一半」，而是**与 `maxDepth` 管着
+/// 同一件事**。深度填 0 就是不递归，那么再放一颗「递归解压」开关，两者必然
+/// 对不上 —— 开关开着而深度是 0、或者反过来，用户没有任何办法知道该信哪个。
+/// 删掉开关之后深度是唯一入口，`0` 的语义同时从「无限制」翻成了「不递归」
+/// （见 [kDefaultMaxDepth]）。
+/// 也没有 `symmetricOutput`（设置页上原来叫「目录对称输出」），2026-10 改成
+/// `customOutput`（「自定义输出目录」）。**那次改名刻意没有走
+/// [kRenamedToggles]** —— 那颗旧开关从接线到删除**一次都没被读过**（全仓库
+/// 只有设置页写它，`resolveOutputDir` 永远走「解到包旁边」那条路），所以它的
+/// `true` 不承载任何用户意图。照 [kRenamedToggles] 把 `true` 搬过来，只会让新
+/// 语义变成「自定义输出目录 = 开」，**正好反了**。改名要带旧值过来，前提是旧值
+/// 有意义；这里没有，所以旧键直接按「删掉的开关」处理（`settings_repo.load`
+/// 只认本表的键，旧键读都不读）。
 const Map<String, bool> kDefaultToggles = {
-  'recursive': true,
-  'symmetricOutput': true,
+  // 开着 = 每次点「开始解压」先让用户选一个根输出目录，解出来的东西按源目录
+  // 结构镜像写进去（`output_paths.mirroredBaseDir`）；关着 = 解到每个压缩包
+  // 旁边，同级对称（默认）。根目录**不落盘**，每次重选 —— 见 `AppState._outputRoot`。
+  'customOutput': false,
   'fakeExtDetect': true,
-  'splitMerge': true,
-  'pwdAutoTry': true,
+  'pwdPrompt': true,
+  // 手输的密码验通过之后自动存进密码库。**默认开**：用户会去手敲一个密码，
+  // 本身多半就说明这个包他还要再解（同一次备份切出来的一组包、下次还会拿到的
+  // 存档），敲完就丢等于让他重敲。想「这次只是临时看一眼」的人可以关掉它。
+  // 落地在 `AppState._maybeAutoImportPassword`。
+  'pwdAutoSave': true,
   'errorPause': true,
 };
 
-/// 深度默认「无限制」。
-const int kDefaultMaxDepth = 0;
-
-/// 深度芯片依次走过的档位。`0` = 无限制。
+/// 改过名的开关：新键 → 它曾经用过的旧键（按新→旧排序，取第一个有值的）。
 ///
-/// 放在这里是为了让 `AppState.cycleMaxDepth`、设置页的芯片、以及加载时的
-/// 收敛（[coerceMaxDepth]）读同一张表 —— 三处各写一份 `[0, 5, 10, 20]`，
-/// 改动时漏掉一处就是一个只在特定路径上才炸的 bug。
-const List<int> kMaxDepthOptions = [0, 5, 10, 20];
+/// `pwdPrompt` 原叫 `pwdAutoTry`（「密码库自动尝试」）。那个名字说的是**两边
+/// 共有**的那一半 —— 现在无论开关开还是关，密码库都会先自动试一遍；这颗开关
+/// 真正决定的是**试不出来之后问不问**，所以按它实际做的事改了名。不改的话，
+/// 键名会一直指着那个恒为真的动作，下一个读代码的人得先被骗一次。
+///
+/// 与 `settings_repo.dart` 里「老版本删掉的开关一律不读」**不冲突**：那条防
+/// 的是死开关复活，而这个开关一直在，只是名字不再准确 —— 用户的取舍（开还是
+/// 关）要跟过来，不能让他升级一次就发现设置自己变了。
+const Map<String, List<String>> kRenamedToggles = {
+  'pwdPrompt': ['pwdAutoTry'],
+};
+
+/// 递归深度的默认值。**`0` = 不递归**。
+///
+/// ## 「一层」怎么数
+///
+/// 数的是**从被选目录往下走了几步**，「一步」有两种、**同等计入**：
+/// **进一层子目录**、**解开一层嵌套包**（`scanner.dart` 里 `ScanItem.depth`
+/// 写的就是 `baseDepth + 目录层级`）。所以 `子目录/a.zip` 比 `a.zip` 少一层
+/// 预算 —— 它自己已经占掉一层了。这条是**有意为之**，`scanner_test.dart` 里
+/// 「depth 随目录层级递增」那条钉着它。
+///
+/// **顶层那批包也走同一道闸门**（2026-10 补的，见
+/// `AppState._runExtractBatch` 播种那段）：在那之前顶层是无条件排队的，
+/// 于是 `0` 拦得住包**里面**的嵌套包，却拦不住**目录里面**的包 —— 而按上面
+/// 那条规则，后者离被选目录更远。现在两者一视同仁。
+///
+/// 名字里那个「递归」只描述了后一种，念起来容易以为前一种不算 —— 设置页与
+/// 弹窗的说明都把两种写全了，别缩回只提嵌套包那半句。
+///
+/// 这个语义 2026-10 翻过面：原来是「`0` = 无限制」（上界只在实现层
+/// `kHardDepthCeiling` 兜着）。翻面的原因是那颗「递归解压」开关被删了 ——
+/// 它和深度管着同一件事，留两个入口必然对不上（见 [kDefaultToggles] 里
+/// 那一段）。现在深度是唯一入口，`0` 就该是「关」。
+///
+/// 默认取 20 而不是 0：删开关是为了去掉重复，不是为了把递归解压默认关掉。
+/// 20 是原来档位表里最大的一档，实际效果等于解到底 —— 真线上没有会嵌套到
+/// 20 层的包 —— 所以老用户升级过来行为不变。
+const int kDefaultMaxDepth = 20;
+
+/// 递归深度可填范围的**下界**，同时也是「不递归」那一档。
+///
+/// 0 在这里是**语义**而不是「填错了」，所以合法 —— 与 [kMinMaxLogs] 恰好
+/// 相反，那边 0 被排除是因为「不记录日志」该是另一个开关（见那边的注释）。
+const int kMinMaxDepth = 0;
+
+/// 递归深度可填范围的**上界**，直接用实现层那道硬顶
+/// （[kHardDepthCeiling]）。「用户能填多少」与「代码真正允许多深」是同一个
+/// 数，不必各写一份、再靠测试盯着它们别走散 —— 与 [kMaxMaxLogs] 同一个写法。
+const int kMaxMaxDepth = kHardDepthCeiling;
 
 /// 日志封顶的默认值。与原型期行为一致（那时候是 `AppState._maxLogs = 300`）。
 const int kDefaultMaxLogs = 300;
@@ -83,12 +158,19 @@ const int kMinMaxLogs = 1;
 /// 一百万。
 const int kMaxMaxLogs = 5000;
 
-/// 把磁盘上读回来的深度收敛到 [kMaxDepthOptions] 里。
+/// 把磁盘上读回来的深度夹进 [kMinMaxDepth]–[kMaxMaxDepth]。
 ///
-/// **必须收敛**：`settings_screen` 的芯片用 `kMaxDepthOptions.indexOf(maxDepth)`
-/// 定位，表外的值给出 `-1`，再拿去索引标签数组就是越界 —— 设置页直接打崩。
-/// 老版本写的档位、被人手改过的文件，都可能给出表外的值。
-int coerceMaxDepth(int? raw) => _nearest(kMaxDepthOptions, raw, kDefaultMaxDepth);
+/// 与 [coerceMaxLogs] 一样**不吸附**：深度已经是自由输入，磁盘上那个数就是
+/// 用户自己填的，没有一张档位表可以让它「最近」到哪儿去。越界只可能是手改
+/// 文件、或更早的版本留下的残值 —— 夹回边界是唯一说得过去的解释。
+///
+/// **老档里的 `0` 会照读成「不递归」**，这确实是语义翻面带来的一次行为变化：
+/// 旧版本里 `0` 是「无限制」，而当时它同时是出厂默认值。这里**不替用户翻译**
+/// —— 无法区分「旧版写的 0」和「用户刚照着新语义设的 0」，猜错的方向是把人
+/// 特意关掉的递归又打开。本 app 尚未上架，没有真实用户档要迁移；真要迁移，
+/// 得换键名（`maxDepthV2`）而不是在这里猜。
+int coerceMaxDepth(int? raw) =>
+    raw == null ? kDefaultMaxDepth : raw.clamp(kMinMaxDepth, kMaxMaxDepth);
 
 /// 把磁盘上读回来的日志封顶夹进 [kMinMaxLogs]–[kMaxMaxLogs]。
 ///
@@ -97,20 +179,6 @@ int coerceMaxDepth(int? raw) => _nearest(kMaxDepthOptions, raw, kDefaultMaxDepth
 /// 越界只能是手改文件或跨版本残留，夹回边界是唯一说得过去的解释。
 int coerceMaxLogs(int? raw) =>
     raw == null ? kDefaultMaxLogs : raw.clamp(kMinMaxLogs, kMaxMaxLogs);
-
-/// 取表里离 [raw] 最近的一档；[raw] 为 null 或表是空的时给 [fallback]。
-///
-/// 取**最近的合法档**而不是无脑归零：用户真设过 20 层，值要是恰好落在表外，
-/// 归零等于把他设的限制悄悄放开。距离相等时留先遇到的那个（表里靠前的档）。
-int _nearest(List<int> options, int? raw, int fallback) {
-  if (raw == null) return fallback;
-  if (options.contains(raw)) return raw;
-  var best = options.first;
-  for (final v in options) {
-    if ((v - raw).abs() < (best - raw).abs()) best = v;
-  }
-  return best;
-}
 
 /// 炸弹防护默认停在 `kLimitPresets` 里「标准」那档。
 ///

@@ -172,6 +172,57 @@ Uint8List realZip(Map<String, String> files) {
   return ZipEncoder().encodeBytes(archive);
 }
 
+/// EOCD 签名 `PK\x05\x06`。`zip_dir.dart` 只导出了「最小长度」那个常量，
+/// 签名本身没导出（它只需要在内部按偏移找），所以这里自带一份。
+const int _kEocdSignature = 0x06054B50;
+
+/// 加密位：中央目录记录的通用位 bit 0。
+///
+/// 与 `zip_dir.dart` 的 `kFlagEncrypted` 同值 —— 那边导出了，这里刻意用
+/// 字面量再写一遍：夹具要是直接引用被测代码的常量，那条常量被人改错时
+/// **两边一起错**，测试照样绿。手写 0x0001 才让它们互相印证。
+const int _kFlagEncryptedInFixture = 0x0001;
+
+/// [realZip] 的加密版：把每条中央目录记录的通用位 bit 0 打开。
+///
+/// 只动中央目录、**不动局部头**：这样嗅探还是按正常的 ZIP 认出来（局部头
+/// `PK\x03\x04` 原封不动），而「要不要密码」正是从中央目录读的 —— 于是这个
+/// 夹具逼着被测代码走「读中央目录 → 认加密位」这条路，而不是蒙对。
+///
+/// 真实的加密 zip 两处都会置位，但这里只改判据真正看的地方，免得夹具比
+/// 被测代码知道得还多。
+Uint8List encryptedZip(Map<String, String> files) {
+  final bytes = Uint8List.fromList(realZip(files));
+  final bd = ByteData.sublistView(bytes);
+
+  var eocd = -1;
+  for (var i = bytes.length - kEocdMinSize; i >= 0; i--) {
+    if (bd.getUint32(i, Endian.little) == _kEocdSignature) {
+      eocd = i;
+      break;
+    }
+  }
+  if (eocd < 0) throw StateError('夹具里没找到 EOCD，ZipEncoder 的输出变了？');
+
+  var off = bd.getUint32(eocd + 16, Endian.little); // 中央目录起始偏移
+  final count = bd.getUint16(eocd + 10, Endian.little);
+  for (var n = 0; n < count; n++) {
+    if (bd.getUint32(off, Endian.little) != kCentralHeaderSignature) {
+      throw StateError('第 $n 条中央目录记录的签名不对，偏移算错了');
+    }
+    bd.setUint16(
+      off + 8,
+      bd.getUint16(off + 8, Endian.little) | _kFlagEncryptedInFixture,
+      Endian.little,
+    );
+    off += 46 +
+        bd.getUint16(off + 28, Endian.little) + // 名长
+        bd.getUint16(off + 30, Endian.little) + // 额外字段长
+        bd.getUint16(off + 32, Endian.little); // 注释长
+  }
+  return bytes;
+}
+
 // ---------------------------------------------------------------------------
 // 临时文件
 // ---------------------------------------------------------------------------

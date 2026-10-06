@@ -153,11 +153,18 @@ const _cmdSamples = <WorkerCmd>[
     rootPath: '/sdcard/Download',
     options: ScanOptions(
       detectFakeExtension: false,
-      mergeSplitVolumes: false,
       pruneDirs: {'node_modules', '.git', 'Android/data'},
     ),
     skipDirs: {'/sdcard/Download/duz_out'},
     depth: 3,
+  ),
+  // 可选字段一律给**非默认值**，否则「填满」是假的（与 `EvFailed.uncertain`
+  // 那条同一个规矩）：所以两个开关都显式写成 false，尽管默认是 true。
+  CmdScanFiles(
+    jobId: 3,
+    paths: ['/sdcard/Download/报告.docx'],
+    ignoreContainers: false,
+    expandSplitVolumes: false,
   ),
   CmdExtract(
     jobId: 2,
@@ -200,6 +207,8 @@ List<WorkerEvent> _eventSamples(SendPort commandPort) => [
     message: '归档损坏，无法读取中央目录',
     detail: 'DuzEngineException(-1): ...',
     code: DuzErrorCode.extract,
+    // 按本文件顶上那条规矩来：可选字段给非默认值，否则「填满」是假的。
+    uncertain: true,
   ),
 ];
 
@@ -215,6 +224,7 @@ List<WorkerEvent> _eventSamples(SendPort commandPort) => [
 Null _coverEveryCmd(WorkerCmd c) => switch (c) {
   CmdPing() => null,
   CmdScan() => null,
+  CmdScanFiles() => null,
   CmdExtract() => null,
   CmdCancel() => null,
   CmdShutdown() => null,

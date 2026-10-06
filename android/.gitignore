@@ -7,8 +7,21 @@ gradle-wrapper.jar
 GeneratedPluginRegistrant.java
 .cxx/
 
-# Remember to never publicly share your keystore.
-# See https://flutter.dev/to/reference-keystore
+# Gradle 在 `android/` 这一层也会产出东西（比如 `build/reports/problems/`
+# 那份 HTML）。**根目录那条 `/build/` 管不到这里** —— 它锚在仓库根，
+# 所以少了这一行，`android/build/` 会被整个提交进去。本机漏过一次。
+/build
+
+# ===== 签名材料：**永不入库** =====
+#
+# 这几条是 Flutter 模板自带的，别删。理由比模板里那句「不要公开分享你的
+# keystore」更具体：
+#
+# keystore 一旦进了公开仓库，任何人都能拿它以我们的名义签出「同一个应用」的
+# 升级包 —— 应用商店认签名不认人。而且**事后从 git 历史里删掉是没用的**，
+# 历史仍然找得回来；唯一干净的补救是换密钥 + 换包名 + 重新上架。
+#
+# 要提交的是 `key.properties.example` 那份**没有密钥的模板**。
 key.properties
 **/*.keystore
 **/*.jks

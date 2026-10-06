@@ -2,12 +2,10 @@ import 'dart:async';
 import 'dart:collection';
 import 'dart:io';
 
-import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 import 'package:permission_handler/permission_handler.dart';
 
-import '../data/builtin_extractors.dart';
 import '../data/persist.dart';
 import '../engine/controller.dart';
 import '../engine/cycles.dart';
@@ -20,11 +18,13 @@ import '../engine/progress_meter.dart';
 import '../engine/protocol.dart';
 import '../engine/scanner.dart';
 import '../models/archive_file.dart';
-import '../models/extractor.dart';
 import '../models/log_entry.dart';
 import '../models/password_entry.dart';
-import '../services/prompts.dart';
 import '../services/disk_space.dart';
+import '../services/keep_alive.dart';
+import '../services/notification_permission.dart';
+import '../services/password_prompt.dart';
+import '../services/prompts.dart';
 
 /// 这批解压**最后是怎么收场的**。总结卡片的标题、配色、图标全看它。
 ///
@@ -87,16 +87,22 @@ class AppState extends ChangeNotifier {
   AppState({
     EngineController? engine,
     DiskSpaceProbe? diskSpace,
+    KeepAlive? keepAlive,
+    NotificationPermission? notifications,
     ArchivePrompt? prompt,
     FormatDetectPrompt? formatPrompt,
+    PasswordPrompt? passwordPrompt,
     // 参数名与字段名（`_store`）**不止差一个下划线** —— 与上面那条同因：
     // 叫 `store` 会换来一条 Dart 根本没法照做的假警告。
     PersistStore? persistStore,
     AppSnapshot? restore,
   })  : _injectedEngine = engine,
         _diskSpace = diskSpace ?? DiskSpaceProbe(),
+        _keepAlive = keepAlive ?? KeepAlive(),
+        _notifications = notifications ?? NotificationPermission(),
         _onPrompt = prompt,
         _onFormatDetect = formatPrompt,
+        _onPassword = passwordPrompt,
         _store = persistStore {
     // 出厂值在字段初始化时就位了（见下方 `_settings` 等），这里把磁盘上读回来
     // 的那份盖上去。**在构造函数体里做而不是让调用方改**，是为了让「读到的
@@ -121,6 +127,24 @@ class AppState extends ChangeNotifier {
   /// 的 `CmdExtract.availableBytes`）。
   final DiskSpaceProbe _diskSpace;
 
+  /// 解压期间让系统别回收我们。同样走平台通道，同样只在主 isolate 上用。
+  ///
+  /// **它是尽力而为的加强，失败了不影响解压** —— 见 `services/keep_alive.dart`
+  /// 开头那段。所以这里不做任何状态回读，界面也不需要知道它有没有起来。
+  final KeepAlive _keepAlive;
+
+  /// 问通知权限（Android 13+）。同样只在主 isolate 上用，同样是尽力而为 ——
+  /// 拒绝了只是少一条通知，解压绝不因此被拦（见 `services/notification_permission.dart`）。
+  final NotificationPermission _notifications;
+
+  /// 上一次往通知上推进度的时间。
+  ///
+  /// 进度事件被控制器节流到 8Hz，而**改一条通知不是免费的**：每次 notify 都要
+  /// 过一次系统通知服务，各家 ROM 上还会触发通知栏重排。8Hz 地推等于拿解压的
+  /// IO 去抢一个用户根本看不清的刷新率。所以通知自己再节一层，两秒够用了 ——
+  /// 它显示的是「还在动，到哪了」，不是毫秒级读数。
+  DateTime? _lastKeepAliveAt;
+
   /// 一个包处理不了时问用户「继续 / 停止」。
   ///
   /// 两档共用这一个回调：炸弹/空间闸门拦下，和解压出错。原先是两个（`_onBlocked`
@@ -139,6 +163,13 @@ class AppState extends ChangeNotifier {
   /// 静默按真实格式解 —— 那正是加这个弹窗之前的行为。
   final FormatDetectPrompt? _onFormatDetect;
 
+  /// 密码库试不出来时问用户「停止 / 跳过 / 手动输入」（需求 2）。
+  ///
+  /// **为 null 时的行为等同于那颗开关关掉**：静默跳过这个包。不是「当作用户
+  /// 选了跳过」——调用方分得清（见下面 [_PasswordVerdict.autoSkipped]），
+  /// 日志上一个是「已按选择跳过」，一个是「密码未匹配」。
+  final PasswordPrompt? _onPassword;
+
   // 文件夹
   bool _folderSelected = false;
   String _folderName = '';
@@ -146,6 +177,28 @@ class AppState extends ChangeNotifier {
   bool get folderSelected => _folderSelected;
   String get folderName => _folderName;
   String get folderPath => _folderPath;
+
+  /// 「输出到」那一格该显示什么。
+  ///
+  /// **对称输出时输出落在源所在的目录**，所以这一格说的永远是那个目录 ——
+  /// 选了单个文件时 [folderName] 是**文件名**（卡片标题要它），拿它去填
+  /// 「输出到」就是一句假话。
+  String get outputDirName => p.basename(_folderPath);
+
+  /// 「自定义输出目录」开着时用户选的那个根目录；空串 = 没选。
+  ///
+  /// **只活在内存里**：按用户的要求，根目录不落盘，每次点「开始解压」重选一遍。
+  /// 所以它没有 `_persistSettings`/`_applySnapshot` 的份 —— 别顺手把它加进去。
+  String _outputRoot = '';
+  String get outputRoot => _outputRoot;
+
+  /// 这个会话里**选过**的根目录。扫描时要跳过它们，否则输出会被当成下一轮的
+  /// 输入（`解压 → 重扫 → 再解压` 自噬）。记一个**集合**而不是只记当前那个：
+  /// 用户可能这批选 A、下批选 B，A 底下那棵树还留在磁盘上。
+  ///
+  /// 同样不落盘。代价是重启之后那次扫描认不出上一轮的输出 —— 已知、刻意，
+  /// 是「根目录不持久化」那条要求的直接产物。
+  final Set<String> _outputRootsSeen = {};
 
   // 扫描结果
   List<ArchiveFile> _archives = [];
@@ -159,8 +212,8 @@ class AppState extends ChangeNotifier {
   /// 本轮扫描用的参数快照。
   ///
   /// 存下来是给**嵌套扫描**用的：解压期发现的包要按同一份快照去识别，
-  /// 否则用户在设置里关掉的 `splitMerge` / `fakeExtDetect` 会在嵌套那一层
-  /// 悄悄复活，表现为「设置好像不生效」。
+  /// 否则用户在设置里关掉的 `fakeExtDetect` 会在嵌套那一层悄悄复活，
+  /// 表现为「设置好像不生效」。
   ScanOptions _scanOptions = const ScanOptions();
 
   // 扫描进行中
@@ -198,7 +251,7 @@ class AppState extends ChangeNotifier {
   /// 这一批是怎么收场的；`null` = 这份扫描快照还没跑过。见 [BatchOutcome]。
   ///
   /// 它是**唯一**的收场标志：界面出不出总结卡片、卡片写什么标题、主按钮是
-  /// 「开始智能解压」还是「换个文件夹」，全部由它派生 —— 见 [batchRun]。
+  /// 「开始解压」还是「更换目标」，全部由它派生 —— 见 [batchRun]。
   ///
   /// 从前这里是 `_completed` + `_stopReason` + `_batchRun` 三份状态，而界面
   /// 拿 `_completed`（= 全部成功）去问「该不该出卡片」，全批失败时卡片就不见了。
@@ -256,13 +309,13 @@ class AppState extends ChangeNotifier {
   int get failedCount => _failedCount;
 
   /// 这批扫描结果已经解压过了（无论成败、包括被停掉的）。为真时主按钮应换成
-  /// 「换个文件夹」，不能再是「开始智能解压」—— 一旦这批跑过，再点就等于把
+  /// 「更换目标」，不能再是「开始解压」—— 一旦这批跑过，再点就等于把
   /// 同一个队列重排一遍，而输出目录重名会追加 `_1`/`_2`（见 output_paths.dart），
   /// 结果不是「重新解一遍」而是往磁盘里撒重复目录。
   ///
   /// **停止也算跑过了**（原先是例外，真机验收时改的）：停下来的那一批现在会
-  /// 落在总结卡片上，卡片上写清「已完成 1/3 个压缩包」，主按钮是「换个文件夹」
-  /// —— 那是一条明确的出路。留着「开始智能解压」反而像什么都没发生过，用户会
+  /// 落在总结卡片上，卡片上写清「已完成 1/3 个压缩包」，主按钮是「更换目标」
+  /// —— 那是一条明确的出路。留着「开始解压」反而像什么都没发生过，用户会
   /// 以为按下就能接着解剩下那两个，实际却是把已解过的重解一遍。
   ///
   /// 它与 [outcome] 是同一个事实的两种问法（「跑过没有」/「跑得怎么样」），
@@ -341,11 +394,6 @@ class AppState extends ChangeNotifier {
     return dropped;
   }
 
-  // 解压器。**内置那几条是真配置，不是演示数据** —— 见 BuiltinExtractors。
-  // 从原来的 mock_data.dart 搬过来只是因为那里被整个删掉了。
-  final List<Extractor> _extractors = List.from(BuiltinExtractors.all);
-  List<Extractor> get extractors => List.unmodifiable(_extractors);
-
   // 设置开关。初值抄自 `data/persist.dart` 那张表 —— 与「磁盘上什么都没有」
   // （`AppSnapshot.empty`）时给的那一份必须是同一套，否则「首次启动」和
   // 「存过档」会跑出两种行为，最难查。
@@ -357,17 +405,20 @@ class AppState extends ChangeNotifier {
     _persistSettings();
   }
 
-  int _maxDepth = kDefaultMaxDepth; // 0 = 无限制
+  int _maxDepth = kDefaultMaxDepth; // 0 = 不递归
   int get maxDepth => _maxDepth;
-  void cycleMaxDepth() {
-    // 档位表在 `data/persist.dart`：设置页的芯片、加载时的收敛
-    // （`coerceMaxDepth`）与这里读的是同一份。三处各写一份 `[0, 5, 10, 20]`
-    // 的话，改动时漏掉一处就是一个只在特定路径上才炸的 bug。
-    //
-    // `indexOf` 给出 -1 时（值不在表里）取到 `kMaxDepthOptions[0]`，安全 ——
-    // 加载时已经收敛过，这只是第二道防线。
-    final idx = kMaxDepthOptions.indexOf(_maxDepth);
-    _maxDepth = kMaxDepthOptions[(idx + 1) % kMaxDepthOptions.length];
+
+  /// 改递归深度。**`0` 就是不递归。**
+  ///
+  /// 2026-10 之前这里叫 `cycleMaxDepth`，在一张固定档位表 `[0,5,10,20]` 上
+  /// 转圈，而 `0` 那一档的含义是「无限制」。同月两颗一起改了：档位表换成
+  /// 自由输入（与日志条数同一个理由 —— 几张别人挑好的档，不如让自己填），
+  /// `0` 的含义翻成「关」，那颗与它重复的「递归解压」开关删掉。
+  ///
+  /// 界外由 `coerceMaxDepth` 夹回 [kMinMaxDepth]–[kMaxMaxDepth]：弹窗那边
+  /// 先拦一道，这里是第二道。与 [setMaxLogs] 同一个写法。
+  void setMaxDepth(int value) {
+    _maxDepth = coerceMaxDepth(value);
     _notify();
     _persistSettings();
   }
@@ -539,6 +590,9 @@ class AppState extends ChangeNotifier {
     final controller = _injectedEngine ?? EngineController();
     controller.onScanTick = _onScanTick;
     controller.onExtractTick = _onExtractTick;
+    // 后台那一份只喂通知。少了这一句，锁屏期间进度条和通知**一起**冻住 ——
+    // 而通知本来正是为了「用户看不见界面」才存在的。
+    controller.onExtractTickBackground = _onExtractTickBackground;
     try {
       await controller.start();
     } catch (_) {
@@ -561,42 +615,69 @@ class AppState extends ChangeNotifier {
   // 目录选择与扫描
   // ---------------------------------------------------------------------------
 
-  /// 选一个文件夹并递归扫描。UI 现存调用点都长这样，所以保持 `void`，
-  /// 真正的异步流程在 [_pickFolderAndScan] 里跑。
-  void selectFolder() {
-    unawaited(_pickFolderAndScan());
-  }
-
-  Future<void> _pickFolderAndScan() async {
-    if (_scanning) return;
-
-    if (!await _ensureStoragePermission()) {
-      showToast('需要「所有文件访问权限」才能递归扫描目录', type: 'warn');
-      return;
-    }
-
-    String? path;
-    try {
-      // file_picker 13 起全部改成静态方法（`FilePicker.platform` 已移除）。
-      path = await FilePicker.getDirectoryPath(dialogTitle: '选择要扫描的文件夹');
-    } catch (e) {
-      showToast('打开目录选择器失败：$e', type: 'warn');
-      return;
-    }
-    if (path == null || path.isEmpty) return; // 用户点了取消，不打扰
-
-    await selectFolderPath(path);
-  }
-
-  /// 扫描指定目录。与 `selectFolder()` 分开是因为选目录流程依赖
-  /// `FilePicker` 的平台通道，而这里只依赖引擎 —— 将来「最近使用」、
-  /// 「用 DeepUnzip 打开」这类入口也走这里。
+  /// 扫描指定目录。
+  ///
+  /// 「选一个目录」这个动作（需要 `BuildContext`）在屏幕层 —— 自建的文件浏览器
+  /// 是个页面，而这一层**不 import `package:flutter`**（要能跑在 isolate 里、
+  /// 能纯单测）。所以这里只收已经选好的路径；将来的「最近使用」「用 DeepUnzip
+  /// 打开」这类入口也走这里。
   Future<void> selectFolderPath(String path) async {
+    final name = p.basename(path);
+    await _runScan(
+      sourceRoot: path,
+      displayName: name.isEmpty ? path : name,
+      start: (engine, options) => engine.scan(
+        rootPath: path,
+        options: options,
+        // 跳过这个会话里选过的输出根。管子（`CmdScan.skipDirs` → scanner 的
+        // `_shouldSkipDir`）一直是通的，只是从前没人传 —— 因为从前没有「用户
+        // 指定的输出根」这个概念，输出一律在包旁边。
+        //
+        // 传一个**集合**：用户可能这批选 A、下批选 B（根目录不落盘，每次重选），
+        // A 底下那棵树还在磁盘上。不跳的话下一轮扫描会把上一轮的输出当输入，
+        // 解出来的东西再被解一遍 —— 那正是 `scanner.dart` 里 `kSelfOutputDirs`
+        // 想防的自噬，只是那个名单只认名前缀，认不出任意路径。
+        // 传一份**拷贝**：`_outputRootsSeen` 是活的可变集合，而这条命令要跨
+        // isolate 边界送出去，送一个还会被就地改动的对象不是个好主意。
+        skipDirs: {..._outputRootsSeen},
+      ),
+    );
+  }
+
+  /// 扫描**用户点名的那个文件**，不管同目录里别的文件。
+  ///
+  /// 两处与 [selectFolderPath] 不同，都在引擎那侧（见 `CmdScanFiles`）：
+  /// 容器防线让位（用户点了一个 `.docx` 就是想要它）、分卷在同目录里自动补齐
+  /// （`x.zip.001` 单独一片在解码器眼里什么都不是）。
+  ///
+  /// **`_folderPath` 取父目录**：它同时是自定义输出目录的镜像基准、剩余空间
+  /// 探测的目标卷、「打开输出目录」的兜底。单选文件时设成父目录，这三个角色
+  /// 全都仍然成立 —— 镜像时 relative 得到文件名本身、dirname 是 `.`，于是输出
+  /// 落在输出根上；探测的是正确的卷；打开的是父目录。
+  Future<void> selectFilePath(String path) async {
+    final name = p.basename(path);
+    await _runScan(
+      sourceRoot: p.dirname(path),
+      displayName: name.isEmpty ? path : name,
+      start: (engine, options) =>
+          engine.scanFiles(paths: [path], options: options),
+    );
+  }
+
+  /// 两条扫描入口共用的那一段：状态迁移、取消、落结果、出错收尾。
+  ///
+  /// 抽出来是因为「选文件夹」与「选文件」只在**引擎那条命令**和**源根从哪来**
+  /// 上不同，其余（清空上一轮、置扫描态、取消语义、失败也要记一条日志）一字
+  /// 不差。复制一份的话，将来改一处必然漏另一处。
+  Future<void> _runScan({
+    required String sourceRoot,
+    required String displayName,
+    required Future<ScanOutcome> Function(EngineController, ScanOptions) start,
+  }) async {
     if (_scanning) return;
 
-    _folderPath = path;
-    _folderName = p.basename(path);
-    if (_folderName.isEmpty) _folderName = path;
+    _folderPath = sourceRoot;
+    _folderName = displayName;
     _folderSelected = true;
     _resetExtractState();
     _clearScanResult();
@@ -605,17 +686,16 @@ class AppState extends ChangeNotifier {
     _scanFound = 0;
     _scanCurrent = '';
     _notify();
-    showToast('正在递归扫描压缩包...');
+    showToast('正在扫描压缩包…');
 
     try {
       final engine = await _ensureEngine();
       // 快照下来，嵌套扫描（解压期发现的新包）要用同一份，见 [_scanOptions]。
       final options = ScanOptions(
         detectFakeExtension: setting('fakeExtDetect'),
-        mergeSplitVolumes: setting('splitMerge'),
       );
       _scanOptions = options;
-      final pending = engine.scan(rootPath: path, options: options);
+      final pending = start(engine, options);
       if (_cancelRequested) {
         // 先发任务再发取消，顺序不能反：控制器的取消只作用于「正在跑的
         // 任务」（`_activeJob == null` 时直接返回），worker 也只在 runScan
@@ -687,6 +767,7 @@ class AppState extends ChangeNotifier {
         ArchiveFile(
           name: item.fileName,
           type: item.sniff.format.archiveType,
+          badge: item.sniff.format.badge,
           size: formatBytes(item.sizeBytes),
           flags: item.flags.toList(),
           depth: item.depth,
@@ -726,7 +807,11 @@ class AppState extends ChangeNotifier {
   /// 读写外部存储（API ≤ 29）。非 Android 直接放行。
   ///
   /// 权限被拒**不能**让应用不可用：返回 false，由调用方给一句提示。
-  Future<bool> _ensureStoragePermission() async {
+  /// 存储权限前置。**公开**：选目录 / 选文件 / 选输出根三个动作都搬到了屏幕层
+  /// （自建的文件浏览器是个页面，需要 `BuildContext`），而权限**必须在打开它
+  /// 之前**拿到 —— 没有权限时那个页面列出来的每个目录都会是「读不了」，用户会
+  /// 以为是浏览器坏了。
+  Future<bool> ensureStoragePermission() async {
     if (kIsWeb || !Platform.isAndroid) return true;
 
     try {
@@ -769,22 +854,40 @@ class AppState extends ChangeNotifier {
     _manualSkips = 0;
   }
 
+  /// 记下这次的输出根。**不碰平台通道**，所以测试可以直接调。
+  ///
+  /// 同时并进 [_outputRootsSeen]，供扫描跳过（见那个字段）。
+  void setOutputRoot(String path) {
+    if (path.isEmpty) return;
+    _outputRoot = path;
+    _outputRootsSeen.add(path);
+    _notify();
+  }
+
   /// 开始把扫描到的压缩包逐个解开。
   ///
-  /// 输出目录与源同级（`A/B/c.zip` → `A/B/c/`），重名追加 `_1`。递归解压
-  /// （解出来的包里还有包）是 P2，这里只处理顶层的一批。
+  /// 输出目录默认与源同级（`A/B/c.zip` → `A/B/c/`），重名追加 `_1`；
+  /// 「自定义输出目录」开着时改成「用户选的根目录 + 源目录结构的镜像」。
   void startExtract() {
     if (_extracting) return;
     if (_archives.isEmpty) {
-      showToast('先选择一个文件夹并完成扫描', type: 'warn');
+      showToast('请先选择目标文件或文件夹并完成扫描', type: 'warn');
+      return;
+    }
+    // 开着自定义输出目录却没选根 = 不知道该往哪写。界面上那条路（`_onStart`）
+    // 会先把选择器弹出来，走不到这儿；但这是**公开方法**，测试和其它调用点
+    // 得自己站得住 —— 真让它跑下去，`_outputRoot` 是空串，输出会静默退回
+    // 「解到包旁边」，与用户以为的完全相反。
+    if (setting('customOutput') && _outputRoot.isEmpty) {
+      showToast('请先指定输出根目录', type: 'warn');
       return;
     }
     // 这份快照已经跑过一轮了。**这道闸门是必须的，不能只靠界面上把按钮改个
     // 名字** —— 重跑不会「再解一遍」，而是把同一个队列重排一次，输出目录
     // 重名时会追加 `_1`/`_2`，等于往磁盘里撒重复目录（见 output_paths.dart）。
-    // 想再来一遍就重新选一次目录，那会重新扫描，拿到的是新快照。
+    // 想再来一遍就重新选一次目标，那会重新扫描，拿到的是新快照。
     if (batchRun) {
-      showToast('这批已经解压过了，换个文件夹再试', type: 'warn');
+      showToast('本批已解压完成，请重新选择目标', type: 'warn');
       return;
     }
     unawaited(_runExtractBatch());
@@ -808,7 +911,252 @@ class AppState extends ChangeNotifier {
     _cancelRequested = true;
     _stoppedByUser = true;
     _notify();
-    showToast('将在当前压缩包解完后停止');
+    showToast('将在当前压缩包解压完成后停止');
+  }
+
+  // ---------------------------------------------------------------------------
+  // 密码（需求 2）
+  // ---------------------------------------------------------------------------
+
+  /// 本次解压里已经**用成功过**的密码，最近成功的在最前面。
+  ///
+  /// 「一批里有一个包能被某个密码打开，同一批的其它包大概率也是它」—— 同一次
+  /// 备份切出来的一组包、同一个来源的压缩包，基本都是。有了它，这批里剩下的包
+  /// 不必再从头把密码库撸一遍。
+  ///
+  /// **只活在内存里，每批开始清空**（见 `_runExtractBatch` 那段重置）。不落盘
+  /// 有两个理由：一是计划里那条「该目录上次成功的密码优先」要 journal，等
+  /// `JournalRepo` 落地再谈持久化；二是密码多存一份就多一处要守的东西，而密码库
+  /// 本身已经在 `flutter_secure_storage` 里了。真要跨批，把 `.clear()` 挪出
+  /// `_runExtractBatch` 即可 —— 但那样「上礼拜试出来过的一个密码」会排到所有
+  /// 候选前面去，先试错一次的成本就从「这批」变成「一直」。
+  ///
+  /// 手输的密码**同样记**：那是用户刚亲手证明能用的，比库里任何一条都更该被优先
+  /// 试。空密码那次不记 —— 它回答的是「这个包压根不要密码」，而且那一次本来就
+  /// 排在全部候选前面。
+  ///
+  /// 这份记忆**不跟着密码库走**：用户中途把某条从库里删掉，这批里剩下的包还是会
+  /// 先试它。这是刻意的 —— 它是这批里**试出来过**的，不是库里的。
+  final List<String> _runGoodPasswords = [];
+
+  /// 按顺序该试哪些密码。
+  ///
+  /// 两层：**本次解压命中过的**在最前（见 [_runGoodPasswords]），后面才是密码库
+  /// 按 `hitCount` 排出来的。第一层为空时它什么也不占。
+  ///
+  /// 排的是**视图**不是 `_passwords` 本身：密码库页面按插入序渲染（最新加的
+  /// 在最上面），在这里就地排序会让页面上的条目自己跳来跳去。
+  ///
+  /// 库那一层的排序键只有 `hitCount` 一个，并列时按插入序。计划里还写了
+  /// 「该目录上次成功的密码优先」和「`lastUsed` 降序」——前者要 journal
+  /// （`JournalRepo` 还没做），后者不行：`lastUsed` 是**已经格式化好的展示串**
+  /// （「今天 14:32」这种），拿它排序等于拿一句文案当时间戳用，换个格式就全错。
+  /// 少这两条不影响正确性，只影响第一次命中的快慢。
+  List<String> _vaultCandidates() {
+    final order = List<int>.generate(_passwords.length, (i) => i);
+    // 并列时回落到下标升序 —— `List.sort` **不保证稳定**，而「同分的密码每次
+    // 试的顺序不一样」会让问题没法复现。
+    order.sort((a, b) {
+      final byHits = _passwords[b].hitCount.compareTo(_passwords[a].hitCount);
+      return byHits != 0 ? byHits : a.compareTo(b);
+    });
+    // 命中过的不再从库里排一遍：同一个候选试两次不是错，只是白跑一趟解压。
+    return [
+      ..._runGoodPasswords,
+      for (final i in order)
+        if (!_runGoodPasswords.contains(_passwords[i].value))
+          _passwords[i].value,
+    ];
+  }
+
+  /// 记下本次解压里用成功过的密码，挪到最前面。见 [_runGoodPasswords]。
+  void _rememberGoodPassword(String value) {
+    _runGoodPasswords
+      ..remove(value)
+      ..insert(0, value);
+  }
+
+  /// 密码验证通过之后把它存进密码库，由设置页的「手输密码存入密码库」决定
+  /// 开不开（[kDefaultToggles] 里叫 `pwdAutoSave`，默认开）。
+  ///
+  /// 调它的地方只有 `attempt` 成功那一刻 —— 与 [_rememberGoodPassword] 同一个
+  /// 挂点、同一个理由。两条路看起来只关心手输，但挂在那里同时也覆盖密码库命中
+  /// 那一支：那种情况下这条**必然**在库里，于是原地空转（下面那个 dedupe），
+  /// 行为与不挂一模一样。真在调用点上按「是不是手输」分叉反而要多写两个 return
+  /// 点，还要各自判断一次。
+  ///
+  /// **静静地跳过，不弹「密码已存在」**：密码库自己命中的那些包不该每命中一次
+  /// 就冒一句。进库了才出 toast，而且用的是与 `addPassword` 不同的文案
+  /// （「已存入」不是「已添加」）—— 用户没点过任何按钮，日志和提示里得看得出
+  /// 这是自动的。
+  ///
+  /// 开关读的是**活值**：用户解压途中去设置页关掉它，这一批剩下的包就不再入库
+  /// 了。与 `pwdPrompt` 同一条（那颗也是就地读的），而不是像 `errorPause` 那样
+  /// 在批次开始时锁定 —— 它管的是「下一个包怎么办」，用户改完立刻生效才符合直觉。
+  void _maybeAutoImportPassword(String value) {
+    if (value.isEmpty) return;
+    if (!setting('pwdAutoSave')) return;
+    if (_passwords.any((p) => p.value == value)) return;
+    // `hitCount: 1` 不是笔误：它刚刚**真的**解开了一个包。从 0 开始记等于把
+    // 这份证据丢掉，而库里的排序正是按命中数来的。
+    _passwords.insert(
+      0,
+      PasswordEntry(value: value, hitCount: 1, lastUsed: '今天'),
+    );
+    _notify();
+    _persistVault();
+    showToast('密码已存入密码库', type: 'success');
+  }
+
+  /// 记一次命中：用过的密码往前排，下次先试它。
+  void _markVaultHit(String value) {
+    final i = _passwords.indexWhere((p) => p.value == value);
+    // 找不到说明这一趟里用户把密码删了（弹窗开着的时候）。不是错，忽略即可
+    // —— 不能因此崩在 `removeAt(-1)` 上。
+    if (i < 0) return;
+    _passwords[i] =
+        _passwords[i].copyWith(hitCount: _passwords[i].hitCount + 1, lastUsed: '今天');
+    _persistVault();
+  }
+
+  /// 解开这个包，带密码的那部分。
+  ///
+  /// 顺序是：**先空密码试一次** → 候选逐个试（本次解压命中过的在最前，然后才是
+  /// 密码库按 `hitCount` 排的，见 [_vaultCandidates]）→ 还不行就问用户（或者按
+  /// 设置直接跳过）。空密码那一次不是浪费：它回答的是「这个包到底要不要密码」。
+  /// 只有它以 `DUZ_ERR_PASSWORD` 失败，后面那一串才有必要跑。头加密的包在这里
+  /// 一个字节都写不出来（`duz_open` 就失败了），条目加密的包会写出前半段明文
+  /// 条目再撞上第一个加密条目 —— 那点重复写有代价，但换来的是不必给 C++ 加
+  /// 探测接口（见 `password_prompt.dart` 里 `verify` 那段）。
+  ///
+  /// 非密码类的失败（包坏了、被闸门拦下）**立刻原样抛出**，绝不接着试密码
+  /// —— 换十个密码也修不好一个 CRC 坏掉的包，而密码库长得有几十条时，那种
+  /// 「每个坏包都要白试几十遍」会变成肉眼可见的卡顿。
+  /// 返回值里除了结局还带着**密码的来源**，供日志记「密码库 / 手输密码」
+  /// 用 —— 那件事只有这条路上知道，而且用户正是靠它回头去密码库找是哪一条。
+  Future<_PwdUnlocked> _extractResolvingPassword({
+    required ScanItem item,
+    required String outDir,
+    required int depth,
+    required bool recursive,
+    required ScanOptions options,
+    required LimitThresholds limits,
+    required int? availableBytes,
+    required EngineController engine,
+  }) async {
+    Future<_PwdAttempt> attempt(String? password) async {
+      try {
+        final outcome = await engine.extract(
+          parts: item.parts,
+          outDir: outDir,
+          // `null` 在这里必须换成空串 —— 见 [_kEmptyPassword]。
+          password: password ?? _kEmptyPassword,
+          depth: depth,
+          recursive: recursive,
+          options: options,
+          limits: limits,
+          availableBytes: availableBytes,
+        );
+        // 成功即记 —— 这里是**唯一**知道「哪个密码真的管用」的地方：密码库
+        // 命中、手输验过、手输兜底重试三条路都从这儿过，所以挂一次就全盖住了。
+        // 空密码那次不记（它回答的是「压根不要密码」，而它本来就排在全部候选
+        // 前面）。两件事都见各自的说明：
+        if (password != null && password.isNotEmpty) {
+          // 1. 本次解压的候选记忆（[_runGoodPasswords]）
+          _rememberGoodPassword(password);
+          // 2. 存进密码库（[_maybeAutoImportPassword]，认设置页那颗开关）
+          _maybeAutoImportPassword(password);
+        }
+        return _PwdAttempt.done(outcome);
+      } on EngineException catch (e) {
+        return _PwdAttempt.failed(e);
+      }
+    }
+
+    var first = await attempt(null);
+    // 开局那一次带的是**空密码**，所以它就成了说明这个包压根不用密码 ——
+    // 来源记 `null`，日志上不该出现「密码库」这种没发生过的事。
+    if (first.outcome != null) return _PwdUnlocked(first.outcome!);
+    if (!first.isPasswordError) throw first.error!;
+
+    final candidates = _vaultCandidates();
+    // 只记**个数**，不记那些密码本身：弹窗只需要知道「试过几条」来区分
+    // 「空库」和「试了 N 条都没通过」，而它的内容一个都不摆（见
+    // `PasswordAsk.triedCount`）。攒一串明文再交给控件层是白给的暴露面。
+    var triedCount = 0;
+    for (final cand in candidates) {
+      final r = await attempt(cand);
+      if (r.outcome != null) {
+        _markVaultHit(cand);
+        return _PwdUnlocked(r.outcome!, PasswordSource.vault);
+      }
+      // 试到一半包彻底坏了：这时候报的是「坏」而不是「密码没对上」，
+      // 否则日志会指着一个修不好的包说「密码未匹配」，用户回去翻密码库。
+      if (!r.isPasswordError) throw r.error!;
+      triedCount++;
+    }
+
+    // 密码库用光了。开关连着的那一档是「问用户」，关掉那一档是「跳过」。
+    //
+    // 两档的**判据是那颗开关，不是「拿不拿得到弹窗」** —— 后者是把两种完全
+    // 不同的处境混成一种：用户明确说了「别问，跳过」，和用户说了「问一句」
+    // 而这一问没问成（没接桥、这一刻没有 `BuildContext`）。后一种里用户什么
+    // 都没看到，包却没了 —— 与 `prompts.dart` 反复警告的「把没弹当成用户的
+    // 选择」是同一个坑。所以没弹成时按**失败**记，让日志和 toast 把话说出来。
+    if (!setting('pwdPrompt')) {
+      // 带上 `uncertain`：静默跳过时那句 reason 是用户唯一能看到的说法，
+      // 而这个包说不说得清是**包的属性**，与「问不问」这颗开关无关。
+      //
+      // 取值只能来自 `first`（开局那次空密码）：它是这个包第一次露底，也是
+      // 唯一「没带任何候选密码、纯看这个包本身」的一次尝试。后面每一次
+      // 失败都掺了「我们给错了密码」这个变量，不该拿它们的说法覆盖它。
+      throw _PasswordVerdict(
+        _PwdOutcomeEnum.autoSkipped,
+        uncertain: first.error?.uncertain ?? false,
+      );
+    }
+    final ask = _onPassword;
+    if (ask == null) throw first.error!;
+
+    // 手输那一支的结果从这个闭包取。`verify` 的定义就是「拿它真解一遍」，
+    // 所以 true 的那一刻 outcome 一定在（见 `password_prompt.dart`）。
+    ExtractOutcome? manualOutcome;
+    final resolution = await ask(PasswordAsk(
+      fileName: item.fileName,
+      triedCount: triedCount,
+      // 同 `autoSkipped`：说法来自 `first`，且**不影响路由** —— 有它没它都
+      // 照样去密码库试、照样弹这个窗，弹窗只是别替用户在「密码错」上拍板。
+      uncertain: first.error?.uncertain ?? false,
+      verify: (cand) async {
+        final r = await attempt(cand);
+        if (r.outcome == null) return false;
+        manualOutcome = r.outcome;
+        return true;
+      },
+    ));
+
+    switch (resolution?.verdict) {
+      case PasswordVerdict.manual:
+        // 兜底那一句：正常情况下 `manualOutcome` 必定在（弹窗验过了才回
+        // manual）。真要是空着（比如桥接层被改坏、弹窗没验就回了 manual），
+        // 宁可拿那个密码多解一遍，也不能把「解完了但没记日志」这种状态留下来
+        // —— 那会变成一条凭空消失的包。
+        final settled = manualOutcome;
+        if (settled != null) return _PwdUnlocked(settled, PasswordSource.manual);
+        final retry = await attempt(resolution?.password);
+        if (retry.outcome != null) {
+          return _PwdUnlocked(retry.outcome!, PasswordSource.manual);
+        }
+        throw retry.error!;
+      case PasswordVerdict.skip:
+        throw const _PasswordVerdict(_PwdOutcomeEnum.userSkipped);
+      case PasswordVerdict.stop:
+        throw const _PasswordVerdict(_PwdOutcomeEnum.userStopped);
+      case null:
+        // **没弹成**（拿不到 BuildContext）。不是用户的选择，所以不能当跳过：
+        // 用户什么都没看见，包却没了。按失败记，与没有这个特性时一致。
+        throw first.error!;
+    }
   }
 
   /// 逐个解压。批次开始时给扫描结果拍一张快照，之后**只往里追加** ——
@@ -821,16 +1169,81 @@ class AppState extends ChangeNotifier {
   /// 身份是「父传子」的：解 `nested.zip` 之前先算好它自己的身份，把它并进
   /// 子任务的身份集里。所以每一层只需算**一次**哈希，不是每层重算一整条链。
   Future<void> _runExtractBatch() async {
-    final queue = Queue<_ExtractTask>();
-    for (final item in _scanItems) {
-      queue.add(_ExtractTask(item: item, ancestors: const {}));
-    }
-    if (queue.isEmpty) return;
-
     // 设置在批次开始时锁定。跑的过程中用户去设置页改开关不该影响这一批
     // 已经排好的任务 —— 那会让同一批里前后两半的行为不一致。
-    final recursive = setting('recursive');
+    //
+    // 递归与深度现在是**同一个开关**：深度 0 就是不递归（那颗「递归解压」
+    // 开关 2026-10 删掉了，见 `setMaxDepth`）。`recursive` 这个参数在这一层
+    // 的意思是「让引擎顺手扫一下刚解出来的东西里有没有包」—— 深度为 0 时
+    // 那些包一个都用不上，扫一遍再全丢掉是白付的 IO，所以它跟着深度走。
     final maxDepth = _maxDepth;
+    final recursive = maxDepth > 0;
+
+    // 输出根同样锁定成局部量。用户在设置页关掉「自定义输出目录」、或者（在
+    // 别的入口上）重选一个根，都不该让**这一批**的后半个包换个地方落盘 ——
+    // 一批东西被劈成两处，日志上没法解释。
+    //
+    // 空串 = 老规矩（解到包旁边）。这也是**没开自定义时唯一的取值**，所以
+    // 下面不需要再查那开关一次。
+    final outputRoot = _outputRoot;
+    final sourceRoot = _folderPath;
+
+    // **顶层的包也要过这道闸门**（2026-10 补的）。
+    //
+    // 以前这里是无条件把 `_scanItems` 全排进队列的，理由是「被选目录里的
+    // 东西都是输入」。**那条理由是错的**：深度数的是「从被选目录往下走了
+    // 几步」，而走到 `子目录/` 里已经是**一步**了 —— 不管那一步是进子目录
+    // 还是解压出来的，都算一层。所以 `maxDepth = 0` 时，躺在子目录里的包
+    // 与躺在深处的嵌套包一样，都不该解。
+    //
+    // 不这么改的话，两条路会互相矛盾：`maxDepth = 0` 拦得住包**里面**的
+    // 嵌套包，却拦不住**目录里面**的包 —— 而按上面那条规则，后者离被选
+    // 目录更远。
+    //
+    // 拦下的不进队列，但**仍然留在列表里**（它们是扫描结果，用户要看得见
+    // 目录里有什么），只记一条「超出递归深度」，与 `_enqueueNested` 那边
+    // 的处理一致。
+    final queue = Queue<_ExtractTask>();
+    final tooDeep = <ScanItem>[];
+    for (final item in _scanItems) {
+      if (!withinDepthLimit(item.depth, maxDepth)) {
+        tooDeep.add(item);
+        continue;
+      }
+      queue.add(_ExtractTask(
+        item: item,
+        ancestors: const {},
+        // 自定义输出目录：把包在源目录下的相对位置搬到用户选的根底下。
+        // 只有顶层任务要算 —— 嵌套任务的父包已经落在镜像位置上了，见
+        // `_ExtractTask.outputBaseDir` 那段。
+        outputBaseDir: outputRoot.isEmpty
+            ? null
+            : mirroredBaseDir(sourceRoot, item.entryPath, outputRoot),
+      ));
+    }
+
+    // **整批一个都排不进来**。这条要单独走：底下 `_currentFile =
+    // queue.first.item.fileName` 会在空队列上直接抛，而且此时什么都没做，
+    // 不该算「这批跑过了」（`batchRun` 由 `_outcome` 派生，这里不设它就
+    // 自动是 false）—— 用户把深度调大之后要能原地点「开始解压」再来一次。
+    if (queue.isEmpty) {
+      for (final item in tooDeep) {
+        _addLog(buildExtractLog(
+          item: item,
+          skippedReason: '超出递归深度',
+          now: DateTime.now(),
+        ));
+      }
+      if (tooDeep.isNotEmpty) {
+        _persistLogs();
+        showToast(
+          '${tooDeep.length} 个压缩包超出「最大递归深度」$maxDepth，请调大后重试',
+          type: 'warn',
+        );
+      }
+      return;
+    }
+
     final options = _scanOptions;
     // 阈值同样要**在这里取好**。底下用的是 `limits` 这个 getter，它读的是
     // 活的 `_limits` —— 用户在解压途中去设置页换个档，同一批里前半个包按
@@ -848,6 +1261,9 @@ class AppState extends ChangeNotifier {
     _stoppedByUser = false;
     _manualSkips = 0;
     _cancelRequested = false;
+    // 上一批试出来过的密码不带过来 —— 那是**本次解压**的记忆，见
+    // [_runGoodPasswords]。
+    _runGoodPasswords.clear();
     _batchTotal = queue.length;
     _doneCount = 0;
     _progress = 0;
@@ -860,9 +1276,48 @@ class AppState extends ChangeNotifier {
     _notify();
 
     var failed = 0;
-    var skipped = 0;
+    // 顶层就被深度拦下的那些，与嵌套里被拦下的一样计入 `skipped` —— 两边
+    // 在日志与总结卡片上要长得一样，用户不必去分辨是「哪一层」拦的。
+    // （它们不进 `_batchTotal`：那份分母是「这一批要处理的包」，而它们是
+    // 压根没轮到处理的。）
+    var skipped = tooDeep.length;
+    for (final item in tooDeep) {
+      _addLog(buildExtractLog(
+        item: item,
+        skippedReason: '超出递归深度',
+        now: DateTime.now(),
+      ));
+    }
 
     try {
+      // **第一件事就起前台服务**，排在 `_ensureEngine` 前面：起引擎可能要拉起
+      // 原生库，而「这一批开始了」这句话对系统越早说越好。晚一步的窗口里正好
+      // 锁屏，那一批就是裸奔的。
+      //
+      // 放在 `try` 里面而不是前面：万一它抛了（它自己吞掉了平台异常，这里防的是
+      // 别的意外），`finally` 里的 stop 才能兜住 —— 起了没人停的前台服务会留下
+      // 一条撤不掉的常驻通知。
+      _lastKeepAliveAt = DateTime.now();
+      await _keepAlive.start(title: '正在解压', text: _keepAliveText());
+
+      // 第一次「开始解压」时问一次通知权限（Android 13+）。
+      //
+      // **排在起服务之后、而且不 await。** 起前台服务是这一批最不能拖的一步：
+      // 晚一步的那个窗口里正好锁屏，这一批就是裸奔的。把服务吊在一次用户交互
+      // 后面，等于把那个窗口敞开到无限长 —— 弹窗没人答的时候活儿压根还没开始
+      // 跑，那比裸奔更糟：什么都没发生，而用户以为在解压。
+      //
+      // 代价是权限往往在 `startForeground` 之后才落地，Android 13+ 会把这条
+      // 通知先压住（记录在服务上、通知栏里没有）。这里**不为那一段加特判**：
+      // 解压期间每两秒就有一条进度要推（见 [_lastKeepAliveAt]），权限一落地，
+      // 最多两秒后的那一条就该把它顶出来。短到跑不完两秒的那一批不需要通知：
+      // 用户正盯着屏幕。
+      //
+      // **待真机确认**：一条已经被压住的常驻通知，后来重新 `notify` 能不能让
+      // 它显形。不能的话，就得在授权之后再 `startForeground` 一次（这条路要
+      // 等真机上那条通知到底出不出现才敢加）。
+      unawaited(_notifications.ensureAsked());
+
       final engine = await _ensureEngine();
 
       while (queue.isNotEmpty) {
@@ -903,7 +1358,7 @@ class AppState extends ChangeNotifier {
               skippedReason: '自引用',
               now: DateTime.now(),
             ));
-            showToast('${item.fileName}：与上级是同一个包，已跳过', type: 'warn');
+            showToast('${item.fileName}：与上层压缩包相同，已跳过', type: 'warn');
             _notify();
             continue;
           }
@@ -933,7 +1388,7 @@ class AppState extends ChangeNotifier {
               skippedReason: '用户取消',
               now: DateTime.now(),
             ));
-            showToast('${item.fileName}：按你的选择跳过', type: 'warn');
+            showToast('${item.fileName}：已按选择跳过', type: 'warn');
             _notify();
             continue;
           }
@@ -941,9 +1396,13 @@ class AppState extends ChangeNotifier {
 
         // 后缀是假的（需求 5）时要把那段假后缀剥掉，否则输出目录会跟源文件
         // 同名 —— 见 deriveOutputName 里那段说明，真机上就是这么整包失败的。
+        //
+        // `baseDir` 为空 = 老规矩「写在包自己旁边」；自定义输出目录时由
+        // `_ExtractTask.outputBaseDir` 给出用户根下的那个位置。
         final outDir = resolveOutputDir(
           item.entryPath,
           spoofedExtension: item.sniff.isExtensionSpoofed,
+          baseDir: task.outputBaseDir,
         );
 
         // 剩余空间只能在这层量（主 isolate）—— worker 那边够不着平台通道，
@@ -952,16 +1411,20 @@ class AppState extends ChangeNotifier {
         // **每个任务量一次**而不是每批一次：空间在缩，一批几百个包的时候，
         // 开头那个数到后半程早就作废了，会放行一个其实装不下的包。
         //
-        // 量的是选中根目录。对称输出写回源目录旁、非对称写进
-        // `<root>/_extracted/`，两者都在根之下、同一个卷，量根就够。
+        // 量的是**这一批真正要写进去的那个卷**：自定义输出目录时是用户选的
+        // 根，否则是源目录（输出跟在包旁边）。从前这里写死 `_folderPath`，
+        // 那时两者恒等；现在不等于了，量错卷等于没量。
         //
         // 量不到（null）时 worker 会跳过这条检查 —— 不当成 0。见
         // `disk_space.dart` 里为什么这两者绝不能混。
-        final availableBytes = await _diskSpace.availableBytes(_folderPath);
+        final availableBytes = await _diskSpace.availableBytes(
+          outputRoot.isEmpty ? sourceRoot : outputRoot,
+        );
 
         try {
-          final outcome = await engine.extract(
-            parts: item.parts,
+          final unlocked = await _extractResolvingPassword(
+            engine: engine,
+            item: item,
             outDir: outDir,
             depth: item.depth,
             recursive: recursive,
@@ -969,10 +1432,13 @@ class AppState extends ChangeNotifier {
             limits: limits,
             availableBytes: availableBytes,
           );
+          final outcome = unlocked.outcome;
           _doneCount++;
           _addLog(buildExtractLog(
             item: item,
             outcome: outcome,
+            // 密码是从哪来的。没用到密码就是 null，那一格不出标签。
+            passwordSource: unlocked.source,
             now: DateTime.now(),
           ));
           if (recursive && outcome.hasNested) {
@@ -984,6 +1450,48 @@ class AppState extends ChangeNotifier {
               parentAncestors: task.ancestors,
               maxDepth: maxDepth,
             );
+          }
+        } on _PasswordVerdict catch (v) {
+          // 密码这条路走完之后的三种非成功收场。**走异常而不走返回值**，是为了
+          // 让下面那段 `on EngineException catch`（坏包、闸门、弹窗问跳过/停止）
+          // 原样不动 —— 成功仍是返回值，失败仍是异常，这里只是把「密码没解开」
+          // 也归到失败那条路上。
+          _doneCount++;
+          switch (v.kind) {
+            case _PwdOutcomeEnum.autoSkipped:
+              // 开关关掉（或压根没接弹窗桥）：试过密码库、跳过这个包。
+              // 记**跳过**而不是失败 —— 我们确实没解开它，但这是照着「不问
+              // 用户」这个设置办的，不是程序坏了。
+              skipped++;
+              _addLog(buildExtractLog(
+                item: item,
+                // 与解压失败那条走**同一个** `passwordTag`，两处措辞不会
+                // 各改一半（见那边的注释）。
+                skippedReason: passwordTag(uncertain: v.uncertain),
+                now: DateTime.now(),
+              ));
+              // 说不清的时候不能只说「需要密码」—— 那是在用户唯一能看到的那行
+              // 字上替他把「就是密码的事」拍板了，而这正是本轮要改掉的事。
+              showToast(
+                v.uncertain
+                    ? '${item.fileName}：可能密码错误或文件损坏，已跳过'
+                    : '${item.fileName}：需要密码，已跳过',
+                type: 'warn',
+              );
+            case _PwdOutcomeEnum.userSkipped:
+              skipped++;
+              _manualSkips++;
+              _addLog(buildExtractLog(
+                item: item,
+                skippedReason: '用户跳过',
+                now: DateTime.now(),
+              ));
+              showToast('${item.fileName}：已按选择跳过', type: 'warn');
+            case _PwdOutcomeEnum.userStopped:
+              // 与 `ErrorModal` 那颗「停止」同一条路：复用 `_cancelRequested`，
+              // 收尾那块据此把卡片换成「解压出错，已停止」（见 `BatchOutcome`）。
+              failed++;
+              _cancelRequested = true;
           }
         } on EngineException catch (e) {
           _doneCount++;
@@ -1069,7 +1577,7 @@ class AppState extends ChangeNotifier {
         done: _doneCount,
       );
       // `batchRun` 由 `_outcome` 派生，所以「跑过了」这件事到这里自动成立：
-      // 主按钮换成「换个文件夹」（见 [batchRun]）。停掉之后想接着解剩下那几个，
+      // 主按钮换成「更换目标」（见 [batchRun]）。停掉之后想接着解剩下那几个，
       // 就重新选一次目录 —— 那会重新扫描、拿到一份新快照。
       //
       // 代价说清楚：重新选目录会把**已经解好的**再解一遍，输出目录重名时撒出
@@ -1093,6 +1601,15 @@ class AppState extends ChangeNotifier {
       showToast(_completeDetail, type: failed > 0 ? 'warn' : 'ok');
       // 整批收尾 —— 逐包日志到这里全记完了，一次写出去（见 [_persistLogs]）。
       _persistLogs();
+
+      // 撤前台服务。**放在 `finally` 的最后**，因为这里有三条路都会走到：
+      // 正常跑完、用户中止（`_cancelRequested`）、以及半路抛异常。
+      //
+      // 少了这一句的后果不是「多一条通知」那么轻：那条通知是 `setOngoing(true)`
+      // 的，用户**划不掉**它 —— 只能看着一条写着「正在解压」的假通知，直到
+      // 手动来杀进程。所以这里宁可放在 toast 之后、日志落盘之后，也不能提前
+      // return 跳过它。
+      await _keepAlive.stop();
     }
   }
 
@@ -1145,6 +1662,7 @@ class AppState extends ChangeNotifier {
     _archives.add(ArchiveFile(
       name: item.fileName,
       type: item.sniff.format.archiveType,
+      badge: item.sniff.format.badge,
       size: formatBytes(item.sizeBytes),
       // 打上 nested 角标，与顶层那批区分开 —— 深度已经在 item 里了，
       // 列表里靠它缩进显示。
@@ -1207,8 +1725,45 @@ class AppState extends ChangeNotifier {
     return parts.join(' · ');
   }
 
+  /// 通知上那行字。形状：`42% · 3/12 · 备份.zip`。
+  ///
+  /// 三段都是用户一眼要的：还剩多少（百分比）、这一批的第几个、眼下解的是谁。
+  /// **用 `·` 连接而不是换行**：通知的正文在各家 ROM 上常常只剩一两行，
+  /// 换行会把后面两段直接吃掉。
+  String _keepAliveText() {
+    final percent = (_progress * 100).round().clamp(0, 100);
+    return [
+      '$percent%',
+      // 只有一个包时「1/1」是废话，摆着反而让人以为还有别的。
+      if (_batchTotal > 1) '${(_doneCount + 1).clamp(1, _batchTotal)}/$_batchTotal',
+      if (_currentFile.isNotEmpty) _currentFile,
+    ].join(' · ');
+  }
+
+  /// 把这行字推到通知上。**节流由调用方负责**（见 [_lastKeepAliveAt]）。
+  void _pushKeepAlive() {
+    _lastKeepAliveAt = DateTime.now();
+    // 不 await：`_onExtractTick` 是同步的，而且它是 8Hz 的进度回调 —— 让它去等
+    // 一次跨进程的通道往返，等于把通道的延迟摊进解压的进度事件里。通知慢一拍
+    // 无所谓，进度条慢一拍不是。
+    unawaited(_keepAlive.update(_keepAliveText()));
+  }
+
+  /// 后台那一份进度：**只喂通知，不碰界面**。
+  ///
+  /// 与 [_onExtractTick] 是同一套数字，区别只在最后不发 `_notify()` —— 后台时
+  /// 四棵页面树都不可见，重建了没人看（见 [EngineController.setForeground]）。
+  /// 通知正好相反：那时它是用户唯一还看得见的东西。
+  void _onExtractTickBackground(ExtractTick tick) =>
+      _onExtractTick(tick, quiet: true);
+
   /// 引擎解压进度回调。已经被控制器按 8Hz 节流过。
-  void _onExtractTick(ExtractTick tick) {
+  ///
+  /// [quiet] 为真表示这份进度是从**后台**来的（见
+  /// [EngineController.onExtractTickBackground]）：数字照算、通知照推，
+  /// 唯独不发那个会重建四棵树的 `_notify()`。
+  void _onExtractTick(ExtractTick tick, {bool quiet = false}) {
+    final now = DateTime.now();
     // 表只跟踪**当前这个包**，所以整批的进度是
     // 「已完成的包数 + 当前包的内部比例」÷ 总包数。
     // 直接用未压缩字节当整批分母是不行的：扫描时拿到的是**压缩后**大小，
@@ -1217,7 +1772,7 @@ class AppState extends ChangeNotifier {
       doneBytes: tick.doneBytes,
       totalBytes: tick.totalBytes,
       entryName: tick.current,
-      now: DateTime.now(),
+      now: now,
     );
     final snap = _meter.snapshot();
 
@@ -1230,7 +1785,14 @@ class AppState extends ChangeNotifier {
     _speed = snap.speedBytesPerSecond;
     _eta = formatEta(_meter.eta);
     _entryName = snap.entryName;
-    _notify();
+    if (!quiet) _notify();
+
+    // 通知**另算一个节流**（见 [_lastKeepAliveAt]）：上面的 8Hz 是给屏幕上的
+    // 进度条用的，通知那个位置两秒刷一次就够，也不该拿通道往返去挤解压的 IO。
+    final last = _lastKeepAliveAt;
+    if (last == null || now.difference(last) >= const Duration(seconds: 2)) {
+      _pushKeepAlive();
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -1249,7 +1811,7 @@ class AppState extends ChangeNotifier {
     _passwords.insert(0, PasswordEntry(value: value, lastUsed: '今天'));
     _notify();
     _persistVault();
-    showToast('密码已添加到密码库', type: 'success');
+    showToast('密码已存入密码库', type: 'success');
   }
 
   void deletePassword(int index) {
@@ -1268,24 +1830,6 @@ class AppState extends ChangeNotifier {
   void _addLog(LogEntry entry) {
     _logs.insert(0, entry);
     _trimLogsToCap();
-  }
-
-  void addExtractor(Extractor e) {
-    if (_extractors.any((x) => x.name.toUpperCase() == e.name.toUpperCase())) {
-      showToast('该类型已存在', type: 'warn');
-      return;
-    }
-    _extractors.add(e);
-    _notify();
-    showToast('已注册 ${e.name} 解压方式', type: 'success');
-  }
-
-  void deleteExtractor(int index) {
-    if (_extractors[index].isBuiltin) return;
-    final name = _extractors[index].name;
-    _extractors.removeAt(index);
-    _notify();
-    showToast('已移除 $name');
   }
 
   @override
@@ -1317,10 +1861,124 @@ class AppState extends ChangeNotifier {
 /// 共享的是**同一个不可变的 [Set]**：子任务拿到的是父的集合 ∪ 父自己，
 /// 每次扩张新建一个（`{...parent, id}`），所以兄弟之间不会互相污染。
 class _ExtractTask {
-  const _ExtractTask({required this.item, required this.ancestors});
+  const _ExtractTask({
+    required this.item,
+    required this.ancestors,
+    this.outputBaseDir,
+  });
 
   final ScanItem item;
 
   /// 从根到**父**为止的全部祖先身份。根任务的这份是空的。
   final Set<String> ancestors;
+
+  /// 这个包该往哪个目录里写（`resolveOutputDir` 的 `baseDir`）。
+  ///
+  /// `null` = 按老规矩「写在包自己旁边」，由 `resolveOutputDir` 自己算父目录。
+  /// 只有**顶层任务**在「自定义输出目录」开着时会给它一个值。
+  ///
+  /// **嵌套任务刻意不给**：父包的输出目录本身就已经落在镜像位置上，
+  /// worker 报回来的子包路径就在那个目录里面，于是老规矩（父目录 + 名字）
+  /// 天然得到 `<根>/子目录/S1/S2/`。这是推导出来的，不是显式接的线 ——
+  /// `test/providers/app_state_test.dart` 里「自定义输出目录」那组有一条专门钉它。
+  final String? outputBaseDir;
+}
+
+// ---------------------------------------------------------------------------
+// 密码那一档的内部类型
+// ---------------------------------------------------------------------------
+
+/// 试密码那条路上，「我这边没有密码」要写成**空串**，不能写成 `null`。
+///
+/// 引擎那边这两个值是**两件事**：`null` 是「给不出密码」（`duz_open` 传 NULL
+/// → C 侧 `passwordGiven = false`），`''` 是「给了一个空密码」。区别在 ZIP
+/// 这类**条目级加密**的包上会致命 —— 它不需要密码就能打开、能列条目，到
+/// 解压时才问密码，而真问的时候：
+///
+/// - 答 `null`：`CryptoGetTextPassword` 只能返回 `E_NOTIMPL`，7-Zip 的
+///   `ZipHandler` 对这个 HRESULT 用的是 `RINOK`（`ZipHandler.cpp` 里
+///   `RINOK(getTextPassword->CryptoGetTextPassword(&password))`），于是**整个
+///   `Extract()` 原样返回 E_NOTIMPL**：既没报 `kWrongPassword`，也没报条目
+///   失败。我们 C 那边只看到「res != S_OK 且一条都没失败」，翻成一句笼统的
+///   `DUZ_ERR_EXTRACT`（「解压失败」）。
+/// - 答 `''`：7-Zip 照常走校验，AES 的 `Init_and_CheckPassword()` 或
+///   ZipCrypto 的 12 字节头比对必然不过，报 `kWrongPassword` → 我们翻成
+///   `DUZ_ERR_PASSWORD`。
+///
+/// 后果差别不是文案：只有拿到 `DUZ_ERR_PASSWORD`，[AppState] 才知道「这个包
+/// 要密码」，才会去试密码库、才会弹那个窗。**传 `null` 的话整条路一次都不会被
+/// 走到** —— 真机第一次验收就是栽在这里：AES 加密码库一个都没试，`locked_horse
+/// .zip` 直接跳「解压失败」。头加密的包（7z / RAR 常见）反而看不出来，因为
+/// 那种包在 `duz_open` 阶段就失败了，走的是另一条映射（`DescribeOpenFailure`）。
+///
+/// 名字刻意不省成一个裸 `''`：那样看起来像谁漏写了一个值，下一个人会「修」回去。
+///
+/// ## 这条契约有**两头**，改一头就把另一头废掉
+///
+/// C 侧 `duz_open` 必须同样认为「空串 = 给了密码」：它的守卫曾经写成
+/// `if (pwd && pwd[0])`，于是 Dart 换了空串过去、那头又把它折叠回
+/// `passwordGiven = false`，`E_NOTIMPL` 原样回来 —— **修了半天等于没修**，
+/// 真机第二次验收才靠 logcat 里那句 `res=0x80004001` 定位到。
+/// 现在的约定写死在 `duz_engine.cpp` 的 `duz_ctx::passwordGiven` 上：
+/// `nullptr` = 没给，空串 = 密码就是空串。两边要一起改。
+const String _kEmptyPassword = '';
+
+/// 一次解压尝试的结果：要么成了，要么带着异常回来。
+///
+/// 做成值对象而不是让调用方 try/catch：试密码这件事天然要**问很多次**
+/// （空密码一次、密码库 N 次、手输若干次），用异常控制这个循环等于把正常
+/// 流程写成一片红。
+class _PwdAttempt {
+  const _PwdAttempt.done(ExtractOutcome this.outcome) : error = null;
+  const _PwdAttempt.failed(EngineException this.error) : outcome = null;
+
+  final ExtractOutcome? outcome;
+  final EngineException? error;
+
+  /// 这次失败是不是「密码不对」。**只有它为真才值得换下一个候选**。
+  bool get isPasswordError => error?.code == DuzErrorCode.password;
+}
+
+/// 解开了：结局 + 这个包是**怎么打开的**（没用上密码就是 `null`）。
+///
+/// 打包成一个返回值，而不是给 `_extractResolvingPassword` 加个出参：密码的
+/// 来源只有那条路上才知道，而那条路有**四个**成功出口（开局空密码就成、
+/// 密码库命中、手输成功、手输兜底重试）。出参得在四处各写一遍，漏一处就是
+/// 一条日志悄悄少一个标签 —— 而返回值只有一个，编译器会盯着。
+class _PwdUnlocked {
+  const _PwdUnlocked(this.outcome, [this.source]);
+
+  final ExtractOutcome outcome;
+  final PasswordSource? source;
+}
+
+/// 「密码这条路没走通」的三种收场，用异常在 `_runExtractBatch` 里传递。
+///
+/// 走异常是为了让那段已经写好的 `on EngineException catch`（坏包、闸门、
+/// 弹窗）原样不动：成功仍是返回值，失败仍是异常，这里只是把密码这一档也
+/// 归到失败那条路上。`EngineException` 之外单开一个类型，是因为这三种收场
+/// **不该**再经过那段逻辑 —— 尤其不能再去问一次「跳过 / 停止」，用户刚在
+/// 密码弹窗里回答过一模一样的问题。
+class _PasswordVerdict implements Exception {
+  const _PasswordVerdict(this.kind, {this.uncertain = false});
+
+  final _PwdOutcomeEnum kind;
+
+  /// 这个包**说不清**是密码不对还是数据已损坏（见 `EngineException.uncertain`）。
+  ///
+  /// 只有 [autoSkipped] 那一支用得上：另两支（用户跳过 / 用户停止）的说法是
+  /// 「按你的选择」，压根不涉及「为什么没解开」。默认 false 让它不必在每个
+  /// 构造点都写一遍。
+  final bool uncertain;
+}
+
+enum _PwdOutcomeEnum {
+  /// 密码库没试出来，而设置里关掉了弹窗 —— 静默跳过这个包。
+  autoSkipped,
+
+  /// 用户在弹窗里按了「跳过」。
+  userSkipped,
+
+  /// 用户在弹窗里按了「停止解压」—— 整批到此为止。
+  userStopped,
 }

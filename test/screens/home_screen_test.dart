@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:deep_unzip/engine/controller.dart';
 import 'package:deep_unzip/engine/protocol.dart';
 import 'package:deep_unzip/providers/app_state.dart';
+import 'package:deep_unzip/screens/file_browser_screen.dart';
 import 'package:deep_unzip/screens/home_screen.dart';
 import 'package:deep_unzip/services/file_manager_bridge.dart';
 import 'package:deep_unzip/theme/app_theme.dart';
@@ -44,9 +45,12 @@ void main() {
   // 「点了之后没有假弹窗」在压根没点到的前提下通过。改成致命。
   setUpAll(() => WidgetController.hitTestWarningShouldBeFatal = true);
 
-  Widget app(AppState state, {FileManagerBridge? bridge}) => MaterialApp(
+  Widget app(AppState state, {FileManagerBridge? bridge, List<String>? roots}) =>
+      MaterialApp(
         theme: AppTheme.dark,
-        home: Scaffold(body: HomeScreen(state: state, bridge: bridge)),
+        home: Scaffold(
+          body: HomeScreen(state: state, bridge: bridge, browserRoots: roots),
+        ),
       );
 
   /// 挂载首页。
@@ -59,16 +63,32 @@ void main() {
   /// 但 `flutter test` 用的是固定宽度测试字体，比真机字体宽，溢出的 80px
   /// 大概率是这个假象而非真机问题 —— 拿不准的事不改 UI。
   Future<void> pumpHome(WidgetTester tester, AppState state,
-      {FileManagerBridge? bridge}) async {
+      {FileManagerBridge? bridge, List<String>? roots}) async {
     await tester.binding.setSurfaceSize(const Size(800, 1400));
     addTearDown(() => tester.binding.setSurfaceSize(null));
-    await tester.pumpWidget(app(state, bridge: bridge));
+    await tester.pumpWidget(app(state, bridge: bridge, roots: roots));
   }
 
   /// `showToast` 会挂一个 2 秒定时器。在测试体里（FakeAsync 区）产生的
   /// 定时器不排空的话，`testWidgets` 收尾会判定「还有未完成的定时器」而失败。
   Future<void> drainTimers(WidgetTester tester) =>
       tester.pump(const Duration(seconds: 3));
+
+  /// 推帧 + **让真实的文件 I/O 落地**。
+  ///
+  /// 自建浏览器的列目录走真 `dart:io`，而测试体包在 FakeAsync 里 —— 推假时钟
+  /// 推不动真 I/O，只写 `pumpAndSettle` 会一直等到超时（见 memory
+  /// `fakeasync-real-io-trap`）。`runAsync` 切回真事件循环，再推一帧把它的
+  /// continuation 从 fake 区的微任务队列里排出来；这两步要交替做几次才够。
+  Future<void> settle(WidgetTester tester) async {
+    for (var i = 0; i < 8; i++) {
+      await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 20)),
+      );
+      await tester.pump();
+    }
+    await tester.pumpAndSettle();
+  }
 
   /// 手动推 [n] 帧，每帧 100ms。
   ///
@@ -94,8 +114,11 @@ void main() {
     testWidgets('显示选择入口，主按钮禁用', (tester) async {
       await pumpHome(tester, state);
 
-      expect(find.text('选择目标文件夹'), findsOneWidget);
-      expect(find.text('开始智能解压'), findsOneWidget);
+      // **一颗入口**，不是两颗。选的是文件还是文件夹由用户在浏览器里点的是什么
+      // 决定（见 `HomeScreen._pickTarget`），所以这里不该出现「选文件夹 / 选文件」
+      // 这种要用户先想清楚自己属于哪一种的分叉。
+      expect(find.text('选择目标文件 / 文件夹'), findsOneWidget);
+      expect(find.text('开始解压'), findsOneWidget);
 
       final button = tester.widget<PrimaryButton>(find.byType(PrimaryButton));
       expect(button.disabled, isTrue, reason: '没扫描过就不该能点');
@@ -110,6 +133,20 @@ void main() {
 
       expect(state.extracting, isFalse);
       expect(find.byType(BottomSheet), findsNothing);
+    });
+
+    testWidgets('头部摆的是应用标记那张资源，不是通用图标', (tester) async {
+      await pumpHome(tester, state);
+
+      // 只读配置、不等它解码 —— 断言的是「挂的是哪张图」，而解码与否是
+      // 资源打包的事，不归这条管。
+      final logo = tester.widget<Image>(find.descendant(
+        of: find.byType(HomeScreen),
+        matching: find.byType(Image),
+      ));
+      expect((logo.image as AssetImage).assetName, 'assets/logo.png');
+      expect(find.byIcon(Icons.layers), findsNothing,
+          reason: '换掉了就别再留着那个通用图标');
     });
   });
 
@@ -142,7 +179,7 @@ void main() {
 
       final button = tester.widget<PrimaryButton>(find.byType(PrimaryButton));
       expect(button.disabled, isFalse);
-      expect(button.label, '开始智能解压');
+      expect(button.label, '开始解压');
 
       await drainTimers(tester);
     });
@@ -155,7 +192,7 @@ void main() {
       await tester.pumpAndSettle();
     }
 
-    testWidgets('点「开始智能解压」先弹确认，确认后才真的走引擎', (tester) async {
+    testWidgets('点「开始解压」先弹确认，确认后才真的走引擎', (tester) async {
       await pumpHome(tester, state);
 
       await tester.tap(find.byType(PrimaryButton));
@@ -185,12 +222,92 @@ void main() {
       expect(find.text('全部解压完成'), findsOneWidget);
       expect(state.logs.first.name, anyOf('a.zip', 'b.zip'));
 
-      // 跑过一轮之后主按钮换成「换个文件夹」。**不能再是「开始智能解压」**：
+      // 跑过一轮之后主按钮换成「更换目标」。**不能再是「开始解压」**：
       // 再点一次不是重解，而是把同一个队列重排一遍，输出目录重名会撒出
       // `_1`/`_2` 的重复目录（见 output_paths.dart）。
       final button = tester.widget<PrimaryButton>(find.byType(PrimaryButton));
-      expect(button.label, '换个文件夹');
-      expect(button.disabled, isFalse, reason: '换文件夹是脱困路径，不能禁用');
+      expect(button.label, '更换目标');
+      expect(button.disabled, isFalse, reason: '更换目标是脱困路径，不能禁用');
+
+      await drainTimers(tester);
+    });
+
+    testWidgets('开了「自定义输出目录」→ 点开始先开选择页，并且那页上带着出路', (tester) async {
+      // 顺序不能反：确认弹窗上那行「输出到」得是真的。反过来的话，用户是在
+      // 一个还不知道往哪写的界面上点的「确认解压」。
+      state.toggleSetting('customOutput');
+      await pumpHome(tester, state, roots: [root.path]);
+
+      await tester.tap(find.byType(PrimaryButton));
+      await settle(tester);
+
+      // 从前的流程是「先弹一页说明，再开**系统**选择器」—— 那页说明存在的唯一
+      // 理由是系统选择器上写不了标题。自建浏览器自己有标题、页头里也写着怎么
+      // 关掉这一档，所以那一页没了，顺手少一次点击。
+      expect(find.byType(FileBrowserScreen), findsOneWidget);
+      expect(find.text('选择输出根目录'), findsOneWidget);
+      expect(find.textContaining('关掉「自定义输出目录」'), findsOneWidget,
+          reason: '这一档每次都要选，嫌烦的人得能当场看到怎么关掉它');
+      expect(find.text('待解压'), findsNothing, reason: '还没走到确认解压');
+      expect(state.extracting, isFalse);
+      expect(engine.rounds, 0);
+    });
+
+    testWidgets('选择页点返回退出 → 这批不解，而且要出声', (tester) async {
+      state.toggleSetting('customOutput');
+      await pumpHome(tester, state, roots: [root.path]);
+
+      await tester.tap(find.byType(PrimaryButton));
+      await settle(tester);
+      await tester.binding.handlePopRoute();
+      await settle(tester);
+
+      expect(find.byType(FileBrowserScreen), findsNothing);
+      // **与「说明页上按取消」不是一回事**：那是用户在自己的界面上明确点了取消，
+      // 他知道自己放掉了什么；这里是按了「开始解压」、被推进一个选择页、又退出来
+      // —— 一声不吭的话看着就像按钮坏了。所以这一档要出声。
+      expect(state.toastType, 'info');
+      expect(state.toastMsg, contains('未选择输出目录'));
+      expect(state.extracting, isFalse);
+      expect(engine.rounds, 0);
+
+      await drainTimers(tester);
+    });
+
+    testWidgets('选择页里选了根 → 确认弹窗上「输出到」就是那个根', (tester) async {
+      // 输出根**必须与源目录不同**：同一个路径的话，「输出到」那行和首页文件夹卡
+      // 上那行是同一串字，`find.text` 会同时命中两处，断言就测不出东西了。
+      final outRoot = makeTempDir('home_outroot');
+      addTearDown(() {
+        if (outRoot.existsSync()) outRoot.deleteSync(recursive: true);
+      });
+      state.toggleSetting('customOutput');
+      await pumpHome(tester, state, roots: [outRoot.path]);
+
+      await tester.tap(find.byType(PrimaryButton));
+      await settle(tester);
+      await tester.tap(find.text('选择此文件夹'));
+      await settle(tester);
+
+      // 这条同时钉住了「先问位置、再问确认」那个顺序：确认弹窗上显示的应当是刚选
+      // 的那个根，而不是源目录。
+      expect(state.outputRoot, outRoot.path);
+      expect(find.text('待解压'), findsOneWidget);
+      // **按弹窗圈着找**：首页那张文件夹卡还在弹窗底下，源目录那串字仍然在树里。
+      final inModal = find.descendant(
+        of: find.byType(BottomSheet),
+        matching: find.text(outRoot.path),
+      );
+      expect(inModal, findsOneWidget, reason: '「输出到」那行应当是刚选的那个根');
+      expect(
+        find.descendant(
+          of: find.byType(BottomSheet),
+          matching: find.text(root.path),
+        ),
+        findsNothing,
+        reason: '自定义输出目录时输出不在源目录，那行不该还写着源目录',
+      );
+      expect(state.extracting, isFalse, reason: '还没点确认');
 
       await drainTimers(tester);
     });
@@ -209,26 +326,28 @@ void main() {
       expect(find.text('全部解压完成'), findsNothing);
 
       final button = tester.widget<PrimaryButton>(find.byType(PrimaryButton));
-      expect(button.label, '开始智能解压');
+      expect(button.label, '开始解压');
 
       await drainTimers(tester);
     });
 
-    testWidgets('跑完一批后主按钮改成「换个文件夹」，且再点不会重排队列',
+    testWidgets('跑完一批后主按钮改成「更换目标」，且再点不会重排队列',
         (tester) async {
-      await pumpHome(tester, state);
+      await pumpHome(tester, state, roots: [root.path]);
       await runBatch(tester);
 
       expect(state.batchRun, isTrue);
 
       final rounds = engine.rounds;
 
-      // 「换个文件夹」会走 FilePicker + 权限通道，无设备环境下拿不到，所以
-      // 这里只钉住「按下去不会重新解一遍」这条 —— 那才是这次改动要堵的洞。
+      // 点它**不会重新解一遍**，而是弹出选择页 —— 那才是这次改动要堵的洞
+      // （重排队列会往磁盘撒 `_1`/`_2` 重复目录）。
       await tester.tap(find.byType(PrimaryButton));
-      await tester.pumpAndSettle();
+      await settle(tester);
 
       expect(engine.rounds, rounds, reason: '重排队列会往磁盘撒 _1/_2 重复目录');
+      expect(find.byType(FileBrowserScreen), findsOneWidget,
+          reason: '这一档的语义是「换一个」，所以该去选路径');
 
       await drainTimers(tester);
     });
@@ -239,7 +358,7 @@ void main() {
       final blocked = Completer<void>();
       engine.behavior = (_, outDir) => blocked.future;
 
-      await pumpHome(tester, state);
+      await pumpHome(tester, state, roots: [root.path]);
       await tester.tap(find.byType(PrimaryButton));
       await tester.pumpAndSettle();
       await tester.tap(find.text('确认解压'));
@@ -272,14 +391,14 @@ void main() {
       expect(engine.rounds, 1, reason: '停止之后 b.zip 一个字节都不该动');
 
       // 停在半路也要落在**总结页**上（真机验收时用户要求的）：卡片标题写
-      // 「已停止」，主按钮换成「换个文件夹」。从前这里退回「开始智能解压」，
+      // 「已停止」，主按钮换成「更换目标」。从前这里退回「开始解压」，
       // 看起来像什么都没发生过 —— 用户会以为点下去能接着解剩下那个，
       // 而实际是把已经解好的重解一遍、撒出 `_1` 目录。
       expect(find.text('已停止'), findsOneWidget);
       expect(find.text('全部解压完成'), findsNothing,
           reason: '只解了一个包却写「全部完成」是假话');
       expect(find.textContaining('已完成 1/2 个压缩包'), findsOneWidget);
-      expect(label(), '换个文件夹');
+      expect(label(), '更换目标');
 
       await drainTimers(tester);
     });
@@ -311,7 +430,7 @@ void main() {
       expect(find.textContaining('2 个失败'), findsOneWidget);
 
       final button = tester.widget<PrimaryButton>(find.byType(PrimaryButton));
-      expect(button.label, '换个文件夹',
+      expect(button.label, '更换目标',
           reason: '总结页该带的脱困路径，全败时更要有');
 
       await drainTimers(tester);
@@ -354,7 +473,9 @@ void main() {
       await tester.tap(find.text('确认解压'));
       await pumpFrames(tester);
 
-      // 前提：此刻「更换」还在屏幕上，只是不响应 —— 藏起来会让布局跳动。
+      // 前提：此刻「更换」还占着位置，只是不响应 —— 藏起来会让布局跳动。
+      // 它是一个纯 `Text` 占位（`_buildFolderSelected` 的 extracting 分支），
+      // 不是那颗可点的 `_replaceButton`；下面按下去没反应正是这条的证据。
       expect(find.text('更换'), findsOneWidget);
       final before = state.folderPath;
       await tester.tap(find.text('更换'));
@@ -368,14 +489,16 @@ void main() {
 
       // 跑完之后它得真的活过来 —— 检查一遍「只会禁用、忘了解禁」那种写法。
       //
-      // 这里看的是 toast 而不是「弹出了目录选择器」：选目录走 `FilePicker` 的
-      // 平台通道，`flutter test` 里没有实现，`getDirectoryPath` 必抛。所以
-      // 「按下去真的进了 `_pickFolderAndScan`」的可观察后果，就是那条
-      // 「打开目录选择器失败：…」—— 恰好证明这一下没被禁用挡回去。
+      // 判据是「选择页真的弹出来了」：跑完之后那颗占位文字换成可点的「更换」，
+      // 点下去会开浏览器。比只看灰不灰可靠 —— 灰掉却点不动的写法同样能骗过前者。
       expect(state.toastMsg, isNull, reason: '前提：上一条 toast 已经过期');
       await tester.tap(find.text('更换'));
-      await pumpFrames(tester, 2);
-      expect(state.toastMsg, contains('目录选择器'),
+      // **只推到「路由压上来了」就够，不等它列完目录**：这条要验的是「解禁」，
+      // 而列举是真 I/O —— 推假时钟推不动它（要走 runAsync 那套，而这一条里
+      // 刚跑完一批真解压，那套在这里不稳）。断言「按下去真的进了选择流程」，
+      // 与从前断言「弹了那条选择器失败的 toast」是同一个意思。
+      await pumpFrames(tester, 3);
+      expect(find.byType(FileBrowserScreen), findsOneWidget,
           reason: '跑完之后「更换」要能按 —— 禁用只说了一半，还得会解禁');
 
       await drainTimers(tester);
@@ -451,7 +574,7 @@ void main() {
       await tester.tap(find.text('打开输出目录'));
       await tester.pumpAndSettle();
 
-      expect(find.text('没能定位到目录'), findsOneWidget);
+      expect(find.text('无法定位到目录'), findsOneWidget);
       // 用 SelectableText 而不是 `find.text(路径)`：路径在头部那张文件夹卡里
       // 也有一份（而且 SelectableText 自己会渲染成两个 widget），按文本找会
       // 命中一堆。直接看弹窗里那份的内容才是想验的事。
@@ -489,6 +612,60 @@ void main() {
 
       expect(find.text('当前环境不支持'), findsOneWidget);
       expect(calls, isEmpty, reason: '平台不支持就不该去惊动原生');
+
+      await drainTimers(tester);
+    });
+  });
+
+  group('角标间距', () {
+    late AppState state;
+    late Directory root;
+
+    setUp(() async {
+      root = makeTempDir('home_badges');
+      // 加密、但后缀被改成了 .dat → 一个条目上挂两个角标。真机上用户报
+      // 「标签粘在一起」的就是这一格（`伪装成图片.dat`）。
+      File(p.join(root.path, 'locked.dat'))
+          .writeAsBytesSync(encryptedZip({'a.txt': 'x'}));
+
+      state = AppState(engine: FakeEngine());
+      await state.selectFolderPath(root.path);
+    });
+
+    tearDown(() {
+      state.dispose();
+      if (root.existsSync()) root.deleteSync(recursive: true);
+    });
+
+    testWidgets('一个条目上的多个角标之间留得出缝', (tester) async {
+      await pumpHome(tester, state);
+
+      // 角标的字必须**圈着角标找**：筛选芯片里也有「加密」两个字，
+      // 直接 find.text('加密') 会连着芯片一起数进来。
+      expect(
+        find.descendant(
+            of: find.byType(FlagBadge), matching: find.text('加密')),
+        findsOneWidget,
+      );
+      expect(
+        find.descendant(
+            of: find.byType(FlagBadge), matching: find.text('伪后缀')),
+        findsOneWidget,
+      );
+
+      final badges = find.byType(FlagBadge);
+      expect(badges, findsNWidgets(2));
+      final rects = [for (var i = 0; i < 2; i++) tester.getRect(badges.at(i))]
+        ..sort((a, b) => a.left.compareTo(b.left));
+
+      // 不断言缝**等于**几个像素 —— 那是实现细节，改样式就会误报。断言的是
+      // 用户看得见的那件事：两个角标不重叠、之间留得出空。它们曾经严丝合缝地
+      // 贴着，读起来像一个好长的词。
+      for (var i = 1; i < rects.length; i++) {
+        final gap = rects[i].left - rects[i - 1].right;
+        expect(gap, greaterThan(0),
+            reason: '第 $i 个角标跟左边那个粘在一起了（缝 = $gap）');
+      }
 
       await drainTimers(tester);
     });

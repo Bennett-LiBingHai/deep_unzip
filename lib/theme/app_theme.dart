@@ -34,6 +34,17 @@ class AppTheme {
     end: Alignment.bottomRight,
   );
 
+  /// 不可逆操作的确认按钮（清空日志、删密码）。比 [neonRed] 亮一档：纯色实心
+  /// 在深底上发闷，看不出是一颗按钮。
+  ///
+  /// 提到这一层是在出现**第二处**用的时候（清空日志 → 删密码），与当初把它留在
+  /// `clear_logs_modal.dart` 里的理由（「只有这一处用」）是同一条规矩的两头。
+  static const LinearGradient dangerGradient = LinearGradient(
+    begin: Alignment.topLeft,
+    end: Alignment.bottomRight,
+    colors: [neonRed, Color(0xFFFF7A8A)],
+  );
+
   static ThemeData get dark {
     return ThemeData(
       useMaterial3: true,
@@ -81,6 +92,6 @@ class AppTheme {
 
   // 霓虹发光
   static List<BoxShadow> neonGlow(Color color, {double blur = 24}) {
-    return [BoxShadow(color: color.withOpacity(0.35), blurRadius: blur)];
+    return [BoxShadow(color: color.withValues(alpha: 0.35), blurRadius: blur)];
   }
 }

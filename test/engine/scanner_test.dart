@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:deep_unzip/engine/models.dart';
 import 'package:deep_unzip/engine/scanner.dart';
@@ -26,6 +27,16 @@ String put(Directory root, String rel, List<int> bytes) {
 }
 
 List<String> namesOf(ScanSummary s) => [for (final i in s.items) i.fileName];
+
+/// 一个「像 7z 的文件」，够嗅探认出 [SniffFormat.sevenZ] 即可。
+///
+/// 探针是注入的，这些用例测的是**怎么用探针的答案**，不是引擎真能读出什么，
+/// 所以内容只要签名对、长度够分卷切成两半就行。
+List<int> _sevenZStub() => [
+      0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C, // 7z 签名（版本号跟在后面）
+      0x00, 0x04,
+      ...List.filled(12, 0),
+    ];
 
 void main() {
   group('基本遍历', () {
@@ -295,23 +306,6 @@ void main() {
       expect(s.warnings.any((w) => w.contains('分片尺寸异常')), isTrue);
     });
 
-    test('关闭 mergeSplitVolumes → 分片各自成行，且不误报伪后缀', () async {
-      final root = tempRoot('splitoff');
-      final zip = realZip({'hello.txt': 'world'});
-      final half = zip.length ~/ 2;
-      put(root, 'b.zip.001', zip.sublist(0, half));
-      put(root, 'b.zip.002', zip.sublist(half));
-
-      final s = await scanDirectory(
-        root.path,
-        options: const ScanOptions(mergeSplitVolumes: false),
-      );
-      // .002 是裸字节，嗅探认不出来，所以只剩 .001 一行。
-      expect(namesOf(s), ['b.zip.001']);
-      expect(s.items.single.split, isNull);
-      expect(s.items.single.flags, isEmpty);
-    });
-
     test('孤立的高序号分片不会凭空变成一项', () async {
       final root = tempRoot('orphan');
       put(root, 'e.zip.002', 'text'.codeUnits);
@@ -407,6 +401,118 @@ void main() {
     });
   });
 
+  group('加密包检测（「需密码」角标）', () {
+    test('ZIP：中央目录的加密位直接认出来，一次都不开归档', () async {
+      final root = tempRoot('enczip');
+      put(root, 'locked.zip', encryptedZip({'a.txt': 'x'}));
+
+      var probes = 0;
+      final s = await scanDirectory(
+        root.path,
+        probeEncrypted: (parts, format) {
+          probes++;
+          return null;
+        },
+      );
+
+      expect(s.items.single.flags, contains(ArchiveFlag.encrypted));
+      expect(probes, 0, reason: 'ZIP 的加密位是白捡的，不该去问引擎');
+    });
+
+    test('没加密的 ZIP 不会被误标', () async {
+      final root = tempRoot('plainzip');
+      put(root, 'plain.zip', realZip({'a.txt': 'x'}));
+
+      final s = await scanDirectory(root.path);
+      expect(s.items.single.flags, isNot(contains(ArchiveFlag.encrypted)));
+    });
+
+    test('7z：格式闸放行，探针说 true 就打标', () async {
+      final root = tempRoot('enc7z');
+      put(root, 'locked.7z', _sevenZStub());
+
+      final asked = <SniffFormat>[];
+      final s = await scanDirectory(
+        root.path,
+        probeEncrypted: (parts, format) {
+          asked.add(format);
+          return true;
+        },
+      );
+
+      expect(asked, [SniffFormat.sevenZ]);
+      expect(s.items.single.flags, contains(ArchiveFlag.encrypted));
+    });
+
+    test('探针答「不知道」（null）时**不打标** —— 不知道不等于不要密码，'
+        '但更不等于要', () async {
+      final root = tempRoot('unknown7z');
+      put(root, 'maybe.7z', _sevenZStub());
+
+      final s = await scanDirectory(root.path, probeEncrypted: (_, _) => null);
+      expect(s.items.single.flags, isNot(contains(ArchiveFlag.encrypted)));
+    });
+
+    test('探针说 false 也不打标（与 null 同一条出口）', () async {
+      final root = tempRoot('plain7z');
+      put(root, 'open.7z', _sevenZStub());
+
+      final s = await scanDirectory(root.path, probeEncrypted: (_, _) => false);
+      expect(s.items.single.flags, isNot(contains(ArchiveFlag.encrypted)));
+    });
+
+    test('分卷：把**全部**卷交给探针，不是只给首卷', () async {
+      // 这条是探针契约里最容易写错的一点。ZIP 的中央目录在**末卷**上，
+      // 只递首卷等于永远读不到；分卷的「要不要密码」也就永远答不出来。
+      final root = tempRoot('encsplit');
+      final stub = _sevenZStub();
+      final half = stub.length ~/ 2;
+      put(root, 'locked.7z.001', stub.sublist(0, half));
+      put(root, 'locked.7z.002', stub.sublist(half));
+
+      List<String>? seenParts;
+      final s = await scanDirectory(
+        root.path,
+        probeEncrypted: (parts, format) {
+          seenParts = parts;
+          expect(format, SniffFormat.sevenZ);
+          return true;
+        },
+      );
+
+      expect(s.items.single.isSplit, isTrue);
+      expect(seenParts, hasLength(2));
+      expect(seenParts![0], endsWith('locked.7z.001'));
+      expect(seenParts![1], endsWith('locked.7z.002'));
+      expect(s.items.single.flags,
+          containsAll([ArchiveFlag.split, ArchiveFlag.encrypted]));
+    });
+
+    test('分卷用探针的答案优先于首卷嗅探出来的（首卷读不出末卷的目录）',
+        () async {
+      // 首卷是 ZIP 的第一片：密位在末卷的中央目录里，首卷那份嗅探结果只能是
+      // null。探针（真实实现里对 ZIP 会回 null，这里为了验优先级让它回 true）
+      // 一旦答得出来，就该盖过首卷的结果。
+      final root = tempRoot('splitprio');
+      final zip = encryptedZip({'a.txt': 'x'});
+      final half = zip.length ~/ 2;
+      put(root, 'b.zip.001', zip.sublist(0, half));
+      put(root, 'b.zip.002', zip.sublist(half));
+
+      final noProbe = (await scanDirectory(root.path)).items.single;
+      expect(noProbe.flags, isNot(contains(ArchiveFlag.encrypted)),
+          reason: '前提：只嗅首卷时确实认不出来');
+
+      final withProbe = (await scanDirectory(
+        root.path,
+        probeEncrypted: (_, _) => true,
+      ))
+          .items
+          .single;
+      expect(withProbe.flags, contains(ArchiveFlag.encrypted));
+    });
+  });
+
   group('scanFileList（解压过程中发现的新压缩包）', () {
     test('只扫给定的文件，不递归目录', () async {
       final root = tempRoot('filelist');
@@ -443,6 +549,145 @@ void main() {
       expect(s.items, isEmpty);
       expect(s.unreadable, 1);
       expect(s.warnings.single, contains('无法读取'));
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // 用户点名单个文件那条路（首页「选择文件」）
+  // ---------------------------------------------------------------------------
+
+  group('显式文件：忽略容器格式', () {
+    /// 一份**真 OOXML 内容**的 zip：中央目录里有 `[Content_Types].xml` 与
+    /// `word/`，正是 `detectContainer` 用来识破容器的标记。
+    Uint8List ooxmlZip() => realZip({
+          '[Content_Types].xml': '<Types/>',
+          'word/document.xml': '<w:document/>',
+        });
+
+    test('对照组：目录扫描时它被容器防线拦下', () async {
+      final root = tempRoot('explicit_dir');
+      put(root, 'report.docx', ooxmlZip());
+
+      final s = await scanDirectory(root.path);
+      expect(s.items, isEmpty, reason: '这条防线是刻意的，别动它');
+      expect(s.containerSkipped, 1);
+    });
+
+    test('ignoreContainers 时同一个文件被当成压缩包收下', () async {
+      final root = tempRoot('explicit_file');
+      final path = put(root, 'report.docx', ooxmlZip());
+
+      final s = await scanFileList([path], baseDepth: 0, ignoreContainers: true);
+      expect(s.items, hasLength(1),
+          reason: '用户明确点了它，就该解它 —— 哪怕它叫 .docx');
+      expect(s.items.single.sniff.format, SniffFormat.zip);
+      expect(s.containerSkipped, 0);
+    });
+
+    test('让位的是「按名字判死」，不是「不看内容就收下」', () async {
+      // 真身不是压缩包的 .docx（纯文本）让位之后仍然是 unknown，不入列。
+      final root = tempRoot('explicit_txt');
+      final path = put(root, 'notes.docx', '这不是一个压缩包'.codeUnits);
+
+      final s = await scanFileList([path], baseDepth: 0, ignoreContainers: true);
+      expect(s.items, isEmpty);
+    });
+
+    test('默认不开：不传这个参数就还是老样子', () async {
+      final root = tempRoot('explicit_default');
+      final path = put(root, 'report.docx', ooxmlZip());
+
+      final s = await scanFileList([path], baseDepth: 0);
+      expect(s.items, isEmpty, reason: '默认必须保留容器防线');
+    });
+  });
+
+  group('显式文件：分卷自动补齐', () {
+    /// 造一套 `.zip.001/.002`，返回 `(root, 001 的路径)`。
+    (Directory, String) twoVolumes(String tag) {
+      final root = tempRoot(tag);
+      final zip = realZip({'hello.txt': 'world'});
+      final half = zip.length ~/ 2;
+      final p1 = put(root, 'big.zip.001', zip.sublist(0, half));
+      put(root, 'big.zip.002', zip.sublist(half));
+      return (root, p1);
+    }
+
+    test('只点了 .001，也把 .002 一起解', () async {
+      final (_, first) = twoVolumes('siblings');
+
+      final s = await scanFileList([first],
+          baseDepth: 0, expandSplitVolumes: true);
+
+      expect(s.items, hasLength(1));
+      expect(s.items.single.isSplit, isTrue);
+      expect(s.items.single.parts, hasLength(2),
+          reason: '单独一片 .001 在解码器眼里什么都不是');
+    });
+
+    test('不带这个开关时就是孤零零一片（对照组）', () async {
+      final (_, first) = twoVolumes('siblings_off');
+
+      final s = await scanFileList([first], baseDepth: 0);
+      expect(s.items.single.parts, hasLength(1));
+    });
+
+    test('绝不把同目录**别的**包捎带进来', () async {
+      // 这条是「选了文件就只解它」那条要求的边界：补的是同一个分卷家族的
+      // 兄弟，不是「这个目录里的所有压缩包」。
+      final (root, first) = twoVolumes('siblings_only');
+      put(root, 'other.zip', realZip({'x': 'y'}));
+      put(root, 'another.zip.001', realZip({'z': 'w'}));
+
+      final s = await scanFileList([first],
+          baseDepth: 0, expandSplitVolumes: true);
+
+      // 只有 `big` 这一个家族。注意分卷条的 `fileName` 是**第一片的文件名**
+      // （`ScanItem.fileName` 就是 `entryPath` 的 basename），所以要按 parts 断言
+      // ——列表上显示的那个「剥掉卷号」的名字是 `AppState` 另一处算的。
+      expect(s.items, hasLength(1));
+      expect(s.items.single.isSplit, isTrue);
+      expect(
+        s.items.single.parts.map(p.basename).toList(),
+        ['big.zip.001', 'big.zip.002'],
+        reason: '同目录的 other.zip 与 another.zip.001 都不该被捎带进来',
+      );
+    });
+
+    test('点的是普通单文件时什么都不补', () async {
+      final root = tempRoot('siblings_plain');
+      final path = put(root, 'solo.zip', realZip({'x': 'y'}));
+      put(root, 'neighbour.zip', realZip({'x': 'y'}));
+
+      final s = await scanFileList([path],
+          baseDepth: 0, expandSplitVolumes: true);
+
+      expect(namesOf(s), ['solo.zip']);
+    });
+
+    test('兄弟文件读不到也不影响用户点名的那一个', () async {
+      final root = tempRoot('siblings_missing');
+      // 只有 .001，.002 不存在 —— 家族校验会失败，退回单片
+      final zip = realZip({'hello.txt': 'world'});
+      final first = put(root, 'lonely.zip.001', zip.sublist(0, zip.length ~/ 2));
+
+      final s = await scanFileList([first],
+          baseDepth: 0, expandSplitVolumes: true);
+
+      expect(s.items.single.parts, hasLength(1));
+    });
+  });
+
+  group('显式文件的 depth 必须是 0', () {
+    test('baseDepth 0 时每一行都是顶层，不带嵌套标记', () async {
+      // `scanFileList` 的默认 baseDepth 是 1（为嵌套发现调的）。顶层用默认值
+      // 会让每一行都显示成缩进一层 —— 这条钉住调用方别忘了显式传 0。
+      final root = tempRoot('explicit_depth');
+      final path = put(root, 'a.zip', realZip({'x': 'y'}));
+
+      expect((await scanFileList([path], baseDepth: 0)).items.single.depth, 0);
+      expect((await scanFileList([path])).items.single.depth, 1,
+          reason: '不传就是 1，这是嵌套那条路的约定');
     });
   });
 }

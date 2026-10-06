@@ -8,10 +8,10 @@ import 'package:deep_unzip/engine/models.dart';
 import 'package:deep_unzip/engine/output_paths.dart';
 import 'package:deep_unzip/engine/protocol.dart';
 import 'package:deep_unzip/models/archive_file.dart';
-import 'package:deep_unzip/models/extractor.dart';
 import 'package:deep_unzip/models/log_entry.dart';
 import 'package:deep_unzip/models/password_entry.dart';
 import 'package:deep_unzip/providers/app_state.dart';
+import 'package:deep_unzip/services/password_prompt.dart';
 import 'package:deep_unzip/services/prompts.dart';
 import 'package:deep_unzip/services/disk_space.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -19,6 +19,8 @@ import 'package:path/path.dart' as p;
 
 import '../engine/zip_fixtures.dart';
 import '../support/fake_engine.dart';
+import '../support/fake_keep_alive.dart';
+import '../support/fake_notification_permission.dart';
 import '../support/fake_store.dart';
 
 /// `AppState` 是整个 UI 的契约面：4 个页面 + 4 个弹窗都直接读它的 getter。
@@ -176,6 +178,113 @@ void main() {
 
       expect([for (final a in state.archives) a.name],
           ['x2.zip', 'x10.zip', 'inner.zip']);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // 首页「选择文件」那条路（`selectFilePath`）
+  //
+  // 与「选文件夹」的全部差别就在于：**只解点名的那一个**，同目录里没被选的
+  // 不算。这条走的是真引擎（`booted()` 起的是真 worker isolate），所以下面
+  // 断的是端到端结果，不是某个函数的返回值。
+  // ---------------------------------------------------------------------------
+  group('选单个文件', () {
+    t('只解点名的那一个，同目录其它包不出现', () async {
+      final root = tempRoot('as_onefile');
+      // 同一个目录里放三个包，只点中间那个；子目录里再塞一个。
+      put(root, 'a.zip', realZip({'x': 'y'}));
+      final picked = put(root, 'b.zip', realZip({'x': 'y'}));
+      put(root, 'c.zip', realZip({'x': 'y'}));
+      put(root, 'sub/d.zip', realZip({'x': 'y'}));
+
+      final state = booted();
+      await state.selectFilePath(picked);
+
+      expect([for (final a in state.archives) a.name], ['b.zip'],
+          reason: '这就是这条入口存在的理由 —— 不算上同目录里没选的那些，'
+              '也不递归进子目录');
+      expect(state.hasScanned, isTrue);
+    });
+
+    t('源根取父目录，卡片名取文件名', () async {
+      // `_folderPath` 同时是「自定义输出目录」的镜像基准、剩余空间所在的卷、
+      // 「打开输出目录」的兜底。单选文件时设成**父目录**，三个角色全都仍然成立。
+      final root = tempRoot('as_onefile_paths');
+      put(root, 'sub/inner.zip', realZip({'x': 'y'}));
+
+      final state = booted();
+      await state.selectFilePath(p.join(root.path, 'sub', 'inner.zip'));
+
+      expect(state.folderPath, p.join(root.path, 'sub'));
+      expect(state.folderName, 'inner.zip',
+          reason: '卡片标题说的是「选了什么」，所以是文件名');
+      expect(state.outputDirName, 'sub',
+          reason: '而「输出到」那行说的是输出落在哪 —— 对称输出时是父目录，'
+              '拿文件名去填那句就是假话');
+    });
+
+    t('明确选中的容器格式文件照样解（.docx 也是 zip）', () async {
+      final root = tempRoot('as_onefile_docx');
+      final docx = put(
+        root,
+        '报告.docx',
+        realZip({
+          '[Content_Types].xml': '<Types/>',
+          'word/document.xml': '<w:document/>',
+        }),
+      );
+
+      final state = booted();
+      await state.selectFilePath(docx);
+
+      expect([for (final a in state.archives) a.name], ['报告.docx'],
+          reason: '用户点了它就是要它 —— 那条容器防线是为「扫一整个目录」设计的');
+    });
+
+    t('对照：同一个文件走「选文件夹」时被容器防线拦下', () async {
+      final root = tempRoot('as_onefile_docx_ctrl');
+      put(
+        root,
+        '报告.docx',
+        realZip({
+          '[Content_Types].xml': '<Types/>',
+          'word/document.xml': '<w:document/>',
+        }),
+      );
+
+      final state = booted();
+      await state.selectFolderPath(root.path);
+
+      expect(state.archives, isEmpty, reason: '这条防线在目录扫描里不能松');
+      expect(state.lastScan!.containerSkipped, 1);
+    });
+
+    t('点中的是分卷的一片 → 同目录的其余分片自动补齐', () async {
+      final root = tempRoot('as_onefile_split');
+      final zip = realZip({'hello.txt': 'world'});
+      final half = zip.length ~/ 2;
+      final first = put(root, 'big.zip.001', zip.sublist(0, half));
+      put(root, 'big.zip.002', zip.sublist(half));
+
+      final state = booted();
+      await state.selectFilePath(first);
+
+      // 列表上是一条（分卷合并成一行），但它的 parts 得是两片 —— 只拿一片
+      // 在解码器眼里什么都不是。
+      expect(state.archives, hasLength(1));
+      expect(state.archives.single.flags, contains(ArchiveFlag.split),
+          reason: '补齐之后它才是一个完整的分卷家族');
+    });
+
+    t('文件不存在 → 记一条失败日志，不崩', () async {
+      final root = tempRoot('as_onefile_missing');
+      final state = booted();
+
+      await state.selectFilePath(p.join(root.path, '没有这个.zip'));
+
+      expect(state.archives, isEmpty);
+      expect(state.logs.single.status, LogStatus.failed);
+      expect(state.toastType, 'warn');
     });
   });
 
@@ -714,7 +823,7 @@ void main() {
 
       state.stopExtract();
       expect(state.extracting, isTrue, reason: '停止不等于立刻结束：要等当前这个包解完');
-      expect(state.toastMsg, contains('解完后停止'),
+      expect(state.toastMsg, contains('解压完成后停止'),
           reason: '粒度要如实说，别让人以为按下去就冻住');
 
       gate.complete(); // 第一个包解完
@@ -727,8 +836,8 @@ void main() {
       // 包只解了一个。
       expect(state.outcome, BatchOutcome.stopped);
       expect(state.completeDetail, contains('已完成 1/3 个压缩包'));
-      // 停止**也消费**这份快照：主按钮换成「换个文件夹」。真机验收时用户要求的
-      // —— 从前的做法是放开闸门、回到「开始智能解压」，可那看起来像什么都没
+      // 停止**也消费**这份快照：主按钮换成「更换目标」。真机验收时用户要求的
+      // —— 从前的做法是放开闸门、回到「开始解压」，可那看起来像什么都没
       // 发生过，用户会以为点下去能接着解剩下两个。
       expect(state.batchRun, isTrue);
     });
@@ -844,24 +953,30 @@ void main() {
   });
 
   group('设置、密码库、解压器', () {
-    t('cycleMaxDepth 只在 {0,5,10,20} 里转', () {
+    t('setMaxDepth 是自由输入：区间内的值原样生效，界外才夹', () {
       final state = booted();
-      final seen = <int>{};
-      for (var i = 0; i < 4; i++) {
-        seen.add(state.maxDepth);
-        state.cycleMaxDepth();
-      }
-      expect(seen, {0, 5, 10, 20});
-      expect(state.maxDepth, 0, reason: '转一圈回到起点');
+
+      state.setMaxDepth(7);
+      expect(state.maxDepth, 7, reason: '不再是 {0,5,10,20} 那张档位表');
+
+      state.setMaxDepth(0);
+      expect(state.maxDepth, 0, reason: '0 = 不递归，是语义而不是「填错了」');
+
+      state.setMaxDepth(kMaxMaxDepth + 1);
+      expect(state.maxDepth, kMaxMaxDepth, reason: '上界就是实现层那道硬顶');
     });
 
     t('toggleSetting 翻转指定 key，未登记的 key 读作 false', () {
       final state = booted();
-      final before = state.setting('recursive');
-      state.toggleSetting('recursive');
+      final before = state.setting('errorPause');
+      state.toggleSetting('errorPause');
 
-      expect(state.setting('recursive'), !before);
+      expect(state.setting('errorPause'), !before);
       expect(state.setting('不存在的key'), isFalse);
+      // 「递归解压」那颗 2026-10 与 maxDepth 合并后删了。键还留在表里的话，
+      // `setting('recursive')` 会静默读成 false（也就是「关着」），而深度那
+      // 一档同时在说另一件事 —— 没人看得出这里有两个开关在打架。
+      expect(kDefaultToggles.containsKey('recursive'), isFalse);
     });
 
     t('addPassword 拒绝空串与重复', () {
@@ -905,48 +1020,10 @@ void main() {
           reason: '只该删掉下标 1 那条');
     });
 
-    t('内置解压器删不掉', () {
-      final state = booted();
-      final builtin = state.extractors.indexWhere((e) => e.isBuiltin);
-      expect(builtin, isNot(-1), reason: '夹具前提：存在内置解压器');
-      final before = state.extractors.length;
-
-      state.deleteExtractor(builtin);
-
-      expect(state.extractors.length, before);
-    });
-
-    t('注册重名解压器被拒（大小写不敏感）', () {
-      final state = booted();
-      final before = state.extractors.length;
-
-      state.addExtractor(const Extractor(
-        name: 'zip',
-        type: ExtractorType.single,
-        detectLogic: '',
-        extractLogic: '',
-      ));
-
-      expect(state.extractors.length, before);
-      expect(state.toastType, 'warn');
-    });
-
-    t('custom 解压器能注册也能删', () {
-      final state = booted();
-      const custom = Extractor(
-        name: 'FOO',
-        type: ExtractorType.split,
-        detectLogic: 'readHeader(4) === 0x464F4F00',
-        extractLogic: 'foo x {file} {dir}',
-      );
-
-      state.addExtractor(custom);
-      final idx = state.extractors.indexWhere((e) => e.name == 'FOO');
-      expect(idx, isNot(-1));
-
-      state.deleteExtractor(idx);
-      expect(state.extractors.any((e) => e.name == 'FOO'), isFalse);
-    });
+    // 这里原来还有三条「注册 / 删除解压方式」的用例。那个入口 2026-10 撤了：它
+    // 从来没接到引擎上（`addExtractor` 只往列表里加一行，识别靠嗅探表、解压靠
+    // 内置 7-Zip 核心，没有任何一边读它），注册成功的 toast 是假的。现在格式
+    // 清单是只读的，见 `test/data/builtin_extractors_test.dart`。
   });
 
   group('炸弹防护阈值', () {
@@ -1120,7 +1197,7 @@ void main() {
       final state = AppState(engine: engine);
       addTearDown(state.dispose);
 
-      state.cycleMaxDepth(); // 0 → 5
+      state.setMaxDepth(5); // 内层包的 depth 是 6 —— 差一级，必须被拦
 
       await state.selectFolderPath(root.path);
       state.startExtract();
@@ -1136,7 +1213,9 @@ void main() {
       expect(state.logs.first.status, LogStatus.skipped);
     });
 
-    t('关掉 recursive → 内层包既不进列表也不解', () async {
+    t('深度 0 = 不递归 → 内层包既不进列表也不解，连扫都不扫', () async {
+      // 这条原来测的是那颗「递归解压」开关，2026-10 那颗与深度合并后删了：
+      // 现在让内层包不出现的手段就是深度填 0。
       final root = tempRoot('as_norec');
       final outer = put(root, 'a.zip', realZip({'x': 'y'}));
       final inner = put(payload, 'inner.zip', realZip({'y': 'z'}));
@@ -1146,15 +1225,109 @@ void main() {
       final state = AppState(engine: engine);
       addTearDown(state.dispose);
 
-      state.toggleSetting('recursive'); // true → false
+      state.setMaxDepth(0);
 
       await state.selectFolderPath(root.path);
       state.startExtract();
       await drainExtract(state);
 
-      expect(engine.rounds, 1);
-      expect(engine.recursiveSeen, [isFalse], reason: '关掉时连扫都不该扫');
+      expect(engine.rounds, 1, reason: '顶层那个照解，只是不再往下走');
+      expect(engine.recursiveSeen, [isFalse],
+          reason: '不递归时连「扫一下里面有没有包」都不该让引擎做 —— 扫了也全丢');
       expect(state.archives.map((a) => a.name), ['a.zip']);
+    });
+
+    // ---- 顶层扫描也要过同一道闸门（2026-10 补的）-----------------------
+    //
+    // 深度数的是「**从被选目录**往下走了几步」，而「一步」有两种、同等计入：
+    // 进一层子目录、解开一层嵌套包。
+    //
+    // 之前只有第二种被闸门管着（`_enqueueNested`），顶层那批是无条件排队的，
+    // 于是 `maxDepth = 0` 拦得住包**里面**的嵌套包，却拦不住**目录里面**的
+    // 包 —— 而按上面那条规则，后者离被选目录更远。
+
+    t('子目录里的包也占额度：maxDepth = 0 时它不进队列，但仍然列出来', () async {
+      final root = tempRoot('as_topsub');
+      put(root, 'a.zip', realZip({'x': 'y'}));
+      put(root, 'sub/b.zip', realZip({'x': 'y'}));
+
+      final engine = FakeEngine();
+      final state = AppState(engine: engine);
+      addTearDown(state.dispose);
+
+      state.setMaxDepth(0);
+
+      await state.selectFolderPath(root.path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(engine.rounds, 1, reason: '只有躺在被选目录下那一个该被解');
+      expect(engine.recursiveSeen, [isFalse]);
+      expect(
+        state.archives.map((a) => a.name),
+        ['a.zip', 'b.zip'],
+        reason: '子目录里那个仍然要列出来 —— 它是扫描结果，用户得看得见目录里有什么，'
+            '只是这一批轮不到它',
+      );
+      expect(
+        state.logs.map((l) => l.tags).expand((t) => t),
+        contains('超出递归深度'),
+        reason: '被拦下要留一条记录，跟嵌套包那条路长一样',
+      );
+    });
+
+    t('maxDepth = 1 → 子目录里的包正好占那一层，照样解', () async {
+      // 与上一条只差一个数：深度填 1 时，`sub/b.zip` 自己在第 1 层，
+      // 正好在闸门之内。这条钉住「不是被一刀切掉」，而是真的按层级算。
+      final root = tempRoot('as_topsub1');
+      put(root, 'a.zip', realZip({'x': 'y'}));
+      put(root, 'sub/b.zip', realZip({'x': 'y'}));
+
+      final engine = FakeEngine();
+      final state = AppState(engine: engine);
+      addTearDown(state.dispose);
+
+      state.setMaxDepth(1);
+
+      await state.selectFolderPath(root.path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(engine.rounds, 2, reason: '两个都在第 1 层之内，都该解');
+      expect(
+        state.logs.map((l) => l.tags).expand((t) => t),
+        isNot(contains('超出递归深度')),
+      );
+    });
+
+    t('顶层一个都排不进来 → 这批不算跑过，调大深度后原地点得动', () async {
+      final root = tempRoot('as_topall');
+      put(root, 'sub/b.zip', realZip({'x': 'y'}));
+
+      final engine = FakeEngine();
+      final state = AppState(engine: engine);
+      addTearDown(state.dispose);
+
+      state.setMaxDepth(0);
+
+      await state.selectFolderPath(root.path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(engine.rounds, 0, reason: '一个都不该送去解');
+      // `batchRun` 由 `_outcome` 派生。空批次要是也把它置上，主按钮会变成
+      // 「更换目标」，用户把深度调大之后**同一个快照就再也跑不了**了。
+      expect(state.batchRun, isFalse, reason: '什么都没跑，不算「这批跑过了」');
+      expect(state.logs.first.status, LogStatus.skipped);
+      expect(state.logs.first.tags, contains('超出递归深度'));
+
+      // 调大之后原地再来一次 —— 这条路必须通，否则用户只有一个选择：
+      // 重新选目录（那会把已经解好的再解一遍）。
+      state.setMaxDepth(1);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(engine.rounds, 1, reason: '调大深度后同一份快照该能接着跑');
     });
 
     t('内层包失败 → 记失败但不影响批次收尾', () async {
@@ -1184,6 +1357,209 @@ void main() {
     });
   });
 
+  // ---------------------------------------------------------------------------
+  // 自定义输出目录（2026-10，由那颗「目录对称输出」改名而来）
+  //
+  // 旧那颗是**死开关**：全仓库只有设置页写它，`resolveOutputDir` 从不读设置，
+  // 所以它的值对磁盘没有任何影响（账见 `persist.dart` 的 `kDefaultToggles`）。
+  // 这一组盯的是新语义真的接到了磁盘上 —— 关着与从前逐字一致，开着则把根换成
+  // 用户选的那个，并且**按源目录结构镜像**写进去。
+  // ---------------------------------------------------------------------------
+  group('自定义输出目录', () {
+    /// `resolveOutputDir` 一律返回 posix 形态（见 `output_paths.dart` 的
+    /// `_toPosix`），而 `tempRoot` 给的是宿主形态。断言前统一成 `/`。
+    String slash(String s) => s.replaceAll(r'\', '/');
+
+    /// 造一个假扫描项，只给嵌套那两条用例用。
+    ScanItem itemAt(String path, {int depth = 0}) => ScanItem(
+          entryPath: path,
+          parts: [path],
+          sniff: const SniffResult(
+            format: SniffFormat.zip,
+            confidence: SniffConfidence.high,
+            declaredExt: 'zip',
+          ),
+          sizeBytes: 100,
+          flags: const {},
+          depth: depth,
+        );
+
+    AppState opened({
+      required FakeEngine engine,
+      required String outRoot,
+    }) {
+      final state = AppState(engine: engine);
+      addTearDown(state.dispose);
+      state.toggleSetting('customOutput');
+      state.setOutputRoot(outRoot);
+      return state;
+    }
+
+    t('关着（出厂默认）→ 照旧解到包旁边', () async {
+      final root = tempRoot('as_custom_off');
+      put(root, 'sub/a.zip', realZip({'x': 'y'}));
+
+      final engine = FakeEngine();
+      final state = AppState(engine: engine);
+      addTearDown(state.dispose);
+
+      await state.selectFolderPath(root.path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(slash(engine.outDirs.single), slash(p.join(root.path, 'sub', 'a')));
+    });
+
+    t('开着 + 指定了根 → 按源目录结构镜像写进根里', () async {
+      final root = tempRoot('as_custom_mirror');
+      final outRoot = tempRoot('as_custom_mirror_out');
+      put(root, 'top.zip', realZip({'x': 'y'}));
+      put(root, 'sub/a.zip', realZip({'x': 'y'}));
+
+      final engine = FakeEngine();
+      final state = opened(engine: engine, outRoot: outRoot.path);
+
+      await state.selectFolderPath(root.path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(
+        engine.outDirs.map(slash),
+        containsAll([
+          slash(p.join(outRoot.path, 'top')),
+          slash(p.join(outRoot.path, 'sub', 'a')),
+        ]),
+        reason: '顶层包落在根自己身上，子目录里的包带上那一段目录',
+      );
+      expect(
+        engine.outDirs.map(slash),
+        everyElement(startsWith(slash(outRoot.path))),
+        reason: '没有一个包该跑到根外面去',
+      );
+      expect(
+        slash(engine.outDirs.first),
+        isNot(startsWith(slash(root.path))),
+        reason: '一个都不该留在源目录里',
+      );
+    });
+
+    t('嵌套包落在镜像位置底下 —— 父包的输出目录本身就是镜像出来的', () async {
+      final root = tempRoot('as_custom_nest');
+      final outRoot = tempRoot('as_custom_nest_out');
+      put(root, 'sub/outer.zip', realZip({'x': 'y'}));
+
+      // 父包该落到的位置**独立算一遍**，不复用生产代码 —— 复用的话它算错时
+      // 这条用例会跟着一起错，钉不住任何东西。
+      //
+      // 内层包**照实造在父包输出目录里面**（真引擎里 worker 就是在那里扫到的），
+      // 但不落盘：`_enqueueNested` 只读 `outcome.nested` 里那些条目的路径，不碰
+      // 文件本身（身份指纹是拿**父包**算的）。落盘反而会让父包那个目录先存在，
+      // 于是 `resolveOutputDir` 的占用判定把它退成 `outer_1`，台子就搭歪了。
+      final parentOut = '${slash(outRoot.path)}/sub/outer';
+      final engine = FakeEngine()
+        ..nestedFor[parentOut] = [itemAt('$parentOut/inner.zip', depth: 1)];
+      final state = opened(engine: engine, outRoot: outRoot.path);
+
+      await state.selectFolderPath(root.path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(engine.outDirs, hasLength(2), reason: '内层包也要真的解一次');
+      expect(engine.outDirs[0], parentOut);
+      expect(
+        engine.outDirs[1],
+        '$parentOut/inner',
+        reason: '嵌套任务**不带** outputBaseDir（`_enqueueNested` 不设它），'
+            '全靠父包已经落在镜像位置上这件事天然继承。它要是跑到源目录旁边，'
+            '就说明这条推导错了',
+      );
+    });
+
+    t('开着却没设根 → startExtract 直接拒绝，不去惊动引擎', () async {
+      final root = tempRoot('as_custom_noroot');
+      put(root, 'a.zip', realZip({'x': 'y'}));
+
+      final engine = FakeEngine();
+      final state = AppState(engine: engine);
+      addTearDown(state.dispose);
+      state.toggleSetting('customOutput');
+
+      await state.selectFolderPath(root.path);
+      state.startExtract();
+      await settle();
+
+      expect(engine.rounds, 0, reason: '不知道往哪写就不该写');
+      expect(state.extracting, isFalse);
+      expect(state.toastType, 'warn');
+      expect(state.toastMsg, contains('输出根目录'));
+    });
+
+    t('批次跑到一半改根 → 这一批仍按开始时锁定的那个走', () async {
+      final root = tempRoot('as_custom_lock');
+      final outA = tempRoot('as_custom_lock_a');
+      final outB = tempRoot('as_custom_lock_b');
+      put(root, 'a.zip', realZip({'x': 'y'}));
+      put(root, 'b.zip', realZip({'x': 'y'}));
+
+      final gate = Completer<void>();
+      final engine = FakeEngine()
+        ..behavior = (e, outDir) async {
+          if (e.rounds == 1) await gate.future;
+        };
+      final state = opened(engine: engine, outRoot: outA.path);
+
+      await state.selectFolderPath(root.path);
+      state.startExtract();
+      await settle();
+      expect(engine.rounds, 1, reason: '前提：第一个包还卡着');
+
+      state.setOutputRoot(outB.path); // 用户在解压途中换了根
+      gate.complete();
+      await drainExtract(state);
+
+      expect(
+        engine.outDirs.map(slash),
+        everyElement(startsWith(slash(outA.path))),
+        reason: '同一批里前半个包写在 A、后半个写在 B，结果没法解释 —— '
+            '与 `maxDepth`/`limits` 那条锁定是一个道理',
+      );
+    });
+
+    t('选过的根会进下一次扫描的 skipDirs —— 防自噬', () async {
+      final root = tempRoot('as_custom_skip');
+      final outRoot = tempRoot('as_custom_skip_out');
+      put(root, 'a.zip', realZip({'x': 'y'}));
+
+      final engine = FakeEngine();
+      final state = AppState(engine: engine);
+      addTearDown(state.dispose);
+      state.setOutputRoot(outRoot.path);
+
+      await state.selectFolderPath(root.path);
+
+      expect(engine.skipDirsSeen, hasLength(1));
+      expect(
+        engine.skipDirsSeen.single,
+        contains(outRoot.path),
+        reason: '把根选在源目录里面时必须跳过它，否则「解压 → 重扫」会把 '
+            '自己刚写出去的东西当成新包再解一遍',
+      );
+    });
+
+    t('开局那次扫描的 skipDirs 是空的 —— 没选过根就没什么可跳', () async {
+      final root = tempRoot('as_custom_skip_empty');
+      put(root, 'a.zip', realZip({'x': 'y'}));
+
+      final engine = FakeEngine();
+      final state = AppState(engine: engine);
+      addTearDown(state.dispose);
+
+      await state.selectFolderPath(root.path);
+
+      expect(engine.skipDirsSeen.single, isEmpty);
+    });
+  });
+
   group('被拦弹窗与剩余空间', () {
     // 这一组盯的是「闸门之后」那条新加的链：EngineException.breach → 问用户
     // → 用户的决断怎么影响整批。闸门本身住在 native_backend 里（假引擎整个
@@ -1192,7 +1568,7 @@ void main() {
     const breach = LimitBreach(
       kind: LimitKind.diskSpace,
       tag: '空间不足',
-      message: '解压后需要 12.0 GB，设备只剩 3.2 GB，装不下，已放弃',
+      message: '解压后需要 12.0 GB，设备仅剩 3.2 GB，装不下，已放弃',
     );
 
     /// 记下每次被问到的 (文件名, 原因那句话)。
@@ -1309,7 +1685,7 @@ void main() {
       // （见 `prompts.dart` 的表），所以它验的是**剩下的那点差别**：正文。
       //
       // 正文由 `breach?.message ?? e.message` 一句决定。写反成 `??` 左边优先，
-      // 弹窗上就会给一个坏包配一句与它无关的「设备只剩 3.2 GB」，而用户会
+      // 弹窗上就会给一个坏包配一句与它无关的「设备仅剩 3.2 GB」，而用户会
       // 真的去清磁盘。
       final root = tempRoot('as_prompt_plain');
       put(root, 'a.zip', realZip({'x': 'y'}));
@@ -1479,7 +1855,7 @@ void main() {
       // 炸掉的那个算失败、不算「完成」，所以是 0/2。
       expect(state.completeDetail, contains('已完成 0/2 个压缩包'));
       expect(state.completeDetail, contains('1 个失败'));
-      expect(state.batchRun, isTrue, reason: '停止也消费快照，主按钮换成「换个文件夹」');
+      expect(state.batchRun, isTrue, reason: '停止也消费快照，主按钮换成「更换目标」');
     });
 
     t('选「跳过」→ 记一条**手动跳过**，不算失败，整批接着跑', () async {
@@ -1799,6 +2175,982 @@ void main() {
   /// 一个包失败它就不成立。而重跑的危害与成败无关 —— 输出目录重名会追加
   /// `_1`/`_2`（见 output_paths.dart），再点一次不是「重新解一遍」而是往磁盘里
   /// 撒重复目录。所以闸门必须挂在「跑过」（`batchRun`）而不是「成功」上。
+  group('密码库自动尝试与弹窗（需求 2）', () {
+    // 这一组盯的是「密码库真的被拿去试了，而且试的顺序、试的结果都被认得」。
+    //
+    // 关键约定（见 `password_prompt.dart` 里 `PasswordAsk.verify` 那段）：
+    // 「验一个候选」的实现就是**拿它真解一遍**，所以每次 `extract` 都是一次
+    // 尝试，`engine.passwordsSeen` 就是完整流水账 —— 真引擎在 Android 上，
+    // 本地只能靠这张表钉。
+    //
+    // `pwdPrompt` 这颗开关控制的**不是**「要不要试密码库」（一直要试），而是
+    // 「试不出来之后问不问」。它是从 `pwdAutoTry` 改名过来的，那个名字指的是
+    // 两边共有的那一半。
+    //
+    // 流水账里的**第一项永远是空串 `''`**（开局那次「空密码」），不是 `null`。
+    // 这不是风格问题：`null` 会让原生 ZIP 路径直接放弃整次解压、答一个笼统的
+    // 「解压失败」，密码库与弹窗就都不会被走到。第一条用例专门钉这件事。
+
+    /// 只有给对密码才解得开。
+    ///
+    /// 用 `passwordsSeen.last` 而不是闭包里的计数器：`passwordsSeen` 在
+    /// `behavior` 之前就记好了，所以这里读到的就是「这次带的哪个密码」。
+    ///
+    /// [uncertain] 为真时失败带上「分不清是密码错还是文件坏」那一位 —— 模拟
+    /// 7z 的内容加密 / RAR3（没有校验字）。**它只该改说法，不该改流水账**，
+    /// 下面两条用例就是拿 `passwordsSeen` 钉这件事。
+    FakeEngine locked(String right, {bool uncertain = false}) => FakeEngine()
+      ..behavior = (e, outDir) async {
+        if (e.passwordsSeen.last != right) {
+          throw EngineException(
+            uncertain ? '密码不对，或加密数据已损坏' : 'Wrong password',
+            code: DuzErrorCode.password,
+            uncertain: uncertain,
+          );
+        }
+      };
+
+    Directory onePack(String tag) {
+      final root = tempRoot(tag);
+      put(root, 'a.zip', realZip({'x': 'y'}));
+      return root;
+    }
+
+    Directory twoPacks(String tag) {
+      final root = tempRoot(tag);
+      put(root, 'a.zip', realZip({'x': 'y'}));
+      put(root, 'b.zip', realZip({'x': 'y'}));
+      return root;
+    }
+
+    AppState withVault(
+      FakeEngine engine, {
+      List<PasswordEntry> vault = const [],
+      PasswordPrompt? prompt,
+      PersistStore? store,
+    }) {
+      final state = AppState(
+        engine: engine,
+        persistStore: store,
+        restore: AppSnapshot(vault: vault),
+        passwordPrompt: prompt,
+      );
+      addTearDown(state.dispose);
+      return state;
+    }
+
+    t('开局那次空密码送的是空串，不是 null', () async {
+      // 这条钉的是一个**只在真机上才暴露**的坑（见 `app_state.dart` 里
+      // `_kEmptyPassword` 那段）：`null` 与 `''` 在原生 ZIP 路径上是两件事。
+      // 传 `null`，7-Zip 的 `Extract()` 直接返回 `E_NOTIMPL`，C 那边只好翻成
+      // 笼统的 `DUZ_ERR_EXTRACT` —— `_PwdAttempt.isPasswordError` 为假，密码库
+      // 与弹窗整条路一次都不会被走到。真机第一次验收就是这么栽的。
+      //
+      // 为什么非得在这里钉：假引擎的错误码是它自己给的，它认不出「引擎收到
+      // null 会改答别的」这件事。能钉的只有**送给引擎的那个值**本身。
+      final engine = locked('pw-ok');
+      final state = withVault(
+        engine,
+        vault: const [PasswordEntry(value: 'pw-ok')],
+      );
+
+      await state.selectFolderPath(onePack('as_pw_empty').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(engine.passwordsSeen, ['', 'pw-ok']);
+      expect(engine.passwordsSeen, isNot(contains(null)),
+          reason: '只要出现一次 null，这个包在真机上就会变成一句「解压失败」');
+    });
+
+    t('库里有对的密码 → 自动解开，不惊动用户', () async {
+      // 顺序也是这条用例的一部分：先空密码（回答「要不要密码」），再按
+      // `hitCount` 排下来的候选。
+      final engine = locked('pw-ok');
+      final asked = <PasswordAsk>[];
+      final state = withVault(
+        engine,
+        vault: const [
+          PasswordEntry(value: 'pw-bad'),
+          PasswordEntry(value: 'pw-ok'),
+        ],
+        prompt: (ask) async {
+          asked.add(ask);
+          return const PasswordResolution.skip();
+        },
+      );
+
+      await state.selectFolderPath(onePack('as_pw_hit').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(engine.passwordsSeen, ['', 'pw-bad', 'pw-ok']);
+      expect(asked, isEmpty, reason: '密码库解开了就别再问用户');
+      // `logs.first` 才是刚解这个包记的 —— 扫描收尾往前面塞了一条
+      // 「扫描完成」，它排在后面。
+      expect(state.logs.first.status, LogStatus.success);
+      expect(state.completeDetail, contains('1 个压缩包'));
+      expect(state.completeDetail, isNot(contains('失败')));
+    });
+
+    t('命中的密码记一次「用过」并落盘 —— 下次它排最前', () async {
+      final store = FakeStore();
+      final engine = locked('pw-ok');
+      final state = withVault(
+        engine,
+        vault: const [
+          PasswordEntry(value: 'pw-ok'),
+          PasswordEntry(value: 'pw-used'),
+          PasswordEntry(value: 'pw-new'),
+        ],
+        store: store,
+      );
+
+      await state.selectFolderPath(onePack('as_pw_count').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      final hit = state.passwords.firstWhere((p) => p.value == 'pw-ok');
+      expect(hit.hitCount, 1);
+      expect(hit.lastUsed, '今天');
+      expect(store.vaultSaved, isNotEmpty, reason: '命中数得写回去，不然下次白试');
+      expect(store.vaultSaved.last.firstWhere((p) => p.value == 'pw-ok').hitCount,
+          1);
+    });
+
+    t('命中数高的先试 —— 库是按「哪个常有用」排的，不是按插入序', () async {
+      final engine = locked('pw-hot');
+      final state = withVault(
+        engine,
+        vault: const [
+          PasswordEntry(value: 'pw-cold'),
+          PasswordEntry(value: 'pw-hot', hitCount: 3),
+        ],
+      );
+
+      await state.selectFolderPath(onePack('as_pw_order').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(engine.passwordsSeen, ['', 'pw-hot'],
+          reason: '只试了一个说明排序生效了；试的顺序反了说明排反了');
+    });
+
+    t('并列时按插入序 —— 同分的密码每次试的顺序都不一样就没法复现', () async {
+      final engine = locked('pw-c');
+      final state = withVault(
+        engine,
+        vault: const [
+          PasswordEntry(value: 'pw-a'),
+          PasswordEntry(value: 'pw-b'),
+          PasswordEntry(value: 'pw-c'),
+        ],
+      );
+
+      await state.selectFolderPath(onePack('as_pw_tie').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(engine.passwordsSeen, ['', 'pw-a', 'pw-b', 'pw-c']);
+    });
+
+    t('本批命中过的密码，后面的包第一次就试它', () async {
+      // 「本次解压优先尝试成功过的密码」：一批里有一个包被某个密码打开，剩下的包
+      // 大概率是同一个 —— 同一次备份切出来的一组包就是。
+      //
+      // 判据得挑一个**排序本来给不出这个顺序**的库：让命中的那条 `hitCount`
+      // 明显低于另一条。否则光靠既有的「命中就加一」也能让第二个包先试对它，
+      // 这条用例就成了永远绿的假测试。
+      final engine = locked('pw-low');
+      final state = withVault(
+        engine,
+        vault: const [
+          PasswordEntry(value: 'pw-low'),
+          PasswordEntry(value: 'pw-high', hitCount: 5),
+        ],
+      );
+
+      await state.selectFolderPath(twoPacks('as_pw_runmem').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(
+        engine.passwordsSeen,
+        ['', 'pw-high', 'pw-low', '', 'pw-low'],
+        reason: 'a.zip 照旧从命中数高的试起；b.zip 的第二个候选该是本批刚用上的 '
+            'pw-low，而不是又回到库里排第一的 pw-high',
+      );
+    });
+
+    t('手输的密码也算「本次成功过」→ 后面的包不用再问一遍', () async {
+      // 手输走的是同一个 `attempt`，所以它同样进这份记忆 —— 用户刚亲手证明能用
+      // 的密码，比库里任何一条都更该被先试。
+      final engine = locked('typed');
+      final asked = <PasswordAsk>[];
+      final state = withVault(
+        engine, // 空密码库
+        prompt: (ask) async {
+          asked.add(ask);
+          final ok = await ask.verify('typed');
+          expect(ok, isTrue);
+          return const PasswordResolution.manual('typed');
+        },
+      );
+
+      await state.selectFolderPath(twoPacks('as_pw_runmem_manual').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(engine.passwordsSeen, ['', 'typed', '', 'typed'],
+          reason: 'b.zip 第一次尝试（空密码）之后就该轮到 typed');
+      expect(asked, hasLength(1), reason: '只该为 a.zip 弹这一次');
+    });
+
+    t('记忆不跨批 —— 它是「本次解压」的，换一份快照就归零', () async {
+      // 这一条钉的是**范围**：`_runGoodPasswords` 在每批开头清空。不清的话，
+      // 「上礼拜试出来过的一个密码」会永远排在候选最前面，代价从「这批白试
+      // 一次」变成「以后每次解压的每个包都白试一次」。
+      final engine = locked('pw-low');
+      final state = withVault(
+        engine,
+        vault: const [
+          PasswordEntry(value: 'pw-low'),
+          PasswordEntry(value: 'pw-high', hitCount: 5),
+        ],
+      );
+
+      await state.selectFolderPath(onePack('as_pw_runmem_b1').path);
+      state.startExtract();
+      await drainExtract(state);
+      expect(engine.passwordsSeen, ['', 'pw-high', 'pw-low']);
+
+      // 换一份快照 = 新的一批（见 `startExtract` 那道「跑过就不让再跑」的闸门）。
+      await state.selectFolderPath(onePack('as_pw_runmem_b2').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(
+        engine.passwordsSeen,
+        ['', 'pw-high', 'pw-low', '', 'pw-high', 'pw-low'],
+        reason: '第二批又该回到库的顺序：pw-low 的命中数（1）压不过 5',
+      );
+    });
+
+    t('库里没有 → 弹窗；把用户手敲的密码验通即解完', () async {
+      final engine = locked('typed-by-user');
+      final asked = <PasswordAsk>[];
+      final state = withVault(
+        engine,
+        vault: const [PasswordEntry(value: 'pw-bad')],
+        prompt: (ask) async {
+          asked.add(ask);
+          // 弹窗拿到的就是「该验谁」。验真一遍 —— 这正是真弹窗干的事。
+          final ok = await ask.verify('typed-by-user');
+          expect(ok, isTrue);
+          return const PasswordResolution.manual('typed-by-user');
+        },
+      );
+
+      await state.selectFolderPath(onePack('as_pw_manual_ok').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(asked, hasLength(1));
+      expect(asked.single.fileName, 'a.zip');
+      expect(asked.single.triedCount, 1,
+          reason: '弹窗要知道刚才试过几条 —— 它现在只拿得到这个数，不拿密码本身');
+      expect(engine.passwordsSeen, ['', 'pw-bad', 'typed-by-user']);
+      expect(state.logs.first.status, LogStatus.success,
+          reason: '手输成功就是成功，不该因为绕过密码库就显得低人一等');
+    });
+
+    t('手输的密码不对 → verify 给 false，AppState 不开后门', () async {
+      // 「输了留在弹窗页面」是弹窗自己的事（它拿到 false 就不关），这里钉的是
+      // 它**能**拿到 false —— verify 必须如实回答，不能因为「用户都手输了」
+      // 就默认放行。
+      final engine = locked('right');
+      final verdicts = <bool>[];
+      final state = withVault(
+        engine,
+        prompt: (ask) async {
+          verdicts.add(await ask.verify('wrong-1'));
+          verdicts.add(await ask.verify('wrong-2'));
+          verdicts.add(await ask.verify('right'));
+          return const PasswordResolution.manual('right');
+        },
+      );
+
+      await state.selectFolderPath(onePack('as_pw_manual_retry').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(verdicts, [false, false, true]);
+      expect(engine.passwordsSeen, ['', 'wrong-1', 'wrong-2', 'right'],
+          reason: '空库也要先试一次空密码');
+    });
+
+    t('手输的密码验通过 → 自动存进密码库（默认开）', () async {
+      final store = FakeStore();
+      final engine = locked('typed');
+      final state = withVault(
+        engine, // 空库起步
+        store: store,
+        prompt: (ask) async {
+          expect(await ask.verify('typed'), isTrue);
+          return const PasswordResolution.manual('typed');
+        },
+      );
+
+      await state.selectFolderPath(onePack('as_pw_autosave').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      final saved = state.passwords.firstWhere((p) => p.value == 'typed');
+      expect(saved.hitCount, 1,
+          reason: '它刚刚真的解开了一个包 —— 从 0 记起等于把这份证据丢了');
+      expect(store.vaultSaved, isNotEmpty, reason: '得落盘，不然重启就没了');
+      expect(store.vaultSaved.last.map((p) => p.value), contains('typed'));
+    });
+
+    t('关掉「手输密码存入密码库」→ 不进库，但本批的候选记忆照样生效', () async {
+      // 这两件事是**分开的**，这条用例专门把它们分开钉：一条活在内存里、只服务
+      // 这一批（`_runGoodPasswords`），一条写进密码库、服务以后每一次解压。
+      // 关掉后者不该让同一批里的下一个包重新去问用户。
+      final engine = locked('typed');
+      final asked = <PasswordAsk>[];
+      final state = withVault(
+        engine,
+        prompt: (ask) async {
+          asked.add(ask);
+          expect(await ask.verify('typed'), isTrue);
+          return const PasswordResolution.manual('typed');
+        },
+      );
+      state.toggleSetting('pwdAutoSave'); // 默认开，这里关掉
+
+      await state.selectFolderPath(twoPacks('as_pw_autosave_off').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(state.passwords, isEmpty, reason: '关掉了就不该进库');
+      expect(asked, hasLength(1), reason: '但 b.zip 也不该再问一遍');
+      expect(engine.passwordsSeen, ['', 'typed', '', 'typed'],
+          reason: 'b.zip 靠的是本批的记忆，不是密码库');
+    });
+
+    t('密码库自己命中的包不会重复入库，也不会冒一句提示', () async {
+      // 「成功就入库」的挂点在 `attempt` 里，密码库命中也从那儿过。那种情况下
+      // 这条必然在库里 —— 该原地空转，而不是每命中一个包就多一条记录、多一句
+      // toast（那会把提示刷成噪音，还把用户的库越撑越长）。
+      final engine = locked('pw-ok');
+      final toasts = <String>[];
+      final state = withVault(
+        engine,
+        vault: const [PasswordEntry(value: 'pw-ok')],
+      );
+      state.addListener(() {
+        final m = state.toastMsg;
+        if (m != null && (toasts.isEmpty || toasts.last != m)) toasts.add(m);
+      });
+
+      await state.selectFolderPath(onePack('as_pw_autosave_dup').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(state.passwords, hasLength(1));
+      expect(toasts, isNot(contains('密码已存入密码库')));
+    });
+
+    t('密码库解开 → 日志说得出是「密码库」给的钥匙', () async {
+      // 用户回头要查的是「这个包是谁打开的」—— 密码库长起来之后，光看一条
+      // 「1 项」完全对不上号。标签只记来源不记密码本身（见 `PasswordSource`）。
+      final engine = locked('pw-ok');
+      final state = withVault(
+        engine,
+        vault: const [PasswordEntry(value: 'pw-ok')],
+      );
+
+      await state.selectFolderPath(onePack('as_log_src_vault').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(state.logs.first.status, LogStatus.success);
+      expect(state.logs.first.tags, contains('密码库'));
+      expect(state.logs.first.tags, isNot(contains('手输密码')));
+    });
+
+    t('手输解开 → 日志说「手输密码」，与密码库命中的那条分得开', () async {
+      final engine = locked('typed-by-user');
+      final state = withVault(
+        engine,
+        vault: const [PasswordEntry(value: 'pw-bad')],
+        prompt: (ask) async {
+          await ask.verify('typed-by-user');
+          return const PasswordResolution.manual('typed-by-user');
+        },
+      );
+
+      await state.selectFolderPath(onePack('as_log_src_manual').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(state.logs.first.status, LogStatus.success);
+      expect(state.logs.first.tags, contains('手输密码'));
+      expect(state.logs.first.tags, isNot(contains('密码库')),
+          reason: '手输的密码没进库，说成「密码库」用户会去库里翻一条不存在的记录');
+    });
+
+    t('没用上密码的包，日志里一个密码标签都没有', () async {
+      // `null` 与「有来源」必须分得开：写 `''` 或者给个默认值都会让每个普通
+      // 包都挂上「密码库」。
+      final engine = FakeEngine();
+      final state = withVault(engine);
+
+      await state.selectFolderPath(onePack('as_log_src_none').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(engine.passwordsSeen, [''], reason: '前提：一次空密码就成了');
+      expect(state.logs.first.status, LogStatus.success);
+      expect(state.logs.first.tags, ['1 项']);
+    });
+
+    t('密码库试过但没试出来（跳过）→ 也不会说「密码库」', () async {
+      // 跳过那条路上 `passwordSource` 是空的：包**没解开**，说「密码库」
+      // 等于替一次失败的尝试记账。
+      final engine = locked('never');
+      final state = withVault(
+        engine,
+        vault: const [PasswordEntry(value: 'pw-bad')],
+      );
+
+      await state.selectFolderPath(onePack('as_log_src_skip').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(state.logs.first.tags, ['密码未匹配']);
+    });
+
+    t('弹窗选「跳过」→ 记手动跳过，接着解下一个', () async {
+      // 只锁第一个包，第二个让过 —— 这样「跳过」与「停止」才分得开。
+      final engine = FakeEngine()
+        ..behavior = (e, outDir) async {
+          if (e.outDirs.length == 1) {
+            throw const EngineException(
+              'Wrong password',
+              code: DuzErrorCode.password,
+            );
+          }
+        };
+      final state = withVault(
+        engine,
+        prompt: (ask) async => const PasswordResolution.skip(),
+      );
+
+      await state.selectFolderPath(twoPacks('as_pw_skip').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(state.completeDetail, contains('手动跳过 1 个'));
+      expect(state.completeDetail, isNot(contains('失败')));
+      expect(state.outcome, BatchOutcome.clean,
+          reason: '用户自己放掉的包不算这批砸了');
+      expect(state.logs.first.name, 'b.zip', reason: 'b.zip 才是最后解的那个');
+      final a = state.logs.lastWhere((l) => l.name == 'a.zip');
+      expect(a.status, LogStatus.skipped, reason: '按用户的选择跳过，不该记成失败');
+      expect(a.tags, ['用户跳过']);
+    });
+
+    t('弹窗选「停止」→ 剩下的包一个都不跑', () async {
+      final engine = locked('pw-ok');
+      final state = withVault(
+        engine,
+        prompt: (ask) async => const PasswordResolution.stop(),
+      );
+
+      await state.selectFolderPath(twoPacks('as_pw_stop').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(state.extracting, isFalse);
+      expect(state.outcome, BatchOutcome.errored,
+          reason: '弹窗那颗「停止」总是伴随一次失败，标题要说出来');
+      expect(state.completeDetail, contains('已完成 0/2 个压缩包'));
+      expect(state.batchRun, isTrue);
+      expect(engine.outDirs, hasLength(1),
+          reason: '空库里没候选可试，一次空密码之后就停了，b.zip 不该开工');
+    });
+
+    t('关掉这颗开关 → 不弹窗，记「跳过」而不是失败', () async {
+      final engine = locked('pw-ok');
+      final asked = <PasswordAsk>[];
+      final state = withVault(
+        engine,
+        vault: const [PasswordEntry(value: 'pw-bad')],
+        prompt: (ask) async {
+          asked.add(ask);
+          return const PasswordResolution.skip();
+        },
+      );
+      final toasts = <String>[];
+      state.addListener(() {
+        final m = state.toastMsg;
+        if (m != null && (toasts.isEmpty || toasts.last != m)) toasts.add(m);
+      });
+
+      // 默认是 true（弹窗），这里显式关掉。
+      state.toggleSetting('pwdPrompt');
+
+      await state.selectFolderPath(onePack('as_pw_off').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(asked, isEmpty, reason: '关掉了就别再打扰用户');
+      expect(engine.passwordsSeen, ['', 'pw-bad'], reason: '开关管的是问不问，不是试不试');
+      expect(state.logs.first.status, LogStatus.skipped);
+      expect(state.logs.first.tags, ['密码未匹配']);
+      expect(toasts.join('\n'), contains('需要密码，已跳过'));
+      expect(state.completeDetail, isNot(contains('失败')));
+    });
+
+    t('说不清的包静默跳过 → 标签与 toast 都不再断言「就是密码的事」', () async {
+      // 与上一条并排，唯一差别是引擎多带了 `uncertain`。这条路上用户看不到
+      // 弹窗，日志与 toast 是他**唯一**能看到的说法，所以说诚实这件事在这
+      // 一档比在弹窗那一档更要紧。
+      final engine = locked('pw-ok', uncertain: true);
+      final state = withVault(
+        engine,
+        vault: const [PasswordEntry(value: 'pw-bad')],
+      );
+      final toasts = <String>[];
+      state.addListener(() {
+        final m = state.toastMsg;
+        if (m != null && (toasts.isEmpty || toasts.last != m)) toasts.add(m);
+      });
+
+      state.toggleSetting('pwdPrompt');
+
+      await state.selectFolderPath(onePack('as_pw_off_unc').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(state.logs.first.tags, ['密码或损坏']);
+      expect(toasts.join('\n'), contains('可能密码错误或文件损坏，已跳过'));
+      expect(toasts.join('\n'), isNot(contains('需要密码，已跳过')),
+          reason: '「需要密码」是在替用户把「就是密码的事」拍板');
+    });
+
+    t('没接弹窗（回调为 null）→ 与关掉开关一致，不崩', () async {
+      final engine = locked('pw-ok');
+      final state = withVault(engine); // 不注入 prompt
+
+      await state.selectFolderPath(onePack('as_pw_nobridge').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(state.extracting, isFalse);
+      expect(state.logs.first.status, LogStatus.failed,
+          reason: '开关开着却说不出话 —— 那是失败，不是「用户选的跳过」');
+      expect(state.logs.first.tags, ['密码未匹配']);
+    });
+
+    t('弹窗没弹成（拿不到 context）→ 记失败并出声，别让包凭空消失', () async {
+      // 桥接层拿不到 `BuildContext` 时返回 null，那不是用户的选择。与上面
+      // 「压根没接桥」是同一种处境，所以收场也一样：失败 + toast。
+      final engine = locked('pw-ok');
+      final state = withVault(
+        engine,
+        prompt: (ask) async => null,
+      );
+
+      await state.selectFolderPath(onePack('as_pw_noshow').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(state.logs.first.status, LogStatus.failed);
+      expect(state.logs.first.tags, ['密码未匹配']);
+    });
+
+    t('密码库是空的 → 照样弹窗，并且告诉弹窗「没得试」', () async {
+      final engine = locked('typed');
+      final asked = <PasswordAsk>[];
+      final state = withVault(
+        engine,
+        vault: const [],
+        prompt: (ask) async {
+          asked.add(ask);
+          return const PasswordResolution.skip();
+        },
+      );
+
+      await state.selectFolderPath(onePack('as_pw_empty').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(asked.single.triedCount, 0,
+          reason: '空库和「试了 3 个」是两回事，弹窗的文案要分得开');
+      expect(engine.passwordsSeen, [''], reason: '空库没有候选，只剩那次空密码');
+    });
+
+    t('说不清的包 → 路由一个字不改，只是把这一位交给弹窗', () async {
+      // **这条是本轮的核心不变量**：`uncertain` 是「说法」不是「策略」。
+      // 流水账必须与能确定的那一档逐字一致（照样空密码一次、照样按库里的
+      // 顺序试、照样试完才弹窗），否则就是把一个措辞问题做成了行为回归 ——
+      // 这条路上漏一处，表现就是「加密包不再试密码库」。
+      final engine = locked('typed', uncertain: true);
+      final asked = <PasswordAsk>[];
+      final state = withVault(
+        engine,
+        vault: const [PasswordEntry(value: 'pw-bad')],
+        prompt: (ask) async {
+          asked.add(ask);
+          return const PasswordResolution.skip();
+        },
+      );
+
+      await state.selectFolderPath(onePack('as_pw_unc_route').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(engine.passwordsSeen, ['', 'pw-bad'],
+          reason: '与能确定的密码错走的是同一条路');
+      expect(asked, hasLength(1), reason: '照样弹窗要密码');
+      expect(asked.single.uncertain, isTrue);
+      expect(asked.single.triedCount, 1);
+    });
+
+    t('能确定的密码错（ZIP-AES / RAR5）→ 交给弹窗的那一位是 false', () async {
+      // 少了这条，把 `uncertain` 一路写死成 true 也照样全绿 —— 而那样每张
+      // 密码弹窗都会挂上「分不出来」，包括那些 7-Zip 亲口说了「密码不对」的包。
+      final engine = locked('typed');
+      final asked = <PasswordAsk>[];
+      final state = withVault(
+        engine,
+        vault: const [PasswordEntry(value: 'pw-bad')],
+        prompt: (ask) async {
+          asked.add(ask);
+          return const PasswordResolution.skip();
+        },
+      );
+
+      await state.selectFolderPath(onePack('as_pw_cert_route').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(asked.single.uncertain, isFalse);
+    });
+
+    t('坏包不该被当成密码问题 → 一个候选都不试', () async {
+      // 换十个密码也修不好一个 CRC 坏掉的包。密码库长起来之后，「每个坏包都
+      // 白试几十遍」会变成肉眼可见的卡顿。
+      final engine = FakeEngine()
+        ..behavior = (e, outDir) async {
+          throw const EngineException('CRC 校验失败', code: DuzErrorCode.extract);
+        };
+      final state = withVault(
+        engine,
+        vault: const [
+          PasswordEntry(value: 'pw1'),
+          PasswordEntry(value: 'pw2'),
+        ],
+      );
+
+      await state.selectFolderPath(onePack('as_pw_broken').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(engine.passwordsSeen, [''], reason: '非密码类失败该立刻收手');
+      expect(state.logs.first.tags, ['解压失败'],
+          reason: '不能因为带了个密码就记成「密码未匹配」');
+      expect(state.logs.first.status, LogStatus.failed);
+    });
+
+    t('试密码途中包坏了 → 说它坏了，别接着说「密码没对上」', () async {
+      final engine = FakeEngine()
+        ..behavior = (e, outDir) async {
+          if (e.passwordsSeen.last == '') {
+            throw const EngineException(
+              'Wrong password',
+              code: DuzErrorCode.password,
+            );
+          }
+          throw const EngineException('CRC 校验失败', code: DuzErrorCode.extract);
+        };
+      final state = withVault(
+        engine,
+        vault: const [
+          PasswordEntry(value: 'pw1'),
+          PasswordEntry(value: 'pw2'),
+        ],
+      );
+
+      await state.selectFolderPath(onePack('as_pw_mid_break').path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(engine.passwordsSeen, ['', 'pw1'],
+          reason: '第一个候选把包试坏了，后面那个不必再试');
+      expect(state.logs.first.tags, ['解压失败']);
+    });
+  });
+
+  group('保活（前台服务）', () {
+    // 这一组盯的是**时序**：起了没有、停了几次、通知多久推一条。
+    //
+    // 真机上的效果（锁屏、切后台之后进程还在）只能靠真机验收；这里能钉住的是
+    // 「我们确实在最该说的那一刻对系统说了」。解压本身走假引擎，而假保活
+    // 见 `test/support/fake_keep_alive.dart`。
+
+    t('一批跑完：起一次、停一次，而且停在收尾的最后一步', () async {
+      final root = tempRoot('as_ka_clean');
+      put(root, 'a.zip', realZip({'x': 'y'}));
+
+      final keep = FakeKeepAlive();
+      final state = AppState(engine: FakeEngine(), keepAlive: keep);
+      addTearDown(state.dispose);
+
+      await state.selectFolderPath(root.path);
+      state.startExtract();
+
+      // 起服务排在 `_ensureEngine` 前面，所以「已经进入解压态」时它必须**已经**
+      // 在跑 —— 晚一步的那个窗口里正好锁屏，这一批就是裸奔的。
+      expect(keep.events, ['start'], reason: '批次一开就起服务，不等引擎');
+      expect(keep.running, isTrue);
+
+      await drainExtract(state);
+
+      expect(keep.events.first, 'start');
+      expect(keep.events.last, 'stop');
+      expect(keep.stopCount, 1, reason: '起了一次就得停一次，不多不少');
+      expect(keep.running, isFalse,
+          reason: '批次结束了还挂着一条用户划不掉的常驻通知，是最糟的收场');
+
+      expect(keep.titles.single, '正在解压');
+      // 形状 `42% · 3/12 · 备份.zip`。只有一个包时中间那段是没用的「1/1」，
+      // 摆着反而让人以为还有别的，所以它得**不在**。
+      expect(keep.startedWith.single, '0% · a.zip');
+    });
+
+    t('通知节流：两秒内的连跳不推，过了两秒才推一条', () async {
+      final root = tempRoot('as_ka_throttle');
+      put(root, 'a.zip', realZip({'x': 'y'}));
+      put(root, 'b.zip', realZip({'x': 'y'}));
+
+      final keep = FakeKeepAlive();
+      final engine = FakeEngine()
+        ..behavior = (e, outDir) async {
+          if (e.rounds != 1) return;
+          void tick(int done) => e.onExtractTick?.call(ExtractTick(
+                doneBytes: done,
+                totalBytes: 1000,
+                current: 'inner.txt',
+              ));
+
+          // 起服务那一刻刚记过时间戳，所以头几跳都该被压在它下面。
+          tick(100);
+          tick(200);
+
+          // 真实地等过那条线。**这是整个文件里唯一一个真等秒的用例** ——
+          // 换假时钟救不了：节流比的是 `DateTime.now()` 的差值，不是定时器。
+          await Future<void>.delayed(const Duration(milliseconds: 2100));
+          tick(900); // 过了线 → 该推第 1 条
+          tick(950); // 紧跟着的一跳 → 该被**刚推过的那一次**压住
+
+          await Future<void>.delayed(const Duration(milliseconds: 2100));
+          tick(1000); // 又过线了 → 该推第 2 条
+        };
+      final state = AppState(engine: engine, keepAlive: keep);
+      addTearDown(state.dispose);
+
+      await state.selectFolderPath(root.path);
+      state.startExtract();
+
+      // **不能用 `drainExtract`**：它是「推 500 轮零延迟」的推法，那 500 轮
+      // 在这四秒里早跑完了，会在批次真正收尾之前就 fail 掉。
+      for (var i = 0; i < 100 && state.extracting; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+      }
+      expect(state.extracting, isFalse, reason: '前提：这一批得跑完');
+
+      // 两条，而且**正好是那两跳过线的**：
+      //
+      // - 头两跳被「起服务时那个时间戳」压住；
+      // - 第 2 条推出去之后，`tick(950)` 又被顶过的新时间戳压住 —— 这一半
+      //   专门盯着「推完要记得把时间戳顶上去」；漏了那一句的话，从第一次
+      //   推开始，8Hz 的每一跳都会去敲一次方法通道。
+      // 两个数都钉住整批比例：90% ÷ 2 个包 = 45%，100% ÷ 2 = 50%，不是当前包
+      // 自己的 90% —— 用户要的是「这一批还剩多少」。
+      expect(keep.updatedWith, ['45% · 1/2 · a.zip', '50% · 1/2 · a.zip']);
+    });
+
+    t('用户按「停止解压」→ 服务照样停', () async {
+      final root = tempRoot('as_ka_stop');
+      put(root, 'a.zip', realZip({'x': 'y'}));
+      put(root, 'b.zip', realZip({'x': 'y'}));
+
+      final gate = Completer<void>();
+      final keep = FakeKeepAlive();
+      final engine = FakeEngine()
+        ..behavior = (e, outDir) async {
+          if (e.rounds == 1) await gate.future;
+        };
+      final state = AppState(engine: engine, keepAlive: keep);
+      addTearDown(state.dispose);
+
+      await state.selectFolderPath(root.path);
+      state.startExtract();
+      await settle();
+      state.stopExtract();
+      gate.complete();
+      await drainExtract(state);
+
+      expect(engine.rounds, 1, reason: '前提：确实是被停下来的，不是跑完的');
+      expect(state.outcome, BatchOutcome.stopped);
+      expect(keep.stopCount, 1);
+      expect(keep.events.last, 'stop');
+      expect(keep.running, isFalse);
+    });
+
+    t('引擎抛异常 → 服务照样停', () async {
+      final root = tempRoot('as_ka_error');
+      put(root, 'a.zip', realZip({'x': 'y'}));
+
+      final keep = FakeKeepAlive();
+      final engine = FakeEngine()
+        ..behavior = (e, outDir) async {
+          throw const EngineException('坏了', code: DuzErrorCode.open);
+        };
+      final state = AppState(engine: engine, keepAlive: keep);
+      addTearDown(state.dispose);
+
+      await state.selectFolderPath(root.path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(state.logs.first.status, LogStatus.failed,
+          reason: '前提：这一批真的走了异常那条路');
+      expect(keep.stopCount, 1,
+          reason: '异常那条路最容易被漏掉，漏了就是一条永远撤不掉的常驻通知');
+      expect(keep.running, isFalse);
+    });
+
+    t('连着两批：第一批停了第二批才起，中间不串', () async {
+      final root = tempRoot('as_ka_twice');
+      put(root, 'a.zip', realZip({'x': 'y'}));
+
+      final keep = FakeKeepAlive();
+      final state = AppState(engine: FakeEngine(), keepAlive: keep);
+      addTearDown(state.dispose);
+
+      await state.selectFolderPath(root.path);
+      state.startExtract();
+      await drainExtract(state);
+
+      // 再选一次目录 = 重新扫描、开新一批（主按钮那颗「更换目标」）。
+      await state.selectFolderPath(root.path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(keep.events.where((e) => e == 'start'), hasLength(2));
+      expect(keep.stopCount, 2);
+      expect(keep.events.first, 'start');
+      expect(keep.events.last, 'stop');
+      expect(keep.running, isFalse);
+    });
+
+    t('切到后台：通知那一路照推，界面那一路不动', () async {
+      final root = tempRoot('as_ka_bg');
+      put(root, 'a.zip', realZip({'x': 'y'}));
+
+      final gate = Completer<void>();
+      final keep = FakeKeepAlive();
+      final engine = FakeEngine()..behavior = (e, outDir) => gate.future;
+      final state = AppState(engine: engine, keepAlive: keep);
+      addTearDown(state.dispose);
+      var rebuilds = 0;
+      state.addListener(() => rebuilds++);
+
+      await state.selectFolderPath(root.path);
+      state.startExtract();
+      await settle();
+
+      // 起服务那一刻刚记过通知的时间戳，得先等过那条两秒的线，
+      // 否则这一跳会被压在它下面、什么也验不出来。
+      await Future<void>.delayed(const Duration(milliseconds: 2100));
+
+      final before = rebuilds;
+
+      // 后台那一份进度：控制器在后台走的就是这个回调（见 `tick_throttle.dart`）。
+      // 假引擎整个绕过了控制器里的节流器，所以要在这里手动递一次 ——
+      // 递完之后这一刻的状态，与真机上锁屏时的一模一样。
+      engine.onExtractTickBackground?.call(ExtractTick(
+        doneBytes: 500,
+        totalBytes: 1000,
+        current: 'inner.txt',
+      ));
+
+      expect(rebuilds, before,
+          reason: '后台送来的进度不该重建界面 —— 四棵树都不可见，重建了没人看');
+      expect(state.progress, 0.5, reason: '数字照算，只是不发那条通知事件');
+      expect(keep.updatedWith, ['50% · a.zip'],
+          reason: '通知恰恰相反：后台时它是唯一还看得见的东西，必须跟着往前走');
+
+      gate.complete();
+      await drainExtract(state);
+    });
+
+    t('通知权限：第一次开始解压时问一次，且不拖住起服务', () async {
+      final root = tempRoot('as_ka_notif');
+      put(root, 'a.zip', realZip({'x': 'y'}));
+
+      final keep = FakeKeepAlive();
+      var startedWhenAsked = -1;
+      final notif = FakeNotificationPermission()
+        ..onEnsure = () => startedWhenAsked = keep.startedWith.length;
+      final state = AppState(
+        engine: FakeEngine(),
+        keepAlive: keep,
+        notifications: notif,
+      );
+      addTearDown(state.dispose);
+
+      await state.selectFolderPath(root.path);
+      state.startExtract();
+      // `startExtract()` **返回时**服务就该起着 —— 问权限这件事排在它后面，
+      // 而且没被 await，所以它吊不住这一步。
+      expect(keep.events, ['start'], reason: '一批的开工不能吊在一次用户交互后面');
+
+      await drainExtract(state);
+
+      expect(notif.ensureCount, 1);
+      expect(startedWhenAsked, 1,
+          reason: '问权限时服务必须已经起来了 —— 反过来（把服务吊在弹窗后面）'
+              '就有一整段「活儿没开始跑、也没有保活」的窗口');
+      // 「同一个会话里只打扰用户一次」**不在这里断言**：调用方每一批都来问
+      // 一次（它本来就该来问 —— 上一批没授权的话这一批还有机会），压制重复
+      // 弹窗是 [NotificationPermission] 自己那道 `_asked` 的事，它在
+      // `test/services/notification_permission_test.dart` 里验。
+    });
+
+    t('没注入保活 → 照常跑完，不抛也不卡', () async {
+      // 默认那个 `KeepAlive` 在 Windows 上 `Platform.isAndroid` 为 false，
+      // 三个方法一律空转。这正是「加固件没条件就少一层保护、主流程照走」
+      // 那条契约在桌面上的样子 —— 它坏了**不能**把解压带下去。
+      final root = tempRoot('as_ka_none');
+      put(root, 'a.zip', realZip({'x': 'y'}));
+
+      final state = AppState(engine: FakeEngine());
+      addTearDown(state.dispose);
+
+      await state.selectFolderPath(root.path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(state.outcome, BatchOutcome.clean);
+      expect(state.progress, 1.0);
+    });
+  });
+
   group('批次用尽（batchRun）', () {
     t('跑完一批 → batchRun 为真、completed 为真', () async {
       final root = tempRoot('as_batchrun_ok');
@@ -1809,7 +3161,7 @@ void main() {
       addTearDown(state.dispose);
 
       await state.selectFolderPath(root.path);
-      expect(state.batchRun, isFalse, reason: '刚扫完还没跑，按钮该是「开始智能解压」');
+      expect(state.batchRun, isFalse, reason: '刚扫完还没跑，按钮该是「开始解压」');
 
       state.startExtract();
       await drainExtract(state);
@@ -1859,7 +3211,7 @@ void main() {
 
       expect(engine.rounds, 1, reason: '同一个队列不该被重排一遍');
       expect(state.toastType, 'warn');
-      expect(state.toastMsg, contains('换个文件夹'));
+      expect(state.toastMsg, contains('重新选择目标'));
     });
 
     t('重新选目录 → 闸门放开（新快照，可以再跑）', () async {
@@ -1901,11 +3253,10 @@ void main() {
         ..toLoad = AppSnapshot(
           settings: const SettingsData(
             toggles: {
-              'recursive': false,
-              'symmetricOutput': true,
-              'fakeExtDetect': true,
-              'splitMerge': true,
-              'pwdAutoTry': true,
+              // 跟出厂默认（关）不同，这样才证明值是真的从档里读回来的。
+              'customOutput': true,
+              'fakeExtDetect': false,
+              'pwdPrompt': true,
               'errorPause': false,
             },
             maxDepth: 10,
@@ -1934,9 +3285,10 @@ void main() {
       );
       addTearDown(state.dispose);
 
-      expect(state.setting('recursive'), isFalse);
+      expect(state.setting('fakeExtDetect'), isFalse);
       expect(state.setting('errorPause'), isFalse);
-      expect(state.setting('splitMerge'), isTrue);
+      expect(state.setting('customOutput'), isTrue,
+          reason: '出厂是关的 —— 这里为真才说明是读回来的而不是碰巧');
       expect(state.maxDepth, 10);
       expect(state.limitPreset, 3);
       expect(state.limits.maxEntries, 4242);
@@ -1946,14 +3298,13 @@ void main() {
       expect(state.logs.single.status, LogStatus.failed);
     });
 
-    t('档位不越界、深度收敛、日志封顶夹回 —— 读回来的坏值不能让设置页崩', () {
-      // `maxDepth`/`limitPreset` 是设置页的芯片直接拿去 `indexOf` 的：越界就是
-      // 数组下标 -1，打开设置页即崩。收敛在 `SettingsRepo` 里也做了一遍，
-      // 这里是第二道。
+    t('档位不越界、深度夹回区间、日志封顶夹回 —— 读回来的坏值不能让设置页崩', () {
+      // `limitPreset` 是设置页的芯片直接拿去 `indexOf` 的：越界就是数组下标
+      // -1，打开设置页即崩。收敛在 `SettingsRepo` 里也做了一遍，这里是第二道。
       //
-      // `maxLogs` 走的是**另一条**路：它不是芯片，是自由输入框，所以只夹回
+      // `maxDepth`/`maxLogs` 走的是**另一条**路：都是自由输入框，所以只夹回
       // 区间、**不吸附到档位**。7 是合法值，就该是 7 —— 把它挪到某个「最近的
-      // 档」正是用户上一轮明确否掉的做法。
+      // 档」正是用户明确否掉的做法。
       final store = FakeStore()
         ..toLoad = const AppSnapshot(
           settings: SettingsData(maxDepth: 999, limitPreset: 88, maxLogs: 7),
@@ -1966,7 +3317,7 @@ void main() {
       );
       addTearDown(state.dispose);
 
-      expect(state.maxDepth, 20, reason: '收敛到最近的合法档');
+      expect(state.maxDepth, kMaxMaxDepth, reason: '999 夹回上界（就是那道硬顶）');
       expect(state.limitPreset, kLimitPresets.length, reason: '夹到「自定义」档');
       expect(state.limitsCustom, isTrue);
       expect(state.maxLogs, 7, reason: '自由输入不吸附 —— 合法值原样留着');
@@ -2003,15 +3354,16 @@ void main() {
       );
       addTearDown(state.dispose);
 
-      expect(state.setting('recursive'), isTrue);
       expect(state.setting('errorPause'), isTrue);
+      expect(state.setting('pwdAutoSave'), isTrue, reason: '两颗出厂都是开的');
+      expect(state.setting('customOutput'), isFalse, reason: '新那颗出厂就是关的');
     });
 
     t('没注入 store → 一切照出厂默认，不崩', () {
       final state = AppState(engine: FakeEngine());
       addTearDown(state.dispose);
 
-      expect(state.setting('recursive'), isTrue);
+      expect(state.setting('customOutput'), isFalse, reason: '出厂默认是关');
       expect(state.maxDepth, kDefaultMaxDepth);
       expect(state.passwords, isEmpty);
       expect(state.logs, isEmpty);
@@ -2020,7 +3372,7 @@ void main() {
     t('恢复一份「什么都有」的档，也不会把「解压过」带过来', () {
       // **这是那条产品约束的机器判据。** 磁盘上要是记了「哪些目录解过了」，
       // 它就会在这里体现成 `folderSelected` 为真、`batchRun` 为真 —— 用户
-      // 一开 app 就看见「换个文件夹」，想重解一个目录却被挡在外面。
+      // 一开 app 就看见「更换目标」，想重解一个目录却被挡在外面。
       //
       // 恢复的只有设置、密码、日志；源目录**不在** `AppSnapshot` 里
       // （见 persist.dart 的库注释）。所以起点必须仍是「没选过文件夹」。
@@ -2051,16 +3403,16 @@ void main() {
     tearDown(() => state.dispose());
 
     t('切开关 → 当场交出一份带新值的设置', () {
-      state.toggleSetting('recursive');
+      state.toggleSetting('errorPause');
 
       expect(store.lastSettings, isNotNull);
-      expect(store.lastSettings!.toggles['recursive'], isFalse);
-      expect(store.lastSettings!.toggles['errorPause'], isTrue,
+      expect(store.lastSettings!.toggles['errorPause'], isFalse);
+      expect(store.lastSettings!.toggles['customOutput'], isFalse,
           reason: '别的开关要带上');
     });
 
     t('深度 / 档位 / 单项阈值都会落盘', () {
-      state.cycleMaxDepth();
+      state.setMaxDepth(5);
       expect(store.lastSettings!.maxDepth, 5);
 
       state.setLimitPreset(2);

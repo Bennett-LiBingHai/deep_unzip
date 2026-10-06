@@ -10,8 +10,8 @@
 ///
 /// | 键 | 类型 | 内容 |
 /// |---|---|---|
-/// | `toggle.<名>` | bool | 六个开关，逐个独立存 |
-/// | `maxDepth` | int | 递归深度，`{0,5,10,20}` |
+/// | `toggle.<名>` | bool | 每颗开关一个键，逐个独立存（表在 `persist.dart`） |
+/// | `maxDepth` | int | 递归深度，自由输入 `0`–64（`0` = 不递归）；每进一层子目录或解一层嵌套包各算一层 |
 /// | `maxLogs` | int | 日志保留条数，`{100,300,500,1000}` |
 /// | `limitPreset` | int | 炸弹档位下标，或「自定义」 |
 /// | `limit.<字段>` | int | 自定义时那四个阈值 |
@@ -42,8 +42,13 @@ class SettingsRepo {
     // 不读，免得它们又活过来。
     final toggles = <String, bool>{};
     for (final entry in kDefaultToggles.entries) {
-      toggles[entry.key] =
-          prefs.getBool('$_togglePrefix${entry.key}') ?? entry.value;
+      // 先看新键，没有再看它改名前叫什么（见 [kRenamedToggles]）。顺序不能
+      // 反：反过来的话，旧键会盖掉用户在新版本里刚改过的值。
+      bool? stored = prefs.getBool('$_togglePrefix${entry.key}');
+      for (final old in kRenamedToggles[entry.key] ?? const <String>[]) {
+        stored ??= prefs.getBool('$_togglePrefix$old');
+      }
+      toggles[entry.key] = stored ?? entry.value;
     }
 
     final maxDepth = coerceMaxDepth(prefs.getInt(_keyMaxDepth));

@@ -1,4 +1,5 @@
 import 'package:deep_unzip/app_navigator.dart';
+import 'package:deep_unzip/services/password_prompt.dart';
 import 'package:deep_unzip/services/prompts.dart';
 import 'package:deep_unzip/services/dialog_bridge.dart';
 import 'package:flutter/material.dart';
@@ -13,7 +14,7 @@ import 'package:flutter_test/flutter_test.dart';
 void main() {
   // 闸门拦下时那句话由 `LimitBreach.message` 给，解压出错时由引擎给 ——
   // 桥接两边都只当字符串转发，所以这里各挑一句代表，验的是「原样摆出来」。
-  const breachReason = '解压后需要 12.0 GB，设备只剩 3.2 GB，装不下，已放弃';
+  const breachReason = '解压后需要 12.0 GB，设备仅剩 3.2 GB，装不下，已放弃';
   const errorReason = '解压失败：CRC 校验失败（文件已损坏）';
 
   /// 挂一个带 [AppNavigator.key] 的壳 —— 桥接就是靠它拿 context 的。
@@ -194,5 +195,123 @@ void main() {
     // 这条是这组里最要紧的一个：null 兜成 false 的话，弹窗因为拿不到 context
     // 而没能出现时，用户的压缩包会**凭空从批次里消失**，且没有任何解释。
     expect(decision, isNull);
+  });
+
+  // -------------------------------------------------------------------------
+  // 密码（需求 2）
+  // -------------------------------------------------------------------------
+
+  /// 「密码库试过两个都没通过」，`verify` 只认 `right`。
+  ///
+  /// 这里不接真引擎（那是 `password_modal_test.dart` 的活儿）—— 这组只验桥接
+  /// 把用户的动作**翻译成哪个决断**，所以 `verify` 是个能一眼看穿的函数。
+  PasswordAsk askWithTriedCount(int triedCount, {bool uncertain = false}) =>
+      PasswordAsk(
+        fileName: 'locked.zip',
+        triedCount: triedCount,
+        uncertain: uncertain,
+        verify: (candidate) async => candidate == 'right',
+      );
+
+  Future<Future<PasswordResolution?>> askPwdAndSettle(WidgetTester tester) async {
+    final resolution = const DialogBridge().askPassword(askWithTriedCount(2));
+    await tester.pumpAndSettle();
+    return resolution;
+  }
+
+  testWidgets('密码弹窗：跳过 / 停止 / 手输，三条出路各自回到对应的决断',
+      (tester) async {
+    await mount(tester);
+
+    var future = await askPwdAndSettle(tester);
+    expect(find.text('locked.zip'), findsOneWidget,
+        reason: '锁的是哪个包要写在弹窗上');
+    await tester.tap(find.text('跳过'));
+    await tester.pumpAndSettle();
+    expect((await future)?.verdict, PasswordVerdict.skip,
+        reason: '跳过 = 放掉这个包接着跑，不是没答上来');
+
+    future = await askPwdAndSettle(tester);
+    await tester.tap(find.text('停止解压'));
+    await tester.pumpAndSettle();
+    expect((await future)?.verdict, PasswordVerdict.stop,
+        reason: '停止是**另一件事**，绝不能与跳过混成一个值 —— '
+            '混了的话批次那头没法知道该不该清空队列');
+
+    future = await askPwdAndSettle(tester);
+    await tester.tap(find.text('手动输入密码'));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byType(TextField), 'right');
+    await tester.tap(find.text('确认'));
+    await tester.pumpAndSettle();
+    final manual = await future;
+    expect(manual?.verdict, PasswordVerdict.manual);
+    expect(manual?.password, 'right',
+        reason: '用户敲的那个字符串要原样带出去，调用方还得拿它去解压');
+    expect(find.byType(TextField), findsNothing, reason: '验过了就把弹窗关掉');
+  });
+
+  testWidgets('密码弹窗：手输的密码**没验过**就不该带出来', (tester) async {
+    await mount(tester);
+    final future = await askPwdAndSettle(tester);
+
+    await tester.tap(find.text('手动输入密码'));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byType(TextField), 'wrong');
+    await tester.tap(find.text('确认'));
+    await tester.pumpAndSettle();
+
+    // 还开着，future 也还没完成 —— 此刻完成它等于告诉调用方「这个密码能用」。
+    expect(find.byType(TextField), findsOneWidget);
+    await tester.tap(find.text('返回'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('跳过'));
+    await tester.pumpAndSettle();
+    expect((await future)?.verdict, PasswordVerdict.skip);
+  });
+
+  testWidgets('密码弹窗：「分不清密码错还是文件坏」这一位原样送到弹窗上', (tester) async {
+    // 桥接把 `PasswordAsk` **整个**交给弹窗，所以这一位要么原样到场、要么
+    // 就在这儿丢了。丢了的现场表现是弹窗照旧断言「密码库未能解开该压缩包」
+    // —— 一个我们说错了、用户也看不出来的说法。
+    await mount(tester);
+    final resolution =
+        const DialogBridge().askPassword(askWithTriedCount(2, uncertain: true));
+    await tester.pumpAndSettle();
+
+    expect(
+      find.text('密码库未能解开该压缩包，也可能是文件已损坏，两者无法区分'),
+      findsOneWidget,
+    );
+
+    await tester.tap(find.text('跳过'));
+    await tester.pumpAndSettle();
+    expect((await resolution)?.verdict, PasswordVerdict.skip);
+  });
+
+  testWidgets('密码弹窗：滑走 → 兜底成 skip', (tester) async {
+    await mount(tester);
+    final future = await askPwdAndSettle(tester);
+
+    await tester.tapAt(const Offset(10, 10));
+    await tester.pumpAndSettle();
+
+    expect(find.text('停止解压'), findsNothing, reason: '前提：弹窗真的被关掉了');
+    // 兜底成 stop 的话，误滑一下会把**剩下的队列全丢掉**；兜成 skip 的代价
+    // 只是一个包。这个弹窗前面那两条路（选择 / 手输）都是它自己在管，滑走时
+    // 三条回调一条都不触发，所以必须在这里补。
+    expect((await future)?.verdict, PasswordVerdict.skip);
+  });
+
+  testWidgets('密码弹窗：拿不到 context → null（不是 skip）', (tester) async {
+    // 与格式弹窗那条同理：`skip` 是「用户放掉了这个包」，`null` 是「我们没问
+    // 成」。调用方对这两件事的处置不同 —— 后者要记成失败并出声（见
+    // `app_state.dart` 里的 `case null`），吞成 skip 就成了「包凭空消失」。
+    await mount(tester, withKey: false);
+
+    final resolution = await (await askPwdAndSettle(tester));
+
+    expect(resolution, isNull);
+    expect(find.text('停止解压'), findsNothing);
   });
 }

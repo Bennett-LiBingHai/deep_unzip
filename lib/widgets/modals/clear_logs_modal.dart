@@ -12,20 +12,14 @@ import 'modal_button.dart';
 /// 的删除值得一次确认。
 ///
 /// 确认按钮用红色实心、取消用灰色描边：把「哪一颗会造成后果」摆在颜色上，
-/// 不指望用户去读两行字。红渐变就地定义而不进 `AppTheme` —— 目前只有这一处
-/// 用，等第二处出现再往上提。
+/// 不指望用户去读两行字。那份红渐变原先就地定义在这里，理由是没有第二处用
+/// —— 删密码弹窗出现后它进了 `AppTheme.dangerGradient`。
 class ClearLogsModal extends StatelessWidget {
   /// 会被删掉的条数。摆出来是因为「清空」两个字没说是清多少 —— 用户可能在
   /// 筛选过的视图里点的，得让他知道删的是**全部**而不只是眼前这几条。
   final int count;
 
   const ClearLogsModal({super.key, required this.count});
-
-  static const _dangerGradient = LinearGradient(
-    begin: Alignment.topLeft,
-    end: Alignment.bottomRight,
-    colors: [Color(0xFFF43F5E), Color(0xFFFF7A8A)],
-  );
 
   /// 返回用户是否确认。**滑掉弹窗返回 false**（`showBottomModal` 可被手势
   /// 关掉且不给结果，`showModalBottomSheet` 这时给的是 null）—— 默认取「取消」
@@ -65,7 +59,7 @@ class ClearLogsModal extends StatelessWidget {
           ),
           const SizedBox(height: 6),
           const Text(
-            '这是一份只在本机留存的操作历史，清空后无法恢复',
+            '日志仅保存在本机，清空后无法恢复',
             style: TextStyle(
               fontSize: 12,
               color: AppTheme.textDim,
@@ -119,7 +113,7 @@ class ClearLogsModal extends StatelessWidget {
               Expanded(
                 child: ModalButton(
                   label: '清空',
-                  gradient: _dangerGradient,
+                  gradient: AppTheme.dangerGradient,
                   onTap: () => Navigator.pop(context, true),
                 ),
               ),

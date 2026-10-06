@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 12（API 31）起的**系统启动画面**。
+
+     12 起冷启动的那一屏由系统接管：一张居中的图标 + 一个背景色，而
+     `android:windowBackground` 那套在这里不再说了算。不显式指定的话，系统会
+     拿主题里的 `?attr/colorBackground` 当底 —— 在我们的 `Theme.Black` 下是纯黑
+     **加**桌面图标居中，于是 D 日是「纯黑底上摆个图标」再跳进深蓝黑界面，中间
+     仍然是一次可见的变色。
+
+     **样式在带限定符的目录里是整体替换、不合并**，所以下面必须把
+     `windowBackground` 再写一遍。
+
+     **刻意不设 `windowSplashScreenAnimatedIcon`**：那一项的缺省值就是
+     `@mipmap/ic_launcher`。不写它，等设计把图标换掉之后启动画面自动跟着变 ——
+     写死一个占位图只会多一处「忘了改」的地方。
+
+     **也不需要 `postSplashScreenTheme`**（那是 AndroidX SplashScreen 兼容库的
+     属性，平台侧根本没有这个 attr —— 写了会在 aapt2 链接期直接报
+     `style attribute 'android:attr/postSplashScreenTheme' not found`，本机踩过）。
+     换成 NormalTheme 这件事 Flutter 的 Android embedding 自己做了：它在
+     `onCreate` 一开头就读 manifest 里那条
+     `io.flutter.embedding.android.NormalTheme` meta-data 并 `setTheme()`。
+     两个主题的底色是同一个值，所以这一换在屏幕上看不出来。 -->
+<resources>
+    <style name="LaunchTheme" parent="@android:style/Theme.Black.NoTitleBar">
+        <item name="android:windowBackground">@drawable/launch_background</item>
+
+        <!-- 与 `@color/duz_background` 是同一个值，也就是 AppTheme.bgDeep。 -->
+        <item name="android:windowSplashScreenBackground">@color/duz_background</item>
+    </style>
+</resources>

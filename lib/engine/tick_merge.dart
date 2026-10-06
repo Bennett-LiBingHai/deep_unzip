@@ -5,8 +5,12 @@
 /// | 层 | 在哪 | 省的是什么 |
 /// |---|---|---|
 /// | 1. 丢样 | worker，[TickMerger] | **跨 isolate 消息**：每次 `send` 都要序列化、排队、唤醒对端 |
-/// | 2. 节流 | 主 isolate，`EngineController` 的尾沿定时器（8Hz） | **重建四棵 Widget 树**：四个页面都在 `IndexedStack` 里，各自包了一层 `ListenableBuilder` |
-/// | 3. 标脏 | 主 isolate，`setForeground(false)` | **后台时的全部开销**：Activity 不可见，重建了也没人看 |
+/// | 2. 节流 | 主 isolate，`TickThrottle` 的尾沿定时器（8Hz） | **重建四棵 Widget 树**：四个页面都在 `IndexedStack` 里，各自包了一层 `ListenableBuilder` |
+/// | 3. 标脏 | 主 isolate，`setForeground(false)` | **后台时不重建界面**：Activity 不可见，重建了也没人看 |
+///
+/// 第 3 层有一个**例外**：解压进度还有一份喂前台服务通知的（`TickThrottle` 的
+/// `background` 那一路）。它不重建任何东西，而且在后台比在前台更重要 —— 那时
+/// 通知是用户唯一还看得见的东西。
 ///
 /// 为什么 1 和 2 不能合并成一层：它们的**理由不同**，所以合理的参数也不同 ——
 /// 第 1 层的成本随「7-Zip 报得有多密」变，第 2 层的成本随「界面上挂了多重的

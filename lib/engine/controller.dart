@@ -22,6 +22,7 @@ import 'limits.dart';
 import 'models.dart';
 import 'protocol.dart';
 import 'scanner.dart';
+import 'tick_throttle.dart';
 import 'worker.dart';
 
 /// 进度节流间隔（8Hz）。
@@ -34,69 +35,42 @@ const Duration kProgressThrottle = Duration(milliseconds: 125);
 /// 一次扫描的最终结果。
 typedef ScanOutcome = ({ScanSummary summary, Duration elapsed});
 
-/// 尾沿节流器：窗口内多次 [add] 只会在窗口末尾发出**最后一条**。
-///
-/// 尾沿而不是首沿是刻意的。首沿会让第一条立刻显示、之后每 125ms 才更新，
-/// 而尾沿保证最后一条进度一定会发出去 —— 否则进度条会停在半路（后面没有
-/// 更多 tick 来把它顶到 100%）。
-///
-/// 抽成泛型类是因为扫描与解压都要它。两处各写一遍 20 行状态机，
-/// 迟早会在其中一处修 bug 而忘了另一处。
-class _TickThrottle<T extends Object> {
-  _TickThrottle({
-    required this.delay,
-    required this.emit,
-    required this.isForeground,
-  });
-
-  final Duration delay;
-  final void Function(T tick) emit;
-
-  /// 后台时不发，只标脏（见 [EngineController.setForeground] 的说明）。
-  final bool Function() isForeground;
-
-  T? _pending;
-  Timer? _timer;
-
-  void add(T tick) {
-    _pending = tick;
-    if (!isForeground()) return;
-
-    if (delay <= Duration.zero) {
-      flush();
-      return;
-    }
-    _timer ??= Timer(delay, flush);
-  }
-
-  void flush() {
-    _timer?.cancel();
-    _timer = null;
-    final tick = _pending;
-    _pending = null;
-    if (tick != null) emit(tick);
-  }
-
-  /// 丢掉攒着的 tick。任务的结束事件到来时**必须**调：否则定时器稍后触发，
-  /// 会把界面刷回上一个任务的旧进度。
-  void drop() {
-    _timer?.cancel();
-    _timer = null;
-    _pending = null;
-  }
-}
+/// worker isolate 的入口：拿一个 `SendPort` 就开始跑命令循环。
+typedef WorkerEntry = void Function(SendPort toMain);
 
 class EngineController {
-  EngineController({this.throttle = kProgressThrottle});
+  EngineController({
+    this.throttle = kProgressThrottle,
+    this.entryPoint = workerMain,
+  });
 
   /// 进度节流间隔。传 [Duration.zero] 关闭节流（单测用，让事件同步到达）。
   final Duration throttle;
+
+  /// 起哪个入口当 worker。**留出这个口子是为了测协议边界**。
+  ///
+  /// 生产永远用 [workerMain]，只有单测会换成假 worker。要它是因为：消息在
+  /// **同一个 isolate 里构造、断言、扔掉**是测不到搬运的 —— 某个字段忘了跨
+  /// 边界传，编译期合法、单测全绿，只有真机上表现成「弹窗上的说法不对」。
+  /// 这个坑真踩过（见 `EvFailed.uncertain`）。有了假 worker，就能拿一条假的
+  /// [EvFailed] 走一遍**真的** `Isolate.spawn`，把每个字段钉住。
+  final WorkerEntry entryPoint;
 
   /// 节流后的扫描进度回调。**在节流窗口内多次 tick 只会调一次，且参数是最新的那条。**
   void Function(ScanTick tick)? onScanTick;
 
   /// 节流后的解压进度回调，语义同 [onScanTick]。
   void Function(ExtractTick tick)? onExtractTick;
+
+  /// **后台**时那一份解压进度。前台时**不会**被调用（那时走 [onExtractTick]）。
+  ///
+  /// 它是给「不重建任何东西的消费者」准备的，目前只有一个：前台服务那条常驻
+  /// 通知（见 `AppState._onExtractTickBackground`）。界面那一路在后台被整条掐掉
+  /// 是对的 —— 四棵树没人看；但通知恰恰相反，后台时它是唯一还被人看的东西。
+  ///
+  /// 频率不低（worker 侧的合并间隔，约 8Hz），所以消费者自己要再节一层 ——
+  /// 推一条通知要过一次系统通知服务，比重建一棵树还贵。
+  void Function(ExtractTick tick)? onExtractTickBackground;
 
   ReceivePort? _inbox;
   ReceivePort? _errors;
@@ -112,15 +86,18 @@ class EngineController {
   final Map<int, Completer<ExtractOutcome>> _extractWaiters = {};
 
   bool _foreground = true;
-  late final _scanThrottle = _TickThrottle<ScanTick>(
+  // 扫描**没有**后台那一档：它既没有常驻通知，也没有别的后台消费者，
+  // 后台发出去的每一份都是白发的。
+  late final _scanThrottle = TickThrottle<ScanTick>(
     delay: throttle,
     emit: (t) => onScanTick?.call(t),
     isForeground: () => _foreground,
   );
-  late final _extractThrottle = _TickThrottle<ExtractTick>(
+  late final _extractThrottle = TickThrottle<ExtractTick>(
     delay: throttle,
     emit: (t) => onExtractTick?.call(t),
     isForeground: () => _foreground,
+    background: (t) => onExtractTickBackground?.call(t),
   );
 
   bool get isRunning => _isolate != null && !_disposed;
@@ -162,7 +139,7 @@ class EngineController {
     });
 
     _isolate = await Isolate.spawn(
-      workerMain,
+      entryPoint,
       inbox.sendPort,
       debugName: 'duz_worker',
       onError: errors.sendPort,
@@ -263,6 +240,39 @@ class EngineController {
     return c.future;
   }
 
+  /// 扫描**用户点名的那些文件**（首页「选择文件」那条路）。
+  ///
+  /// 与 [scan] 的三点差别，全在 [CmdScanFiles] 的注释里：不碰同目录别的文件、
+  /// 容器防线让位、分卷在同目录里自动补齐。
+  Future<ScanOutcome> scanFiles({
+    required List<String> paths,
+    ScanOptions options = const ScanOptions(),
+    bool ignoreContainers = true,
+    bool expandSplitVolumes = true,
+  }) async {
+    await _ready.future;
+    // 只能在这个 await **之后**检查：dispose 可能刚好在这期间跑完。
+    _ensureAlive();
+    if (_activeJob != null) {
+      throw const EngineException('已有任务在运行');
+    }
+
+    final jobId = _nextJobId++;
+    _activeJob = jobId;
+    final c = Completer<ScanOutcome>();
+    _scanWaiters[jobId] = c;
+
+    _toWorker!.send(CmdScanFiles(
+      jobId: jobId,
+      paths: paths,
+      options: options,
+      ignoreContainers: ignoreContainers,
+      expandSplitVolumes: expandSplitVolumes,
+    ));
+
+    return c.future;
+  }
+
   /// 解压一组分卷到 [outDir]，等到解压结束。
   ///
   /// 进度走 [onExtractTick]（已节流），失败以 [EngineException] 抛出 ——
@@ -331,9 +341,11 @@ class EngineController {
   // 前后台
   // -------------------------------------------------------------------------
 
-  /// 切到后台时**只标脏不发事件**，回到前台立刻补发最后一条。
+  /// 切到后台时**界面那一路只标脏不发事件**，回到前台立刻补发最后一条。
   ///
   /// 后台时 Activity 已经不可见，每一次 `notifyListeners` 白重建四棵树。
+  /// 唯一的例外是解压的 [onExtractTickBackground]：它不重建任何东西，而且在
+  /// 后台时比在前台时更重要（那条常驻通知是锁屏期间唯一的进度来源）。
   void setForeground(bool value) {
     if (_foreground == value) return;
     _foreground = value;
@@ -382,10 +394,19 @@ class EngineController {
           :final message,
           :final detail,
           :final code,
-          :final breach
+          :final breach,
+          // 别漏这一格：`EngineException` 是在**这里**重新组出来的，漏了它
+          // 弹窗与日志就退回「密码不正确」（见 `EvFailed.uncertain`）。
+          :final uncertain
         ):
         _failActive(
-          EngineException(message, detail: detail, code: code, breach: breach),
+          EngineException(
+            message,
+            detail: detail,
+            code: code,
+            breach: breach,
+            uncertain: uncertain,
+          ),
           onlyJob: jobId == 0 ? null : jobId,
         );
     }

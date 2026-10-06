@@ -13,8 +13,12 @@ import io.flutter.plugin.common.MethodChannel
 import java.io.File
 
 /**
- * 宿主 Activity。除了启动 Flutter 之外只做一件事：**让系统文件管理器打开
- * 解压出来的那个目录**。
+ * 宿主 Activity。除了启动 Flutter 之外，它是**所有「得问系统」的能力的唯一出口**
+ * （走下面那条 `CHANNEL`），目前三件：
+ *
+ * 1. 让系统文件管理器打开解压出来的那个目录（下面一大段注释都在讲它）。
+ * 2. 量一个路径所在卷还剩多少字节（`freeSpace`，给炸弹/空间闸门用）。
+ * 3. 解压期间起停那个保活的前台服务（`*KeepAlive`，见 `ExtractKeepAliveService`）。
  *
  * ## 为什么这件事得在原生做
  *
@@ -112,6 +116,30 @@ class MainActivity : FlutterActivity() {
                         result.success(openFolderInFileManager(call.argument<String>("path")))
                     "freeSpace" ->
                         result.success(freeSpace(call.argument<String>("path")))
+                    // ===== 解压期间的前台服务（保活，见 ExtractKeepAliveService）=====
+                    // 三条都回 true/false「叫没叫动」，**不回「现在是不是在跑」**：
+                    // Dart 侧只关心自己那次调用有没有得逞，拿一个可能有延迟的
+                    // 状态回去做判断只会多出一类竞态。三个方法都是幂等的。
+                    "startKeepAlive" -> {
+                        ExtractKeepAliveService.start(
+                            this,
+                            call.argument<String>("title") ?: "正在解压",
+                            call.argument<String>("text") ?: ""
+                        )
+                        result.success(true)
+                    }
+                    "updateKeepAlive" -> {
+                        ExtractKeepAliveService.update(
+                            this,
+                            call.argument<String>("title") ?: "正在解压",
+                            call.argument<String>("text") ?: ""
+                        )
+                        result.success(true)
+                    }
+                    "stopKeepAlive" -> {
+                        ExtractKeepAliveService.stop(this)
+                        result.success(true)
+                    }
                     else -> result.notImplemented()
                 }
             }

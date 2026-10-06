@@ -1,1 +1,34 @@
-TODO: Add your license here.
+deep_unzip_engine
+=================
+
+本目录是 DeepUnzip 的本地 FFI 插件：一层薄 C ABI，动态链接随包分发的 7-Zip
+核心。本插件使用了 7-Zip，该库及其使用受下方所列许可约束。
+
+构建产出两个 .so：
+
+  libduz7zip.so           -- 7-Zip 本体（third_party/7zip 的全部源码）
+  libdeep_unzip_engine.so -- 只有那一层 C ABI，运行期从 libduz7zip.so 取符号
+
+拆开是为了让 7-Zip 以一个独立的库存在（LGPL-2.1 第 6b 条），而不是被静态编进
+引擎的二进制里（那是第 6a 条，义务重得多，要给用户「能改库再重新链接」的材料）。
+
+本插件自身的许可跟随 DeepUnzip 主工程（未单独发布）。
+
+它内含的第三方代码另有许可，必须在分发时一并声明：
+
+  7-Zip
+  Copyright (C) 1999-2026 Igor Pavlov
+  许可：GNU LGPL 2.1 及以后版本，其中 CPP/7zip/Compress/Rar* 附带
+        "unRAR license restriction"；另有三个 BSD 文件：
+        CPP/7zip/Compress/LzfseDecoder.cpp（BSD-3，Apple Inc.）
+        C/ZstdDec.c（BSD-3，Facebook Inc.）
+        C/Xxh64.c（BSD-2，Yann Collet）
+  源码：third_party/7zip/
+  许可全文：LGPL-2.1.txt（本目录，GNU LGPL 2.1 全文）
+            third_party/7zip/DOC/License.txt（7-Zip 自己的许可概览，
+            含 BSD-3 / BSD-2 全文与 unRAR 限制原文）
+
+  unRAR 那条限制说的是「不得用 unRAR 源码重新实现 RAR 压缩算法」。
+  本应用只做解压，不制作 RAR 压缩包，属于该许可明确允许的用途。
+
+应用内「关于」页展示的就是上述声明与全文（lib/screens/about_screen.dart）。

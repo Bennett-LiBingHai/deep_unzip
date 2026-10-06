@@ -44,5 +44,8 @@ app.*.map.json
 /android/app/profile
 /android/app/release
 
+# 签名材料（keystore / key.properties）的忽略规则在 `android/.gitignore` 里 ——
+# 那是 Flutter 模板自带的位置，别在这儿再抄一份，两处迟早只改一处。
+
 # Widget Preview related
 .widget_preview/

@@ -14,6 +14,10 @@
 /// | `c.tar.gz` | `c.tar` | `c` |
 /// | `x.zip.001` | `x.zip` | `x` |
 /// | `backup.part01.rar` | `backup.part01` | `backup` |
+///
+/// 「自定义输出目录」（2026-10）开着时位置换成用户选的根目录，名字规则不变 ——
+/// 那一半由 [mirroredBaseDir] 算父目录，再作为 `baseDir` 交给
+/// [resolveOutputDir]。
 library;
 
 import 'dart:io';
@@ -154,16 +158,26 @@ String deriveOutputName(String archivePath, {bool spoofedExtension = false}) {
 ///
 /// [spoofedExtension] 原样透传给 [deriveOutputName]，见那里的说明。
 ///
+/// [baseDir] 是**父目录的改写**。不给就是「压缩包自己所在的那个目录」（默认，
+/// 也是本 app 从原型期到 2026-10 一直的行为）；给了就把输出放到那个目录底下
+/// —— 「自定义输出目录」那条路走的就是它，父目录由 [mirroredBaseDir] 从
+/// 用户选的根目录算出来。
+///
+/// **名字永远从压缩包自己的名字推**，不受 [baseDir] 影响：换的只是放置位置，
+/// 不是命名规则。
+///
 /// [isTaken] 可注入，默认查真实文件系统。注入它有两个理由：单测不必碰
 /// 磁盘；以及**一次任务内**同一基名可能出现多次而目录还没建出来 ——
 /// 那时调用方传的是「本次已占用的路径」，而不是磁盘状态。
 String resolveOutputDir(
   String archivePath, {
   bool spoofedExtension = false,
+  String? baseDir,
   bool Function(String path)? isTaken,
 }) {
   final normalized = _toPosix(archivePath);
-  final parent = p.posix.dirname(normalized);
+  final parent =
+      baseDir == null ? p.posix.dirname(normalized) : _stripTrailingSlash(_toPosix(baseDir));
   final base = deriveOutputName(normalized, spoofedExtension: spoofedExtension);
   final taken = isTaken ?? _anythingExists;
 
@@ -174,6 +188,39 @@ String resolveOutputDir(
     n++;
   }
   return candidate;
+}
+
+/// 把压缩包在**源目录下的相对位置**搬到 `outputRoot` 底下，得到它该写进哪个
+/// 目录。
+///
+/// 「自定义输出目录」开着时，`子目录/S1.zip` 要落到 `<outputRoot>/子目录/`，
+/// 顶层的 `L1.zip` 落到 `<outputRoot>/` 自己 —— 也就是在用户选的根下面**镜像
+/// 源目录的结构**，而不是把一堆包的名字平铺进根目录（那样不同子目录里的同名包
+/// 会互相撞，只能靠 `_1` 兜底，用户看不出谁是谁）。
+///
+/// `outputRoot` 尾部的 `/` 会去掉：`p.posix.join` 自己会处理，留着反而让
+/// 返回值在「根 / 根的某个子目录」两种情况下长得不一致，调用方做字符串比较时
+/// 会踩到。
+///
+/// 与 [resolveOutputDir] 一样走 posix 上下文，理由见 [_toPosix]。
+String mirroredBaseDir(String sourceRoot, String archivePath, String outputRoot) {
+  final root = _toPosix(outputRoot);
+  final rel = p.posix.relative(_toPosix(archivePath), from: _toPosix(sourceRoot));
+  final dir = p.posix.dirname(rel);
+  // `dirname` 在「同目录」时给 `.`，在 `relative` 失败（路径不相干）时可能给
+  // `..` 之类。两种都不该被 join 进结果 —— 退回根目录本身。
+  if (dir == '.' || dir.isEmpty || dir == '..' || dir.startsWith('../')) {
+    return root;
+  }
+  return p.posix.join(root, dir);
+}
+
+String _stripTrailingSlash(String path) {
+  var out = path;
+  // 只剥一个：`//` 那种（UNC/根）在 Android 上不存在，剥一个足够，
+  // 而 `while` 会把 `//` 剥成空串。
+  if (out.length > 1 && out.endsWith('/')) out = out.substring(0, out.length - 1);
+  return out;
 }
 
 /// 这个路径上**有没有东西** —— 文件、目录、链接都算占着。

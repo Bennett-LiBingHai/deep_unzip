@@ -76,6 +76,18 @@ int? parseCount(String text) {
   return v;
 }
 
+/// 同 [parseCount]，但**允许 0**。
+///
+/// 给递归深度用：那里的 `0` 是一个正经语义（「不递归」），不是「填错了」。
+/// [parseCount] 的 `>= 1` 是给「条数」定的，条数填 0 属于另一件事（「不记录
+/// 日志」该是一个独立的开关，见 `persist.dart` 的 `kMinMaxLogs`）—— 两种
+/// 语义只差这一档，所以并排放着，让下一个人一眼看出它们为什么不一样。
+int? parseNonNegativeCount(String text) {
+  final s = _normalizeNumber(text);
+  if (!RegExp(r'^\d+$').hasMatch(s)) return null;
+  return int.tryParse(s);
+}
+
 /// 去掉空白与千分位逗号，并转小写。
 String _normalizeNumber(String text) =>
     text.replaceAll(RegExp(r'[\s,]'), '').toLowerCase();

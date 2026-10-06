@@ -80,6 +80,29 @@ DUZ_EXPORT const char* duz_last_open_error(void);
 // 调用方要靠错误码决定「换个密码重试」还是「放弃这个包」。
 DUZ_EXPORT int32_t duz_last_open_error_code(void);
 
+// 上一次失败是不是「密码不对**或**数据已损坏，这两者分不出来」。1 = 分不出来。
+//
+// 只有 DUZ_ERR_PASSWORD 这一档才可能为 1，且**只有解压阶段**可能为 1。两种情形
+// 都要求「这个格式没有密码校验字」：ZIP（AES 的校验字 / ZipCrypto 的头校验）和
+// RAR5 有校验字，7-Zip 亲口报 kWrongPassword，那一档恒为 0 —— 它们是**能确定**的。
+//
+//   - 加密条目的**数据压根没解开**（kDataError）—— 压缩条目的 7z / RAR3；
+//   - 加密条目的 **CRC 对不上**（kCRCError）—— **stored 条目**，那里没有解码器、
+//     只有一次透明拷贝，密码错和坏数据都只能表现为 CRC 不匹配（2026-10-05 用
+//     `7z a -mx0 -p` 造的包实测过，与 `-mx5` 那条的报错不同）。
+//
+// 反过来说：**有校验字的格式上 kCRCError 不算这一档**。那里密码错在解码之前就被
+// 校验字拦下了，走不到 CRC —— CRC 失败恰恰证明密码是对的、坏的确实是数据。
+//
+// 它只影响**说法**，不影响**策略**：DUZ_ERR_PASSWORD 的含义与处置（换下一个
+// 候选密码重试 duz_open / 弹密码窗）有它没它完全一样。做成一个单独的位而不是
+// 新错误码，正是因为「分不清」不是一个路由概念 —— 写成错误码就等于让每个判
+// DUZ_ERR_PASSWORD 的地方都得再多认一个值，漏一处就表现成「加密包不再试密码库」。
+//
+// 与 duz_last_open_error()/…_code() 同源同生命周期：紧挨着它们读，不要跨
+// await，也不要拿一次成功调用的结果去用。
+DUZ_EXPORT int32_t duz_last_error_uncertain(void);
+
 // 列条目。成功时 *out 指向 malloc 出来的数组（count 个），调用方用
 // duz_free_entries 释放。只读中央目录，不解压任何数据。
 //

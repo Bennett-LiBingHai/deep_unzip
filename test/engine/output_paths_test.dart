@@ -122,6 +122,81 @@ void main() {
     });
   });
 
+  // 「自定义输出目录」开着时用这两个函数：`mirroredBaseDir` 算父目录，
+  // `resolveOutputDir(baseDir:)` 算法子名。拆开是因为**名字规则一个字都不该
+  // 因为位置变了而变** —— 把两件事揉进一个函数，改名字时就得连位置一起想。
+  group('mirroredBaseDir —— 把相对结构搬进输出根', () {
+    test('顶层文件 → 就是输出根自己', () {
+      expect(mirroredBaseDir('/src', '/src/a.zip', '/out'), '/out');
+    });
+
+    test('一层子目录跟着搬', () {
+      expect(mirroredBaseDir('/src', '/src/子目录/S1.zip', '/out'), '/out/子目录');
+    });
+
+    test('多层整段照搬', () {
+      expect(mirroredBaseDir('/src', '/src/a/b/c.zip', '/out'), '/out/a/b');
+    });
+
+    test('输出根带尾斜杠也认（不拼出双斜杠）', () {
+      expect(mirroredBaseDir('/src', '/src/sub/a.zip', '/out/'), '/out/sub');
+    });
+
+    test('源根带尾斜杠也认', () {
+      expect(mirroredBaseDir('/src/', '/src/sub/a.zip', '/out'), '/out/sub');
+    });
+
+    test('包不在源根底下 → 退回输出根，绝不让 .. 爬出去', () {
+      // 结果里留下 `..` 就等于「写到输出根外面」。宁可就地平铺在根上 ——
+      // 这也是唯一不会写出用户没选过的目录的选择。
+      expect(mirroredBaseDir('/src', '/other/a.zip', '/out'), '/out');
+      expect(mirroredBaseDir('/src', '/src/../a.zip', '/out'), '/out');
+    });
+
+    test('源根就等于包所在的那一层时，不做多余拼接', () {
+      expect(mirroredBaseDir('/src/sub', '/src/sub/a.zip', '/out'), '/out');
+    });
+  });
+
+  group('resolveOutputDir(baseDir:) —— 只换父目录，名字规则原样', () {
+    test('给了 baseDir 就用它当父目录', () {
+      expect(
+        resolveOutputDir('/src/sub/a.tar.gz',
+            baseDir: '/out/sub', isTaken: (_) => false),
+        '/out/sub/a',
+      );
+    });
+
+    test('不给 baseDir 还是老规矩：解到包旁边', () {
+      expect(resolveOutputDir('/src/sub/a.tar.gz', isTaken: (_) => false),
+          '/src/sub/a');
+    });
+
+    test('baseDir 一样走 _1/_2 去重', () {
+      final taken = {'/out/sub/a', '/out/sub/a_1'};
+      expect(
+        resolveOutputDir('/src/sub/a.zip',
+            baseDir: '/out/sub', isTaken: taken.contains),
+        '/out/sub/a_2',
+      );
+    });
+
+    test('baseDir 带尾斜杠不拼出双斜杠', () {
+      expect(
+        resolveOutputDir('/src/a.zip', baseDir: '/out/', isTaken: (_) => false),
+        '/out/a',
+      );
+    });
+
+    test('伪后缀与 baseDir 一起用', () {
+      expect(
+        resolveOutputDir('/src/fake.pdf',
+            spoofedExtension: true, baseDir: '/out', isTaken: (_) => false),
+        '/out/fake',
+      );
+    });
+  });
+
   // 需求 5 的伪后缀。真机上 `fake.pdf`（实为 ZIP）整包失败，根因就在这里：
   // 输出名跟源文件同名，后端建目录时撞上一个已经存在的**文件**。
   group('伪后缀的输出名', () {
