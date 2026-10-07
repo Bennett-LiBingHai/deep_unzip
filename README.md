@@ -66,6 +66,29 @@ Gradle 的发行包走腾讯云镜像，配置在
 
 `flutter test` 跑全部用例，**不需要设备或模拟器**。
 
+## 发布
+
+```bash
+export FLUTTER_STORAGE_BASE_URL=https://storage.flutter-io.cn
+flutter build apk --release
+
+"$ANDROID_HOME/build-tools/<版本>/apksigner" verify --print-certs \
+  build/app/outputs/flutter-apk/app-release.apk
+```
+
+`apksigner` 那一步不能省：**没有 `android/key.properties` 时构建不报错**，
+只会静默退回 debug 签名。输出里是 `CN=Android Debug, O=Android, C=US`，说明这个包
+不能上架；看到自己填的 `CN` 才算真签上了。签名与 keystore 的说明见上面「构建」。
+
+**APK 不进仓库。** 整个 `build/` 都在 `.gitignore` 里，而要让 git 放行里面某一个
+文件，得逐层绕开 `/build/`（父目录被忽略时否定规则看不见），且 `flutter clean`
+一跑就变成一条待提交的删除记录 —— 二进制还会永久留在历史里，发一版涨一份体积。
+发布走 Gitee 的**发行版**：建一个版本、把 APK 作为附件传上去。不占 git 历史、
+有版本号和更新说明、下载走 Gitee 的 CDN。
+
+版本号在 `pubspec.yaml` 的 `version:` 一行：`+` 前面是 `versionName`（给人看的），
+后面是 `versionCode` —— 商店判断新旧用的是这个整数，**每次发版必须递增**。
+
 ## 目录结构
 
 ```
