@@ -256,7 +256,7 @@ void main() {
 
       final c = await booted();
       final pending = c.scan(rootPath: root.path);
-      await c.cancelScan();
+      await c.cancel();
       final out = await pending;
 
       // 取消不是错误。
@@ -266,7 +266,7 @@ void main() {
 
     t('没有任务时取消是空操作', () async {
       final c = await booted();
-      await c.cancelScan();
+      await c.cancel();
       expect(c.isRunning, isTrue);
     });
   });

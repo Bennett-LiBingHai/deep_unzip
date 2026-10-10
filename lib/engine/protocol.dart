@@ -104,14 +104,14 @@ final class CmdScanFiles extends WorkerCmd {
 
 /// 把一组（已排好序的）分卷解压到 [outDir]。
 ///
-/// 这是**唯一**会长时间阻塞 worker 的命令：`duz_extract_all` 是一次同步
-/// FFI 调用，跑完之前 worker 的事件循环不转。所以：
+/// 解压本体跑在**原生侧自己的线程**上（`duz_extract_start` 立刻返回），worker
+/// 只是用轮询循环取进度 —— 所以这条命令**不再阻塞** worker 的事件循环，[CmdCancel]
+/// 在解压期间照样处理得到（它会在下一次轮询把取消送到原生侧）。
 ///
-/// - 解压期间进来的 [CmdCancel] **要到解压结束才会被处理** —— 也就是说
-///   现阶段它取消失败（不报错，只是不生效）。真正的「解压中途取消/暂停」
-///   需要把取消信号做成原生内存里的一个标志字节，让 7-Zip 的进度回调直接
-///   去读，而不必等事件循环。那是 P3 的活，这里不假装已经支持。
-/// - 进度靠 [EvExtractTick] 主动推，不是被拉。
+/// 这条架构是硬约束换来的：原生侧此前用 `NativeCallable.isolateLocal` 回调报
+/// 进度，而 7-Zip 的多线程解码路径会从**它自己的工作线程**调那个回调，Dart VM
+/// 直接 `FATAL`、进程消失（见 `src/duz_engine.h` 顶上那段线程约定）。现在原生侧
+/// 永不回调 Dart，进度靠 [EvExtractTick] 主动推、取消靠标志位。
 final class CmdExtract extends WorkerCmd {
   const CmdExtract({
     required this.jobId,
@@ -172,11 +172,19 @@ final class CmdExtract extends WorkerCmd {
 
 /// 请求中止当前任务。**没有对应参数** —— 同一时刻只有一个任务，
 /// 「取消」只可能指它。
+///
+/// 扫描是协作式的（每个条目边界看一眼 epoch），解压靠轮询循环把标志送到原生
+/// 侧 —— 两条路都是「尽快」，不是「立刻」。所以调用方不能假设 [CmdCancel]
+/// 一送出任务就停了，得等那个任务自己收场。
 final class CmdCancel extends WorkerCmd {
   const CmdCancel();
 }
 
 /// 停掉命令循环。主 isolate 随后会硬杀本 isolate。
+///
+/// worker 收到它要**等在飞的任务收尾**再关 inbox —— 解压那条路上，
+/// `duz_close` 跑到了 C++ 那条解压线程才有人 join（见 `controller.dart` 的
+/// `dispose()`：先送 cancel + shutdown，给一个宽限期，到期才硬杀）。
 final class CmdShutdown extends WorkerCmd {
   const CmdShutdown();
 }
@@ -361,4 +369,29 @@ class EngineException implements Exception {
   @override
   String toString() =>
       detail == null ? 'EngineException: $message' : 'EngineException: $message\n$detail';
+}
+
+/// 这次解压**被用户中止了** —— 不是失败，也不该被当成失败处理。
+///
+/// **刻意不继承 [EngineException]**，这一条是整个设计的关键：
+///
+/// - `app_state.dart` 的批次循环里有一条 `on EngineException` 兜底，会把接到的
+///   一切记成失败日志、计一次失败数。取消走的是另一条 `on ExtractCancelled`。
+/// - 更要紧的是**试密码那条链**（`_extractResolvingPassword`）：它的 `verify`
+///   闭包把「拿到 outcome」直接当成「这个密码是对的」，而试密码本身就是一次
+///   `engine.extract`（`duz_verify_password` 仍是 UNSUPPORTED）。如果把取消做成
+///   `ExtractOutcome.cancelled` 一路用返回值往上带，那个闭包会把「用户按了停止」
+///   读成「密码验证通过」并记一次密码库命中 —— **静默假绿**。
+///
+/// 做成异常之后，它穿过 `_extractResolvingPassword` 的六个成功出口自动传播，
+/// 一处都不用逐个改；而因为类型上没有继承关系，它既不会被 `on EngineException`
+/// 接住，也不会被那条 `verify` 闭包当成成功。
+///
+/// 边界划在这里：`extractArchive` / `extract` 那一层**返回值**（那里手上有归档，
+/// outcome 是真的）；再往上就只剩这一个异常。
+class ExtractCancelled implements Exception {
+  const ExtractCancelled();
+
+  @override
+  String toString() => 'ExtractCancelled';
 }

@@ -7,8 +7,11 @@
 // 用法：装到设备上，把路径填进去（如 /sdcard/Download/test.zip），
 // 点「打开并列出」看条目，再点「解压」看进度。
 //
-// 两件事都在独立 isolate 里跑 —— 引擎调用会阻塞整个 isolate，
-// 在主 isolate 调就是 UI 全程冻死。
+// 两件事都在独立 isolate 里跑 —— 它们都是**长任务**（打开归档要读中央目录，
+// 解压要真的减压），在主 isolate 调会让 UI 冻住那么久。解压本身已经不阻塞
+// 调用方的 isolate 了（原生侧自己起线程，这里只是轮询，见
+// `deep_unzip_engine.dart` 顶上那段线程约定），但放进 isolate 仍然是正确姿势：
+// 轮询循环自己也要占事件循环，而扫描与解压共用一个 worker 是上层设计的。
 import 'dart:async';
 import 'dart:io';
 import 'dart:isolate';
@@ -161,7 +164,12 @@ class _SmokeState extends State<_Smoke> {
   }
 
   /// 解压，进度通过 SendPort 回传，最后发一个 `null` 当结束哨兵。
-  static void _extract(_ExtractArgs args) {
+  ///
+  /// `async` 是必须的：`extractAll` 现在返回 `Future<bool>`（原生侧自己起线程
+  /// 干活，这里每 80ms 轮询一次），不 await 就会在解压刚开始时就把哨兵发出去，
+  /// 主侧会以为解完了。`onProgress` 返回 true 表示「继续」—— 这个冒烟页没有
+  /// 停止按钮，所以恒为 true。
+  static Future<void> _extract(_ExtractArgs args) async {
     try {
       // 输出目录必须先存在 —— 原生侧只往里写，不建它。
       final dir = Directory(args.outDir);
@@ -169,10 +177,10 @@ class _SmokeState extends State<_Smoke> {
 
       final a = DuzArchive.open([args.path], password: args.password);
       try {
-        // 按「条目名变了」节流，而不是每条都发：7-Zip 报进度的频率远高于
-        // 条目切换频率，原样转发会把端口和 UI 一起淹掉。
+        // 按「条目名变了」节流，而不是每条都发：轮询是 80ms 一次，而条目切换
+        // 远没那么频繁，原样转发会把端口和 UI 一起淹掉。
         String? last;
-        a.extractAll(
+        await a.extractAll(
           args.outDir,
           onProgress: (done, total, name) {
             if (name != null && name != last) {

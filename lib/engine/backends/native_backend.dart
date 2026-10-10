@@ -11,10 +11,15 @@
 ///    「除 native_backend 外不得 import package:flutter」是同一条纪律的延伸：
 ///    依赖外部世界的口子越少越好，而这个口子本来就无法避免。
 ///
-/// ## 阻塞警告
+/// ## 长任务警告
 ///
-/// 本文件两个函数都会**阻塞调用它的 isolate**（原生侧同步跑完整个解压）。
-/// 只能在 worker isolate 里调，绝不要在 UI isolate 调。
+/// 本文件的函数都是**长任务**，该在 worker isolate 里调。但它们**不阻塞**
+/// 调用方的 isolate：[extractArchive] 是异步的，原生侧的解压跑在 C++ 自己的
+/// 线程上，这里只是轮询取进度（见 `packages/deep_unzip_engine` 顶上那段线程约定）。
+/// 换句话说，worker 在解压期间照样能收命令 —— 「解压中途取消」就是这么成立的。
+///
+/// 唯一的例外是 [peekArchive] / [probeEncrypted]：`duz_open` 仍是同步的，
+/// 但那是列中央目录级的活，不减压。
 library;
 
 import 'dart:io';
@@ -23,6 +28,7 @@ import 'package:deep_unzip_engine/deep_unzip_engine.dart' as engine;
 
 import '../limits.dart';
 import '../models.dart';
+import '../output_cleanup.dart';
 import '../protocol.dart';
 
 /// 一个归档的概览，给「先看要不要密码」这类判断用。
@@ -133,17 +139,18 @@ bool _engineUnusable = false;
 /// [outDir] 不存在时会被创建 —— 原生侧只往里写、不建目录，而调用方
 /// （递归解压里算出来的输出路径）往往还没建。
 ///
-/// [onTick] 每次原生报进度就调一次，**不做合并也不做节流**：合并是 worker
-/// 的职责（它有那个时间预算），节流是主 isolate 的职责（它知道 UI 频率）。
-/// 本层如实转发。
+/// [onTick] 每轮轮询就调一次，**不做合并也不做节流**：合并是 worker 的职责
+/// （它有那个时间预算），节流是主 isolate 的职责（它知道 UI 频率）。本层如实转发。
 ///
-/// [shouldCancel] 每次报进度时问一次，返回 true 即中止并抛 [EngineException]。
-/// **注意它同步执行在同一线程上**，所以实现必须是纯内存判断 —— 在这里 await
-/// 什么或者等另一个 isolate 回消息，会把解压卡死。
+/// [shouldCancel] 每轮轮询问一次，返回 true 即向原生侧送一次取消、并在解压
+/// unwind 之后**正常返回**一个 `cancelled: true` 的 [ExtractOutcome] —— 取消
+/// **不是**异常（用户按的是「停止」）。实现必须是**纯内存判断**：它跑在 worker
+/// isolate 的事件循环上，在这里 await 什么只会把下一轮轮询推后，进而推迟取消
+/// 生效的时刻。
 ///
 /// [availableBytes] 是目标卷的剩余字节数，由主 isolate 量好传进来（这一层
 /// 跑在 worker isolate，够不着平台通道）。`null` = 量不到 → 跳过空间检查。
-ExtractOutcome extractArchive({
+Future<ExtractOutcome> extractArchive({
   required List<String> parts,
   required String outDir,
   String? password,
@@ -151,7 +158,7 @@ ExtractOutcome extractArchive({
   bool Function()? shouldCancel,
   LimitThresholds limits = LimitThresholds.standard,
   int? availableBytes,
-}) {
+}) async {
   // 顺序是刻意的：**先开归档、过闸门，再建输出目录**。
   //
   // 反过来（先建目录再开）会在炸弹被拒时留下一个空目录 —— 用户看到的是
@@ -172,24 +179,37 @@ ExtractOutcome extractArchive({
     }
 
     final dir = Directory(outDir);
-    if (!dir.existsSync()) dir.createSync(recursive: true);
+    // **建目录之前**先量出「这次解压可能新建哪些层」的上界：取消时要靠它把
+    // 空目录收干净，又绝不能把用户早先就有的目录一起收掉。见 output_cleanup.dart。
+    final boundary = existingBoundary(dir);
+    if (boundary != dir.path) dir.createSync(recursive: true);
 
     String last = '';
-    a.extractAll(
+    // 取消**不是**异常：`extractAll` 在被中止时正常返回，这里如实把 `cancelled`
+    // 报上去。谁是「用户按了停止」谁是「这个包坏了」，上层靠它分。
+    //
+    // 这个 bool **取自原生侧的快照**，不是「我们请求过取消」—— 请求取消的那一刻
+    // 包可能刚好解完了，那种情况该记成功。见 `DuzArchive.extractAll` 的说明。
+    final cancelled = await a.extractAll(
       outDir,
       onProgress: (done, total, name) {
         if (name != null) last = name;
         onTick?.call(
           ExtractTick(doneBytes: done, totalBytes: total, current: last),
         );
+        // 返回 false = 请求取消；原生侧在下一个进度点 unwind。
         return !(shouldCancel?.call() ?? false);
       },
     );
+    // 被中止时把这次新建、又什么都没留下的空目录收掉 —— 原生侧只管删那个
+    // 写了一半的**文件**，目录是这一层建的，也该由这一层收。见 output_cleanup.dart。
+    if (cancelled) pruneCreatedDirs(dir, boundary);
     return ExtractOutcome(
       outDir: outDir,
       entryCount: a.entries.length,
       unpackedBytes: a.unpackedSize,
       elapsed: watch.elapsed,
+      cancelled: cancelled,
     );
   } on engine.DuzEngineException catch (e) {
     throw _translate(e);

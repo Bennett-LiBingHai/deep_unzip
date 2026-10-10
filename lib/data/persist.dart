@@ -43,7 +43,7 @@ import '../models/password_entry.dart';
 /// （全仓库只有设置页在读它），但**接上它反而是错的** —— 7-Zip 逐条目比对
 /// CRC32 是解压流程的一部分、顺带算出来的，关掉省不下时间；关了唯一的
 /// 效果是坏文件静默解成乱码、日志还写 success。而且 C ABI
-/// （`duz_extract_all`）根本没有这个参数，要接得改 C++ 重编 `.so`。
+/// （`duz_extract_start`）根本没有这个参数，要接得改 C++ 重编 `.so`。
 /// CRC 校验的效果一直在：对不上就是 `EngineException`，走的就是那颗
 /// 「跳过 / 停止」弹窗。
 ///

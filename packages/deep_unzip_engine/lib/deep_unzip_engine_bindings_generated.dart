@@ -33,37 +33,90 @@ class DeepUnzipEngineBindings {
   late final _duz_close = _duz_closePtr
       .asFunction<void Function(ffi.Pointer<duz_ctx>)>();
 
-  /// 全量解压到 outDir。outDir 必须已存在且可写。
-  /// 路径安全（zip-slip、绝对路径、`..`）由 C++ 侧强制，Dart 侧还会再校验一次。
-  int duz_extract_all(
-    ffi.Pointer<duz_ctx> ctx,
-    ffi.Pointer<ffi.Char> outDir,
-    duz_progress_cb cb,
-    ffi.Pointer<ffi.Void> userData,
-  ) {
-    return _duz_extract_all(ctx, outDir, cb, userData);
+  /// 请求中止正在跑的解压。可从任意线程调，幂等。
+  ///
+  /// 粒度是**条目/块边界**：7-Zip 在下一个进度点看到标志后返回 E_ABORT 并
+  /// unwind。所以正在写的那个条目会被删掉（宁可留个空目录也不留一个长度不对的
+  /// 文件），之前已解好的完整文件一个都不动。
+  ///
+  /// 如果解压恰在此前已经跑完，这次取消落空 —— 快照会给 cancelled=0、
+  /// rc=DUZ_OK，调用方该把它当成功。
+  void duz_extract_cancel(ffi.Pointer<duz_ctx> ctx) {
+    return _duz_extract_cancel(ctx);
   }
 
-  late final _duz_extract_allPtr =
+  late final _duz_extract_cancelPtr =
+      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Pointer<duz_ctx>)>>(
+        'duz_extract_cancel',
+      );
+  late final _duz_extract_cancel = _duz_extract_cancelPtr
+      .asFunction<void Function(ffi.Pointer<duz_ctx>)>();
+
+  /// 取一次进度快照。**调用方自带名字缓冲**（nameBuf/nameBufLen）而不是让原生
+  /// 返回内部指针 —— 那样的指针会在下一次写入时失效，Dart 读到的是野地址。
+  /// 当前条目名以 UTF-8 写进 nameBuf（截断到 nameBufLen-1 字节），没有名字或
+  /// nameBufLen <= 0 时写空串。
+  ///
+  /// 快照的 running 由 1 变 0 的**那一次**会顺手 join 解压线程，并把它的失败
+  /// 原因搬进**调用线程**的 thread_local —— 于是 duz_last_open_error() 与
+  /// duz_last_error_uncertain() 在 poll 出结局之后立刻就读得到，与 duz_open
+  /// 失败时完全同源。之后每次 poll 仍返回 running=0 与同一个 rc（幂等）。
+  ///
+  /// 返回值只表示「这次查询本身有没有问题」（DUZ_OK / DUZ_ERR_ARG），
+  /// 解压的结局在 out 里。
+  int duz_extract_poll(
+    ffi.Pointer<duz_ctx> ctx,
+    ffi.Pointer<duz_progress_snapshot> out,
+    ffi.Pointer<ffi.Char> nameBuf,
+    int nameBufLen,
+  ) {
+    return _duz_extract_poll(ctx, out, nameBuf, nameBufLen);
+  }
+
+  late final _duz_extract_pollPtr =
       _lookup<
         ffi.NativeFunction<
           ffi.Int32 Function(
             ffi.Pointer<duz_ctx>,
+            ffi.Pointer<duz_progress_snapshot>,
             ffi.Pointer<ffi.Char>,
-            duz_progress_cb,
-            ffi.Pointer<ffi.Void>,
+            ffi.Int32,
           )
         >
-      >('duz_extract_all');
-  late final _duz_extract_all = _duz_extract_allPtr
+      >('duz_extract_poll');
+  late final _duz_extract_poll = _duz_extract_pollPtr
       .asFunction<
         int Function(
           ffi.Pointer<duz_ctx>,
+          ffi.Pointer<duz_progress_snapshot>,
           ffi.Pointer<ffi.Char>,
-          duz_progress_cb,
-          ffi.Pointer<ffi.Void>,
+          int,
         )
       >();
+
+  /// 开始全量解压到 outDir。outDir 必须已存在且可写。
+  /// 路径安全（zip-slip、绝对路径、`..`）由 C++ 侧强制，Dart 侧还会再校验一次。
+  ///
+  /// **立刻返回**：解压跑在 C++ 自己的线程上（所以允许多线程解码器从它的工作
+  /// 线程报进度，那条路碰不到 Dart）。返回值只说「有没有起得来」（DUZ_OK /
+  /// DUZ_ERR_ARG / DUZ_ERR_UNSUPPORTED），解压的结局在 poll 的快照里。
+  ///
+  /// 一个 ctx 只解一次：重复调用返回 DUZ_ERR_ARG。
+  int duz_extract_start(
+    ffi.Pointer<duz_ctx> ctx,
+    ffi.Pointer<ffi.Char> outDir,
+  ) {
+    return _duz_extract_start(ctx, outDir);
+  }
+
+  late final _duz_extract_startPtr =
+      _lookup<
+        ffi.NativeFunction<
+          ffi.Int32 Function(ffi.Pointer<duz_ctx>, ffi.Pointer<ffi.Char>)
+        >
+      >('duz_extract_start');
+  late final _duz_extract_start = _duz_extract_startPtr
+      .asFunction<int Function(ffi.Pointer<duz_ctx>, ffi.Pointer<ffi.Char>)>();
 
   void duz_free_entries(ffi.Pointer<duz_entry> entries, int count) {
     return _duz_free_entries(entries, count);
@@ -78,11 +131,17 @@ class DeepUnzipEngineBindings {
 
   /// 上一次失败是不是「密码不对**或**数据已损坏，这两者分不出来」。1 = 分不出来。
   ///
-  /// 只有 DUZ_ERR_PASSWORD 这一档才可能为 1，且**只有解压阶段**可能为 1：加密条目
-  /// 的数据压根没解开，而那种加密没有校验字（7z 的 AES 就是个纯 CBC 滤波器、RAR3
-  /// 也没有），错密码和坏数据在解码器眼里长得一模一样。ZIP（AES 的校验字 /
-  /// ZipCrypto 的头校验）和 RAR5 有校验字，7-Zip 亲口报 kWrongPassword，那一档
-  /// 恒为 0 —— 它们是**能确定**的。
+  /// 只有 DUZ_ERR_PASSWORD 这一档才可能为 1，且**只有解压阶段**可能为 1。两种情形
+  /// 都要求「这个格式没有密码校验字」：ZIP（AES 的校验字 / ZipCrypto 的头校验）和
+  /// RAR5 有校验字，7-Zip 亲口报 kWrongPassword，那一档恒为 0 —— 它们是**能确定**的。
+  ///
+  /// - 加密条目的**数据压根没解开**（kDataError）—— 压缩条目的 7z / RAR3；
+  /// - 加密条目的 **CRC 对不上**（kCRCError）—— **stored 条目**，那里没有解码器、
+  /// 只有一次透明拷贝，密码错和坏数据都只能表现为 CRC 不匹配（2026-10-05 用
+  /// `7z a -mx0 -p` 造的包实测过，与 `-mx5` 那条的报错不同）。
+  ///
+  /// 反过来说：**有校验字的格式上 kCRCError 不算这一档**。那里密码错在解码之前就被
+  /// 校验字拦下了，走不到 CRC —— CRC 失败恰恰证明密码是对的、坏的确实是数据。
   ///
   /// 它只影响**说法**，不影响**策略**：DUZ_ERR_PASSWORD 的含义与处置（换下一个
   /// 候选密码重试 duz_open / 弹密码窗）有它没它完全一样。做成一个单独的位而不是
@@ -172,8 +231,8 @@ class DeepUnzipEngineBindings {
   /// NULL，duz_last_open_error_code() 给 DUZ_ERR_PASSWORD。调用方应换下一个
   /// 候选密码重试 duz_open。
   /// - 仅条目加密（ZIP 常见）：不打密码也能打开并列出条目，duz_open 成功；
-  /// 到 duz_extract_all 才返回 DUZ_ERR_PASSWORD。这样 UI 可以先展示条目
-  /// 再去要密码。
+  /// 到解压（duz_extract_start 起、poll 出结局）才报 DUZ_ERR_PASSWORD。
+  /// 这样 UI 可以先展示条目再去要密码。
   ///
   /// 失败返回 NULL，此时没有 ctx，用 duz_last_open_error()/…_code() 取原因。
   ffi.Pointer<duz_ctx> duz_open(
@@ -272,20 +331,25 @@ final class duz_entry extends ffi.Struct {
   external int index;
 }
 
-/// 进度回调。done/total 为字节；total 为 0 表示未知（此时只报 done）。
-/// currentEntry 是当前条目名，可为 NULL。
-/// 返回非 0 表示请求取消，解压会尽快中止并返回 DUZ_ERR_EXTRACT。
-typedef duz_progress_cb =
-    ffi.Pointer<ffi.NativeFunction<duz_progress_cbFunction>>;
-typedef duz_progress_cbFunction = ffi.Int Function(
-  ffi.Pointer<ffi.Void> userData,
-  ffi.Uint64 done,
-  ffi.Uint64 total,
-  ffi.Pointer<ffi.Char> currentEntry,
-);
-typedef Dartduz_progress_cbFunction = int Function(
-  ffi.Pointer<ffi.Void> userData,
-  int done,
-  int total,
-  ffi.Pointer<ffi.Char> currentEntry,
-);
+/// 解压进度的一次采样。由 duz_extract_poll 填。
+final class duz_progress_snapshot extends ffi.Struct {
+  /// 已写出的字节数（单调不减）
+  @ffi.Uint64()
+  external int done;
+
+  /// 未压缩总量；0 = 未知（此时只看 done）
+  @ffi.Uint64()
+  external int total;
+
+  /// 1 = 还在解压；0 = 已结束，下面两个字段才有意义
+  @ffi.Int32()
+  external int running;
+
+  /// 1 = 这次解压是被 duz_extract_cancel 中止的
+  @ffi.Int32()
+  external int cancelled;
+
+  /// 结束时的 DUZ_ERR_*；cancelled 为 1 时恒为 DUZ_OK
+  @ffi.Int32()
+  external int rc;
+}

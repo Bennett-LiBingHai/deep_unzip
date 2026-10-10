@@ -5,15 +5,26 @@
 /// - `deep_unzip_engine_bindings_generated.dart`（ffigen 生成）是**机械**绑定：
 ///   裸指针进、裸指针出，不懂所有权。
 /// - 本文件是**语义**层：管内存、把 UTF-8 指针变成 Dart `String`、把错误码
-///   变成异常、把 `duz_progress_cb` 变成 Dart 闭包。
+///   变成异常、把轮询出来的字节数变成 Dart 闭包的一次调用。
 ///
 /// 上层（`lib/engine/backends/native_backend.dart`）只该用本文件，不该直接碰
 /// 生成的那层 —— 否则所有权规则（谁分配谁释放、哪个指针活多久）会散落各处。
 ///
 /// ## 线程
 ///
-/// [DuzArchive.extractAll] 会阻塞调用它的 isolate 直到解压完成。**绝不能在主
-/// isolate 调用**（UI 会整个冻住），必须放在 worker isolate 里。
+/// **原生侧永不回调 Dart。** 解压走的是「C++ 起自己的线程干活 + Dart 轮询取
+/// 快照」：`duz_extract_start` 立刻返回，这里用一个 `await` 的轮询循环
+/// （[kExtractPollInterval]）取进度、送取消。
+///
+/// 这不是风格选择，是硬约束换来的：以前进度是 `NativeCallable.isolateLocal`
+/// 回调，而 7-Zip 的多线程解码路径会从**它自己 `pthread_create` 出来的线程**上
+/// 调 `ICompressProgressInfo` —— 从别的线程调 isolateLocal 回调会让 Dart VM
+/// 直接 `FATAL("Cannot invoke native callback outside an isolate.")`、进程消失
+/// （2026-10-10 真机实测，见 `src/duz_engine.h` 顶上那段线程约定）。
+///
+/// 所以 [DuzArchive.extractAll] 现在**不阻塞**调用它的 isolate。它仍然是个长
+/// 任务，仍然该放在 worker isolate 里，但那是为了别让 UI 排队等它，而不是因为
+/// 它会把事件循环堵死。
 library;
 
 import 'dart:ffi';
@@ -128,9 +139,76 @@ class DuzEntry {
 
 /// 进度回调。返回 `false` 表示请求取消。
 ///
+/// **它跑在调用方的 isolate 上**（两次轮询之间），不在原生线程上 —— 新架构下
+/// 原生侧永不回调 Dart。所以它可以碰 Dart 的一切，但**别在这里做重活**：每多
+/// 花一毫秒，下一次轮询就晚一毫秒，取消也就晚一毫秒生效。
+///
 /// [name] 是当前条目名，可能为 `null`（7-Zip 在报总量时还没进到具体条目）。
 /// `total` 为 0 表示未知，此时只该看 `done`。
 typedef DuzProgressCallback = bool Function(int done, int total, String? name);
+
+/// 轮询间隔。**刻意小于 worker 侧那个 `kExtractTickMerge`（120ms）**：三层节流
+/// 里干活的是那个合并层，这里只是取样的网眼 —— 网眼比闸门大，合并层就白设了。
+///
+/// 这个数也只决定取消的**最坏**延迟（一个间隔），因为取消标志要等下一次 poll
+/// 才送到原生侧。
+const Duration kExtractPollInterval = Duration(milliseconds: 80);
+
+/// 取条目名的缓冲长度。原生侧按 UTF-8 截断到 len-1，所以极端深的中文路径会被
+/// 截断 —— 名字只用于显示，截断是可接受的代价（换指针方案要担心野地址）。
+const int kExtractNameBufLen = 1024;
+
+/// 解压轮询的一帧，[runExtractLoop] 的输入。
+typedef ExtractTick = ({
+  int done,
+  int total,
+  String? name,
+  bool running,
+  bool cancelled,
+  int rc,
+});
+
+/// 解压轮询循环 —— **不碰 FFI**，三个动作 + 睡眠都由调用方注入。
+///
+/// 抽成顶层函数是为了能在宿主机上单测（照 `DiskSpaceProbe(channel)` 与
+/// `listDirectory(path, lister)` 的先例）：这里能钉住 poll 的节奏、「返回 false
+/// 只取消一次」、取消**不抛异常**、`rc != OK` 才抛。
+///
+/// [failure] 会在**读到 `running == 0` 的那一帧立刻**被调用（中间没有 await），
+/// 因为失败原因存在原生侧的 thread_local 里，晚一步读就可能被别的调用冲掉。
+///
+/// 返回**这次解压是不是真的被中止了** —— 取自原生侧那个快照位，不是「我们送出
+/// 过取消」这个事实。两者会不一致（请求取消时它可能刚好已经解完了），而只有
+/// 前者的口径才对：否则一个好好解完的包会被报成「已停止」。
+Future<bool> runExtractLoop({
+  required ExtractTick Function() poll,
+  required void Function() cancel,
+  required DuzEngineException Function() failure,
+  required Future<void> Function(Duration) sleep,
+  DuzProgressCallback? onProgress,
+  Duration interval = kExtractPollInterval,
+}) async {
+  var cancelSent = false;
+  for (;;) {
+    final tick = poll();
+    if (!tick.running) {
+      // 取消**不是**异常：用户按的是「停止」，不是「这个包坏了」。上层靠
+      // `cancelled` 那位区分，别在这儿把它折成一个 DUZ_ERR_EXTRACT。
+      if (tick.cancelled) return true;
+      if (tick.rc != DUZ_OK) throw failure();
+      return false;
+    }
+    // 只在第一次请求时送取消：原生侧那个标志本来就是幂等的，多送无害，但
+    // 「送了几次」是我们自己的账，测试要能断言它恰好是 1。
+    if (onProgress != null &&
+        !onProgress(tick.done, tick.total, tick.name) &&
+        !cancelSent) {
+      cancelSent = true;
+      cancel();
+    }
+    await sleep(interval);
+  }
+}
 
 /// 一个已打开的归档。
 ///
@@ -226,47 +304,61 @@ class DuzArchive {
   ///
   /// 路径安全（zip-slip、绝对路径、`..`）由 C++ 侧强制。
   ///
-  /// [onProgress] 的返回值语义是「继续吗」：返回 `false` 会尽快中止，
-  /// 然后本方法抛一个 `DUZ_ERR_EXTRACT` 的异常（文案「已取消」）。
+  /// **异步**：`duz_extract_start` 立刻返回，真正的解压跑在 C++ 自己的线程上，
+  /// 这里用一个轮询循环（见 [runExtractLoop]）取进度、送取消。所以它**不阻塞**
+  /// 调用方的 isolate，但仍然是长任务 —— 该放 worker isolate 里。
   ///
-  /// **会阻塞当前 isolate。只能在 worker isolate 里调。**
-  void extractAll(String outDir, {DuzProgressCallback? onProgress}) {
+  /// [onProgress] 的返回值语义是「继续吗」：返回 `false` 会向原生侧送一次取消，
+  /// 解压随即在下一个进度点 unwind。**取消是正常返回、不抛异常**（用户按的是
+  /// 「停止」，不是「这个包坏了」）；只有真的失败才抛 [DuzEngineException]。
+  ///
+  /// **返回 `true` 表示这次解压确实被中止了** —— 取自原生侧那个快照位，而不是
+  /// 「我们送出过取消」这个事实。两者会不一致（请求取消时它可能刚好已经解完），
+  /// 而只有前者说得出口。取消之后写到一半的那个条目由原生侧删掉
+  /// （见 `src/duz_engine.h` 的 `duz_extract_cancel`）。
+  ///
+  /// **解压期间不要 [close]**：那会 join 这条线程并释放 ctx。本方法返回之后再关。
+  Future<bool> extractAll(String outDir, {DuzProgressCallback? onProgress}) async {
     _checkOpen();
 
     final dir = outDir.toNativeUtf8();
-    NativeCallable<duz_progress_cbFunction>? cb;
+    final snap = calloc<duz_progress_snapshot>();
+    final nameBuf = calloc<Char>(kExtractNameBufLen);
     try {
-      if (onProgress != null) {
-        // 必须是 isolateLocal 而不是 listener：前者同步回调在调用它的那条
-        // 线程上，正好是 7-Zip 报进度的那条；后者会把调用投到主 isolate 的
-        // 事件循环，而我们已经把它堵住了（更别说解压本来就在别的 isolate 里）。
-        // 返回类型是 int，所以必须给 exceptionalReturn —— 那是**回调自己抛异常**
-        // 时返回给 C++ 的值。取 1（取消）而不是 0（继续）：回调挂了还若无其事地
-        // 接着解压，用户会看到一个不动却也不报错的进度条。中止更诚实，而且
-        // 立刻可恢复（我们什么都没写坏，输出目录是新建的）。
-        cb = NativeCallable<duz_progress_cbFunction>.isolateLocal(
-          (Pointer<Void> _, int done, int total, Pointer<Char> name) {
-            final n = name == nullptr ? null : name.cast<Utf8>().toDartString();
-            return onProgress(done, total, n) ? 0 : 1;
-          },
-          exceptionalReturn: 1,
-        );
-      }
-
-      final rc = _b.duz_extract_all(
-        _ctx,
-        dir.cast<Char>(),
-        cb?.nativeFunction ?? nullptr,
-        nullptr,
-      );
+      final rc = _b.duz_extract_start(_ctx, dir.cast<Char>());
       if (rc != DUZ_OK) {
+        // 这一档只有「起不来」：参数非法 / 已解过一次 / 本平台没编核心。
         // 同 `open`：紧挨着读，且只在失败分支里读。
         throw DuzEngineException(rc, _readLastError(),
             uncertain: _readLastErrorUncertain());
       }
+
+      return await runExtractLoop(
+        poll: () {
+          final r = _b.duz_extract_poll(_ctx, snap, nameBuf, kExtractNameBufLen);
+          if (r != DUZ_OK) throw DuzEngineException(r, _readLastError());
+          final s = snap.ref;
+          final n = nameBuf.cast<Utf8>().toDartString();
+          return (
+            done: s.done,
+            total: s.total,
+            name: n.isEmpty ? null : n,
+            running: s.running != 0,
+            cancelled: s.cancelled != 0,
+            rc: s.rc,
+          );
+        },
+        cancel: () => _b.duz_extract_cancel(_ctx),
+        // 紧挨着那次「running == 0」的 poll 读三件套 —— 它们存在原生侧的
+        // thread_local 里，是本线程取走的那一份（见 duz_engine.h 的 poll 说明）。
+        failure: () => DuzEngineException(snap.ref.rc, _readLastError(),
+            uncertain: _readLastErrorUncertain()),
+        sleep: (d) => Future<void>.delayed(d),
+        onProgress: onProgress,
+      );
     } finally {
-      // 先关回调再放路径：duz_extract_all 已经返回，回调不可能再被调用。
-      cb?.close();
+      calloc.free(snap);
+      calloc.free(nameBuf);
       malloc.free(dir);
     }
   }

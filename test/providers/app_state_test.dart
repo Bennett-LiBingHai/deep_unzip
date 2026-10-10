@@ -84,6 +84,21 @@ void main() {
     fail('解压批次没在预期轮次内收尾');
   }
 
+  /// 推到 [predicate] 为真为止（最多 [budget] 轮）。
+  ///
+  /// [settle] 那种「推固定轮数」只够穿过几个纯内存的 `await`；批次里夹着
+  /// **真文件 IO** 的几步（最典型的是出队时算包指纹的 `archiveIdentity`）
+  /// 就不是推得动的 —— `Duration.zero` 的定时器只管让出事件循环，真 IO 什么
+  /// 时候完成取决于机器忙不忙。测试机上一跑全量（多个测试文件并发）就够不上
+  /// 了，表现成「批次卡在第一个包」。所以这种地方等**条件**，不等轮数。
+  Future<void> waitUntil(bool Function() predicate, {int budget = 2000}) async {
+    for (var i = 0; i < budget; i++) {
+      if (predicate()) return;
+      await Future<void>.delayed(Duration.zero);
+    }
+    fail('等待的条件没在预期轮次内成立');
+  }
+
   group('扫描结果映射到 UI 模型', () {
     t('真目录 → archives 非空，folder* 与 hasScanned 就位', () async {
       final root = tempRoot('as_basic');
@@ -803,7 +818,48 @@ void main() {
       expect(state.progress, 1.0);
     });
 
-    t('停止解压：当前包解完后停下，剩下的包不再开工', () async {
+    t('speed 单位是 MB/s；剩余时间是当前包的，换包时清掉', () async {
+      final root = tempRoot('as_speed');
+      put(root, 'a.zip', realZip({'x': 'y'}));
+      put(root, 'b.zip', realZip({'x': 'y'}));
+
+      const mb = 1024 * 1024;
+      final gate = Completer<void>();
+      late AppState state;
+      String? etaAtSecondStart;
+      final engine = FakeEngine()
+        ..behavior = (e, outDir) async {
+          if (e.rounds == 1) {
+            e.onExtractTick?.call(const ExtractTick(
+                doneBytes: 0, totalBytes: 100 * mb, current: 'x'));
+            await Future<void>.delayed(const Duration(milliseconds: 200));
+            e.onExtractTick?.call(const ExtractTick(
+                doneBytes: 10 * mb, totalBytes: 100 * mb, current: 'x'));
+            await gate.future;
+          } else {
+            etaAtSecondStart = state.eta;
+          }
+        };
+      state = AppState(engine: engine);
+      addTearDown(state.dispose);
+
+      await state.selectFolderPath(root.path);
+      state.startExtract();
+      await settle();
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+
+      // 10 MB / ~0.2 s ≈ 50 MB/s。宽一点的区间是给测试机的调度抖动留的；
+      // 关键是它不再是字节/秒（那会是 5e7 量级）。
+      expect(state.speed, inInclusiveRange(5, 100));
+      // 剩下 90 MB 按 ~50 MB/s 算，几秒的量级 —— 只属于 a.zip。
+      expect(state.eta, isNot('--'));
+
+      gate.complete();
+      await drainExtract(state);
+      expect(etaAtSecondStart, '--', reason: '上一个包的剩余时间不该带到下一个包');
+    });
+
+    t('停止解压：当前包被真正打断，剩下的包不再开工', () async {
       final root = tempRoot('as_stop');
       put(root, 'a.zip', realZip({'x': 'y'}));
       put(root, 'b.zip', realZip({'x': 'y'}));
@@ -822,20 +878,38 @@ void main() {
       await settle();
 
       state.stopExtract();
-      expect(state.extracting, isTrue, reason: '停止不等于立刻结束：要等当前这个包解完');
-      expect(state.toastMsg, contains('解压完成后停止'),
-          reason: '粒度要如实说，别让人以为按下去就冻住');
+      // **取消真的送到引擎了**。从前这里只置一个标志位，因为同步 FFI 期间
+      // worker 收不到命令；现在原生侧自己起线程、worker 只是轮询，所以
+      // `cancel()` 的信号在下一轮轮询就传下去了。
+      expect(engine.cancelCalls, 1, reason: '按下停止必须真的去叫引擎停');
+      expect(state.extracting, isTrue, reason: '不是瞬间：要等原生侧在下一个进度点 unwind');
+      expect(state.toastMsg, contains('正在停止当前压缩包'));
 
-      gate.complete(); // 第一个包解完
+      gate.complete(); // 原生侧 unwind 完，这一次解压以「被中止」返回
       await drainExtract(state);
 
       expect(engine.rounds, 1, reason: '剩下两个包不该再开工 —— 停止没有「继续」');
       expect(state.extracting, isFalse);
       // 停在半路也要出总结卡片，而且标题必须说「停了」而不是「完成了」
       // （见 `home_screen.dart` 的 `_bannerTitle`）。那句「完成」是假话：三个
-      // 包只解了一个。
+      // 包一个都没解完。
       expect(state.outcome, BatchOutcome.stopped);
-      expect(state.completeDetail, contains('已完成 1/3 个压缩包'));
+      // **被中止的那个包不算「已完成」。** 它只在磁盘上留了半棵树（写到一半
+      // 的那个条目由原生侧删掉，但前面的条目已经落地），算进「已完成 N 个」
+      // 是句假话。所以这里是 0 而不是旧语义的 1。
+      expect(state.completeDetail, contains('已完成 0/3 个压缩包'));
+      // 也不是失败：这是我们照着用户的命令办的，不是程序坏了。
+      expect(state.failedCount, 0);
+      expect(
+        state.logs.any((l) => l.status == LogStatus.failed),
+        isFalse,
+        reason: '停止不是失败 —— 用户看到一排红字会以为程序坏了',
+      );
+      expect(
+        state.logs.any((l) => l.status == LogStatus.skipped),
+        isTrue,
+        reason: '日志要留下一条「用户停止」，让人回头能看出这批断在哪里',
+      );
       // 停止**也消费**这份快照：主按钮换成「更换目标」。真机验收时用户要求的
       // —— 从前的做法是放开闸门、回到「开始解压」，可那看起来像什么都没
       // 发生过，用户会以为点下去能接着解剩下两个。
@@ -868,7 +942,7 @@ void main() {
       final state = booted();
       state.stopExtract();
       expect(state.extracting, isFalse);
-      expect(state.toastMsg, isNull, reason: '没活儿在跑就不该冒一句「将在…停止」出来');
+      expect(state.toastMsg, isNull, reason: '没活儿在跑就不该冒一句「正在停止当前压缩包」出来');
     });
 
     t('解压途中被 dispose：不崩，批次正常收尾', () async {
@@ -924,7 +998,7 @@ void main() {
       state.stopExtract();
       gate.complete();
       await settle();
-      expect(state.extracting, isFalse, reason: '停止请求发出后当前包解完就该收尾');
+      expect(state.extracting, isFalse, reason: '停止请求发出后当前包被打断就该收尾');
 
       state.dispose();
       await settle(60);
@@ -1152,6 +1226,45 @@ void main() {
       // 分母跟着长：收尾必须报 2 个，不能只说开头那 1 个。
       expect(state.completeDetail, contains('2 个压缩包'));
       expect(state.outcome, BatchOutcome.clean);
+      expect(state.progress, 1.0);
+    });
+
+    t('解嵌套包时「递归层」跟着走；分母变大时进度如实回退', () async {
+      final root = tempRoot('as_nest_depth');
+      final outer = put(root, 'nested.zip', realZip({'readme.txt': 'x'}));
+      final innerPath = put(payload, 'inner.zip', realZip({'deep.txt': 'y'}));
+      final outerSize = File(outer).lengthSync();
+
+      final depthsDuring = <int>[];
+      final progressDuring = <double>[];
+      final gate = Completer<void>();
+      late AppState state;
+      final engine = FakeEngine()
+        ..nestedFor[resolveOutputDir(outer)] = [itemAt(innerPath, depth: 1)]
+        ..behavior = (e, outDir) async {
+          depthsDuring.add(state.depth);
+          progressDuring.add(state.progress);
+          if (e.rounds == 2) await gate.future;
+        };
+      state = AppState(engine: engine);
+      addTearDown(state.dispose);
+
+      await state.selectFolderPath(root.path);
+      state.startExtract();
+      // **不能只「推几轮微任务」**：外层解完到内层开工之间夹着一次真文件读
+      // —— 内层包有祖先集，出队时要 `archiveIdentity` 算指纹（见
+      // `app_state.dart` 里那段「身份是懒算的」）。真 IO 不是推 20 轮
+      // `Duration.zero` 定时器能盖住的，机器一忙就够不上（memory
+      // `fakeasync-real-io-trap` 是同一个坑）。所以等**条件**，不等轮数。
+      await waitUntil(() => depthsDuring.length == 2);
+
+      expect(depthsDuring, [0, 1], reason: '从前 _depth 从没被赋值过，界面恒为 0');
+      // 外层解完时是 100%，发现内层（100 B）之后分母变成 outer + 100。
+      expect(progressDuring.last, closeTo(outerSize / (outerSize + 100), 1e-9),
+          reason: '只进不退会让它卡在 100%，这正是用户看到的「进度条不对」');
+
+      gate.complete();
+      await drainExtract(state);
       expect(state.progress, 1.0);
     });
 

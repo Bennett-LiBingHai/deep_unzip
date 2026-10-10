@@ -46,6 +46,11 @@ void workerMain(SendPort toMain) {
       // 交换性命令（取消）优先于任务类命令，且不受 busy 影响。
       switch (message) {
         case CmdShutdown():
+          // **等在飞的任务收尾再关端口。** 解压那条路上，任务收尾就是
+          // `duz_close`，而只有它能 join C++ 那条解压线程 —— 关早了那条线程
+          // 就成了孤儿：还在往盘上写，却没人 join、没人 duz_close，而主 isolate
+          // 给的宽限期一到就会硬杀本 isolate。见 controller.dart 的 dispose()。
+          await state.drain();
           inbox.close();
           return;
         case CmdCancel():
@@ -55,11 +60,11 @@ void workerMain(SendPort toMain) {
           toMain.send(EvPong(token));
           return;
         case CmdScan():
-          await state.runScan(message);
+          await state.track(state.runScan(message));
         case CmdScanFiles():
-          await state.runScanFiles(message);
+          await state.track(state.runScanFiles(message));
         case CmdExtract():
-          await state.runExtract(message);
+          await state.track(state.runExtract(message));
       }
     } catch (e, st) {
       // 兜底：任何漏网的异常都不能让 worker 静默死掉 ——
@@ -88,6 +93,30 @@ class _WorkerState {
 
   void cancel() {
     _cancelEpoch++;
+  }
+
+  /// 正在跑的那个任务（没有则为 null）。[drain] 靠它等在飞任务收尾。
+  Future<void>? _current;
+
+  /// 把一次任务登记进来，好让 `CmdShutdown` 等得到它。
+  ///
+  /// 为什么需要这一手：`inbox.listen` 的回调虽然是 `async`，但流**不会**等它
+  /// —— 后续事件照样投递（这正是「解压期间 CmdCancel 处理得到」的机制）。
+  /// 所以「端口收到 CmdShutdown」完全不等于「任务已经跑完」。
+  Future<void> track(Future<void> task) {
+    _current = task;
+    return task.whenComplete(() {
+      if (identical(_current, task)) _current = null;
+    });
+  }
+
+  /// 等在飞任务收尾。每条命令都是自带 try/catch 的，所以这里不会吃到异常。
+  Future<void> drain() async {
+    for (;;) {
+      final task = _current;
+      if (task == null) return;
+      await task;
+    }
   }
 
   Future<void> runScan(CmdScan cmd) async {
@@ -186,19 +215,17 @@ class _WorkerState {
     }
 
     _busy = true;
-    // 解压本体（同步 FFI）期间取消进不来，但**之后的嵌套扫描是可以被打断的**
-    // ——那时命令循环是活的。所以这里如实捕获，让取消至少能中止扫描那一段。
     final epoch = _cancelEpoch;
 
     try {
       // ---- 第一层节流：合并进度 ----
-      // 这里刻意**不**用 Stopwatch 之外的东西：回调跑在解压线程上，
-      // 多算一点就多一分阻塞 7-Zip。所以 `TickMerger` 只做一次减法，
-      // 时间由这里读好再传进去。
+      // 这里刻意**不**用 Stopwatch 之外的东西：`onTick` 虽然跑在本 isolate 上，
+      // 但它是从轮询循环里同步调的，多算一点就多推后一次轮询。所以 `TickMerger`
+      // 只做一次减法，时间由这里读好再传进去。
       final merger = TickMerger(kExtractTickMerge);
       final clock = Stopwatch()..start();
 
-      final outcome = extractArchive(
+      final outcome = await extractArchive(
         parts: cmd.parts,
         outDir: cmd.outDir,
         password: cmd.password,
@@ -208,20 +235,20 @@ class _WorkerState {
           if (!merger.shouldEmit(clock.elapsed)) return;
           toMain.send(EvExtractTick(jobId: cmd.jobId, tick: tick));
         },
-        // P1 不支持解压中途取消：本回调同步跑在被堵住的 worker 上，
-        // 没有任何东西能在解压期间把「取消」写进这里。诚实返回 false，
-        // 而不是留个永远读不到的标志假装支持。
-        shouldCancel: () => false,
+        // 解压现在**能被中途取消**：`extractArchive` 是异步的（原生侧自己起
+        // 线程干活，这里只轮询），所以 worker 的事件循环在解压期间照样转，
+        // `CmdCancel` 一进来 `_cancelEpoch` 就变，下一次轮询把取消送到原生侧。
+        // 写法与 `runScan`/`runScanFiles` 逐字一致。
+        shouldCancel: () => epoch != _cancelEpoch,
       );
 
       // ---- 嵌套扫描（需求 1）----
       // 只在调用方要的时候做。**扫的是 outcome.outDir 而不是 cmd.outDir**：
       // 重名时前者才是真正落盘的那个目录。
       //
-      // 这一步跑在解压**之后**、和它同一轮 await 里，所以期间来的 CmdCancel
-      // 同样处理不到（和 CmdExtract 的限制一致）。扫描本身按文件数每
-      // kTickEveryFiles 才报一次，对大归档也不会把端口刷爆。
-      final done = cmd.recursive
+      // 被取消时**不做**这一步：用户已经喊停了，再去把刚解出来的半棵树扫一遍
+      // 是白费力气（`outcome.cancelled` 由原生快照给出，不是猜的）。
+      final done = cmd.recursive && !outcome.cancelled
           ? outcome.withNested(await _findNested(
               cmd: cmd,
               outDir: outcome.outDir,

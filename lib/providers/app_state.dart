@@ -280,6 +280,22 @@ class AppState extends ChangeNotifier {
   // 这几个都是**批次级**而不是「当前包」级的：进度条要在整批的尺度上单调
   // 前进，而每个包的字节计数是各自从 0 开始的。
   int _batchTotal = 0;
+
+  /// 进度条的分子分母，单位是**压缩包在磁盘上的字节数**（[ScanItem.sizeBytes]）。
+  ///
+  /// 用磁盘字节而不是包数：一个 1 KB 的包和一个 2 GB 的包不该各占一半进度条。
+  /// 用磁盘字节而不是未压缩字节：排队中的包只知道前者，后者要开包才知道，
+  /// 两者混着算量纲不一致。当前包内部的比例由 7-Zip 的未压缩计数给出，
+  /// 乘上这个包的权重折算进来（见 [_recomputeProgress]）。
+  ///
+  /// 分母随嵌套发现而变大（见 [_enqueueNested]），进度条会**如实回退** ——
+  /// 这是刻意的：只进不退的版本在「单个包里套了嵌套包」时会停在 100% 不动，
+  /// 那比倒退更像坏了。
+  int _bytesTotal = 0;
+  int _bytesDone = 0;
+
+  /// 正在解的那个包的权重（同 [_bytesTotal] 的单位）。
+  int _currentWeight = 0;
   DateTime? _batchStart;
   ProgressMeter _meter = ProgressMeter();
 
@@ -700,7 +716,7 @@ class AppState extends ChangeNotifier {
         // 先发任务再发取消，顺序不能反：控制器的取消只作用于「正在跑的
         // 任务」（`_activeJob == null` 时直接返回），worker 也只在 runScan
         // 捕获 epoch 之后才认这个信号。两条消息走同一个端口，顺序有保证。
-        unawaited(engine.cancelScan());
+        unawaited(engine.cancel());
       }
       final out = await pending;
       _applyScan(out.summary, out.elapsed);
@@ -800,7 +816,7 @@ class AppState extends ChangeNotifier {
   void cancelScan() {
     if (!_scanning) return;
     _cancelRequested = true;
-    unawaited(_engine?.cancelScan() ?? Future<void>.value());
+    unawaited(_engine?.cancel() ?? Future<void>.value());
   }
 
   /// Android 上递归读目录需要「所有文件访问权限」（API 30+）或
@@ -893,25 +909,34 @@ class AppState extends ChangeNotifier {
     unawaited(_runExtractBatch());
   }
 
-  /// 停下这一批。**粒度是「包与包之间」**，不是条目级。
+  /// 停下这一批。**当前这个包会被真正打断**，不用等它解完。
   ///
-  /// 之所以做不到条目级：`duz_extract_all` 是一次同步 FFI 调用，跑起来就
-  /// 不回头，中途没有任何 Dart 代码能被执行（见 [CmdExtract] 的说明）。
-  /// 能做到的是「当前这个包解完就停」。对多数场景够用，但一个大包可能要
-  /// 等上几十秒才真的停下来 —— UI 上要如实说这一点，别让用户以为按下去
-  /// 就立刻停了（那颗按钮的文案因此是「停止解压」而不是「已停止」）。
+  /// 之所以现在做得到：解压跑在原生侧自己的线程上，worker 只是轮询，所以
+  /// `cancel()` 的信号在下一轮轮询就送到引擎，7-Zip 在下一个进度点 unwind
+  /// （见 [CmdExtract] 的说明）。粒度是条目/块边界，不是字节级 —— 已解好的
+  /// 完整文件都留着，写到一半的那一个由原生侧删掉，所以停下之后不会留下
+  /// 一个长度不对的文件。
+  ///
+  /// 仍然**不是瞬间**的：7-Zip 要在下一个进度点才看得到标志，大块头的包可能
+  /// 要几百毫秒。所以按钮文案是「停止解压」而不是「已停止」。
   ///
   /// **停下就是停下，没有「继续」。** 剩下没解的包直接丢掉，用户想接着来
   /// 只能重新选文件夹（那会重新扫描，拿到一份新快照）。原先这里是一对
   /// `pauseExtract`/`resumeExtract`，暂停闸门让队列原封不动地等着；用户
   /// 明确要求「不需要暂停，要么继续、要么停止」，于是收敛成这一条不可恢复
   /// 的停止 —— 与弹窗里那颗「停止」走的是同一条路（都是 `_cancelRequested`）。
+  ///
+  /// 那颗按钮按下去时会走的另一条路是 [cancelScan]（正在扫的时候），两者
+  /// 共用 `_cancelRequested` 这一个位。
   void stopExtract() {
     if (!_extracting || _cancelRequested) return;
     _cancelRequested = true;
     _stoppedByUser = true;
+    // **真的要引擎停**，不能只置标志 —— 从前这里只置标志是因为引擎收不到，
+    // 而现在收得到（见上面那段）。没起来时是空操作，与 [cancelScan] 同一个写法。
+    unawaited(_engine?.cancel() ?? Future<void>.value());
     _notify();
-    showToast('将在当前压缩包解压完成后停止');
+    showToast('正在停止当前压缩包…');
   }
 
   // ---------------------------------------------------------------------------
@@ -1057,6 +1082,22 @@ class AppState extends ChangeNotifier {
           limits: limits,
           availableBytes: availableBytes,
         );
+        // **被中止的解压绝不是「成功」，必须变成异常再往外走。**
+        //
+        // 这条不能省成「把 outcome 原样返回上去、上层看 `cancelled`」：上面那段
+        // `verify` 闭包把「拿到 outcome」直接当成「这个密码是对的」，而试密码
+        // 本身就是一次 `engine.extract`（`duz_verify_password` 仍是
+        // UNSUPPORTED）。返回值式取消走到那里，弹窗会认定「这个密码对」并记
+        // 一次密码库命中 —— **静默假绿**。
+        //
+        // 抛异常之后它穿过本函数的六个成功出口自动传播，一处都不用逐个改；
+        // 又因为 `ExtractCancelled` 刻意不继承 [EngineException]，下面那条
+        // `on EngineException` 和 `verify` 里的 `outcome == null` 都接不住它。
+        //
+        // 位置也很要紧：**必须在下面那段「成功即记」之前** —— 一次被中止的
+        // 解压什么都没验证，不该往密码库里塞东西。
+        if (outcome.cancelled) throw const ExtractCancelled();
+
         // 成功即记 —— 这里是**唯一**知道「哪个密码真的管用」的地方：密码库
         // 命中、手输验过、手输兜底重试三条路都从这儿过，所以挂一次就全盖住了。
         // 空密码那次不记（它回答的是「压根不要密码」，而它本来就排在全部候选
@@ -1265,9 +1306,13 @@ class AppState extends ChangeNotifier {
     // [_runGoodPasswords]。
     _runGoodPasswords.clear();
     _batchTotal = queue.length;
+    _bytesTotal = queue.fold(0, (sum, t) => sum + _weightOf(t.item));
+    _bytesDone = 0;
+    _currentWeight = 0;
     _doneCount = 0;
     _progress = 0;
     _speed = 0;
+    _depth = 0;
     _eta = '--';
     _currentFile = queue.first.item.fileName;
     _entryName = '';
@@ -1328,11 +1373,18 @@ class AppState extends ChangeNotifier {
 
         final task = queue.removeFirst();
         final item = task.item;
+        // 上一个包（无论成败跳过）已经处理完，它的权重整个算进分子。
+        _bytesDone += _currentWeight;
+        _currentWeight = _weightOf(item);
         _currentFile = item.fileName;
         _entryName = '';
+        _depth = item.depth;
+        // 剩余时间是**这个包**的：上一个包的那个数到这里已经作废。
+        _eta = '--';
         // 每个包重开一次表：包的字节计数是各自从 0 开始的，
         // 不重开的话下一个包的第一条 tick 会被当成「计数器回退」。
         _meter.reset();
+        _recomputeProgress(0);
         _notify();
 
         // 身份是**懒算**的，只有真用得上时才读文件。这个包自己的身份有两个
@@ -1451,6 +1503,25 @@ class AppState extends ChangeNotifier {
               maxDepth: maxDepth,
             );
           }
+        } on ExtractCancelled {
+          // 用户按了「停止」，**当前这个包被真的打断了**（不是等它解完）。
+          //
+          // 它既不是失败、也不算完成：
+          //   - 不计 `_doneCount` —— 那个数在界面上是「已完成 N 个」，而它只在
+          //     磁盘上留了半棵树，算完成是句假话；
+          //   - 不 `failed++` —— 这是我们照着用户的命令办的，不是程序坏了。
+          //
+          // 日志如实记一条「用户停止」，让用户回头能看出这批断在哪里。
+          _addLog(buildExtractLog(
+            item: item,
+            skippedReason: '用户停止',
+            now: DateTime.now(),
+          ));
+          // 防御性置位：正常情况下它早就为真了（取消是从 [stopExtract] /
+          // `cancelScan` 那条路来的），但**收场性质完全由它派生** —— 万一有一
+          // 条路没置位，这里不补的话，一批被打断的解压会显示成「全部完成」。
+          _cancelRequested = true;
+          break;
         } on _PasswordVerdict catch (v) {
           // 密码这条路走完之后的三种非成功收场。**走异常而不走返回值**，是为了
           // 让下面那段 `on EngineException catch`（坏包、闸门、弹窗问跳过/停止）
@@ -1649,9 +1720,10 @@ class AppState extends ChangeNotifier {
       }
       queue.add(_ExtractTask(item: child, ancestors: childAncestors));
       _appendNested(child);
+      _bytesTotal += _weightOf(child);
     }
 
-    // 分母跟着长。进度条会因此回退，所以 [_onExtractTick] 里做了单调钳制。
+    // 分母跟着长，进度条会因此如实回退（见 [_bytesTotal]）。
     _batchTotal = _doneCount + queue.length;
     return skipped;
   }
@@ -1757,6 +1829,24 @@ class AppState extends ChangeNotifier {
   void _onExtractTickBackground(ExtractTick tick) =>
       _onExtractTick(tick, quiet: true);
 
+  /// 一个包在进度条上占多少（单位见 [_bytesTotal]）。
+  ///
+  /// 至少记 1：量不到大小（0）的包也是一份活，不能让它在进度条上隐形。
+  static int _weightOf(ScanItem item) => item.sizeBytes > 0 ? item.sizeBytes : 1;
+
+  /// 整批进度 = (已处理完的包的权重 + 当前包权重 × 当前包内部比例) ÷ 总权重。
+  ///
+  /// 当前包的内部比例来自 7-Zip 的未压缩计数，与权重的量纲不同 —— 但它只是
+  /// 个 0..1 的比例，乘上权重之后就回到同一个单位了。
+  void _recomputeProgress(double currentFraction) {
+    if (_bytesTotal <= 0) {
+      _progress = 0;
+      return;
+    }
+    final done = _bytesDone + _currentWeight * currentFraction.clamp(0.0, 1.0);
+    _progress = (done / _bytesTotal).clamp(0.0, 1.0);
+  }
+
   /// 引擎解压进度回调。已经被控制器按 8Hz 节流过。
   ///
   /// [quiet] 为真表示这份进度是从**后台**来的（见
@@ -1764,10 +1854,8 @@ class AppState extends ChangeNotifier {
   /// 唯独不发那个会重建四棵树的 `_notify()`。
   void _onExtractTick(ExtractTick tick, {bool quiet = false}) {
     final now = DateTime.now();
-    // 表只跟踪**当前这个包**，所以整批的进度是
-    // 「已完成的包数 + 当前包的内部比例」÷ 总包数。
-    // 直接用未压缩字节当整批分母是不行的：扫描时拿到的是**压缩后**大小，
-    // 两个数不同量纲，比值会大于 1。
+    // 表只跟踪**当前这个包**；整批的进度由 [_recomputeProgress] 按包的
+    // 磁盘大小加权合成。
     _meter.update(
       doneBytes: tick.doneBytes,
       totalBytes: tick.totalBytes,
@@ -1776,13 +1864,11 @@ class AppState extends ChangeNotifier {
     );
     final snap = _meter.snapshot();
 
-    final inFlight =
-        _batchTotal == 0 ? 0.0 : (_doneCount + snap.progress) / _batchTotal;
-    // **单调**：分母会随嵌套发现而变大（见 [_enqueueNested]），原始比值
-    // 因此会回退 —— 进度条倒着走比走得慢更像是坏了。所以只许前进。
-    final clamped = inFlight.clamp(0.0, 1.0);
-    if (clamped > _progress) _progress = clamped;
-    _speed = snap.speedBytesPerSecond;
+    _recomputeProgress(snap.progress);
+    // 表里存的是字节/秒，而页面拼的单位是 MB/s —— 从前这里直接塞字节数，
+    // 于是界面上出现一个大得离谱的「MB/s」。
+    _speed = bytesPerSecondToMBps(snap.speedBytesPerSecond);
+    // 表每个包重开一次，所以这是**当前这个包**还剩多久，不是整批。
     _eta = formatEta(_meter.eta);
     _entryName = snap.entryName;
     if (!quiet) _notify();

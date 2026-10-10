@@ -114,14 +114,28 @@ int32_t duz_verify_password(duz_ctx* ctx, const char* pwd) {
   return DUZ_ERR_UNSUPPORTED;
 }
 
-int32_t duz_extract_all(duz_ctx* ctx, const char* outDir, duz_progress_cb cb,
-                        void* userData) {
+int32_t duz_extract_start(duz_ctx* ctx, const char* outDir) {
   (void)ctx;
   (void)outDir;
-  (void)cb;
-  (void)userData;
   return DUZ_ERR_UNSUPPORTED;
 }
+
+// 骨架版照实填「已经结束、而且是没编进来的那种失败」—— 调用方（Dart 侧）只看
+// 快照，不再看回调，所以这里必须把结局写全，不能留个 running=1 让它永远转圈。
+int32_t duz_extract_poll(duz_ctx* ctx, duz_progress_snapshot* out,
+                         char* nameBuf, int32_t nameBufLen) {
+  (void)ctx;
+  if (!out) return DUZ_ERR_ARG;
+  out->done = 0;
+  out->total = 0;
+  out->running = 0;
+  out->cancelled = 0;
+  out->rc = DUZ_ERR_UNSUPPORTED;
+  if (nameBuf && nameBufLen > 0) nameBuf[0] = '\0';
+  return DUZ_OK;
+}
+
+void duz_extract_cancel(duz_ctx* ctx) { (void)ctx; }
 
 void duz_close(duz_ctx* ctx) { delete ctx; }
 
@@ -145,9 +159,11 @@ int32_t duz_version(char* buf, int32_t bufLen) {
 // 真实实现（Android）
 // ---------------------------------------------------------------------------
 
+#include <atomic>
 #include <deque>
 #include <mutex>
 #include <string>
+#include <thread>
 
 #include "7zVersion.h"  // 7-Zip 自己的版本宏，免得我们手抄一份还写歪
 
@@ -270,11 +286,7 @@ class DuzExtractCallback final : public IFolderArchiveExtractCallback,
 
  public:
   duz_ctx* Ctx;
-  duz_progress_cb Progress;
-  void* UserData;
 
-  UInt64 UnpackTotal;
-  std::string CurrentName;  // UTF-8，给 progress 回调用
   UInt32 FailedCount;
   bool SawWrongPassword;
 
@@ -292,7 +304,7 @@ class DuzExtractCallback final : public IFolderArchiveExtractCallback,
   // 在两边都构造完之后接上，所以这里给 nullptr 兜底。
   CArchiveExtractCallback* Ecs = nullptr;
 
-  // 失败清理的战果，用于如实汇报（见 duz_extract_all 结尾）。
+  // 失败清理的战果，用于如实汇报（见 RunExtract 结尾）。
   UInt32 RemovedCount = 0;        // 删掉的损坏文件数
   UInt32 RemoveFailedCount = 0;   // 想删但没删掉的（不是文件不存在）
 
@@ -300,11 +312,8 @@ class DuzExtractCallback final : public IFolderArchiveExtractCallback,
   // 解压。但**开头几条必须全留** —— 卡死的位置几乎总在最前面。
   unsigned long long ReportCalls;
 
-  DuzExtractCallback(duz_ctx* ctx, duz_progress_cb cb, void* userData)
+  explicit DuzExtractCallback(duz_ctx* ctx)
       : Ctx(ctx),
-        Progress(cb),
-        UserData(userData),
-        UnpackTotal(0),
         FailedCount(0),
         SawWrongPassword(false),
         SawEncryptedDataError(false),
@@ -323,22 +332,15 @@ class DuzExtractCallback final : public IFolderArchiveExtractCallback,
   /// 条目，把其余全删掉是另一种伤害。
   void RemoveFailedOutput();
 
-  HRESULT Report(UInt64 done) {
-    if (!Progress) return S_OK;
-    ++ReportCalls;
-    if (ReportCalls <= 8 || (ReportCalls % 500) == 0) {
-      DUZ_LOG("Report #%llu done=%llu total=%llu name=%s", ReportCalls,
-              (unsigned long long)done, (unsigned long long)UnpackTotal,
-              CurrentName.empty() ? "(none)" : CurrentName.c_str());
-    }
-    if (Progress(UserData, done, UnpackTotal,
-                 CurrentName.empty() ? nullptr : CurrentName.c_str()) != 0) {
-      DUZ_LOG("Report: 回调要求取消");
-      Cancelled = true;
-      return E_ABORT;
-    }
-    return S_OK;
-  }
+  /// 一次进度上报。**这是整个文件里最热的函数**，而它会被 7-Zip 的多线程解码器
+  /// 从**它自己的工作线程**上调用（见 duz_engine.h 顶上那段线程约定，也是这次
+  /// 改造的由来）。所以这里只做两件原子操作，**一次锁都不拿** —— 上游把
+  /// `MTDEC_ProgessStep` 置成了 `1<<0`（`C/MtDec.c:235`），几乎每轮都报，一次
+  /// 互斥锁就能把多线程解码拖回单线程的速度。
+  /// 定义在线外（见下面 `DuzExtractCallback::Report`）：`duz_ctx` 的完整定义
+  /// 排在本类**之后**，而这里要访问它的成员 —— 写在类里就成了「对不完整类型
+  /// 取成员」，编不过。
+  HRESULT Report(UInt64 done);
 };
 
 }  // namespace
@@ -415,6 +417,70 @@ struct duz_ctx {
   IInArchive* Archive() const {
     return arcLink.Arcs.IsEmpty() ? nullptr : arcLink.Arcs.Back().Archive;
   }
+
+  // ---- 解压线程与进度快照（见 duz_engine.h 的 start / poll / cancel）----
+  //
+  // 为什么要自己起线程而不是就在调用线程上解：7-Zip 的多线程解码器会从它
+  // 自己的 pthread_create 线程里报进度，而 Dart 的 isolateLocal 回调只能被
+  // isolate 所在线程调用 —— 从别的线程调就是 VM FATAL、进程消失。让原生侧
+  // 起线程、Dart 用普通 FFI 轮询取快照，两边就再也不共享一个回调蹦床了。
+  std::thread worker;
+  // 进度只走原子、名字才上锁 —— 分工见 DuzExtractCallback::Report 的说明。
+  std::atomic<uint64_t> progDone{0};
+  std::atomic<uint64_t> progTotal{0};
+  std::atomic<int> cancelFlag{0};
+  std::atomic<bool> threadDone{false};
+  std::mutex nameMutex;
+  std::string curName;   // UTF-8 的当前条目名
+
+  bool started = false;  // 一个 ctx 只解一次（见 duz_engine.h 的契约）
+  bool joined = false;   // 线程已被 join 过（poll 与 close 里各判一次）
+  // 线程的结局。只在 join 之后读，所以不需要原子。
+  int32_t finRc = DUZ_OK;
+  bool finCancelled = false;
+  std::string finMsg;
+  bool finUncertain = false;
+
+  bool CancelRequested() const {
+    return cancelFlag.load(std::memory_order_seq_cst) != 0;
+  }
+
+  void NoteTotal(uint64_t total) {
+    progTotal.store(total, std::memory_order_relaxed);
+  }
+
+  /// done 只增不减：多线程解码时几条工作线程会各自报同一个全局计数，
+  /// 交错之下偶尔会先看到一个较大的值再看到较小的 —— 进度条必须单调。
+  void NoteDone(uint64_t done) {
+    uint64_t prev = progDone.load(std::memory_order_relaxed);
+    while (done > prev &&
+           !progDone.compare_exchange_weak(prev, done,
+                                           std::memory_order_relaxed)) {
+    }
+  }
+
+  void SetCurrentName(const std::string& n) {
+    std::lock_guard<std::mutex> g(nameMutex);
+    curName = n;
+  }
+
+  std::string CurrentNameSnapshot() {
+    std::lock_guard<std::mutex> g(nameMutex);
+    return curName;
+  }
+
+  /// 把当前条目名写进调用方的缓冲（UTF-8，截断到 len-1 字节）。
+  void CopyNameInto(char* buf, int32_t len) {
+    if (!buf || len <= 0) return;
+    std::lock_guard<std::mutex> g(nameMutex);
+    const size_t n = curName.size() < (size_t)(len - 1) ? curName.size() : (size_t)(len - 1);
+    if (n) memcpy(buf, curName.data(), n);
+    buf[n] = '\0';
+  }
+
+  /// 解压线程主体：就是原先 duz_extract_all 的整个函数体。
+  /// **绝不把异常抛出去** —— std::thread 里漏出的异常会 std::terminate。
+  void RunExtract(const char* outDir);
 };
 
 namespace {
@@ -440,7 +506,7 @@ HRESULT DuzOpenCallback::Open_CryptoGetTextPassword(BSTR* password) {
 Z7_COM7F_IMF(DuzExtractCallback::SetTotal(UInt64 total)) {
   // 7-Zip 报的 total 是「未压缩总量」，与我们的进度语义一致，直接转发。
   DUZ_LOG("SetTotal total=%llu", (unsigned long long)total);
-  UnpackTotal = total;
+  Ctx->NoteTotal(total);
   return Report(0);
 }
 
@@ -462,11 +528,14 @@ Z7_COM7F_IMF(DuzExtractCallback::AskOverwrite(
 Z7_COM7F_IMF(DuzExtractCallback::PrepareOperation(
     const wchar_t* name, Int32 isFolder, Int32 askExtractMode,
     const UInt64* position)) {
-  CurrentName = name ? UToUtf8(UString(name)) : std::string();
+  const std::string current = name ? UToUtf8(UString(name)) : std::string();
+  // 低频（每条目一次），所以这儿拿锁没问题 —— 与 Report 里那条「一次锁都不拿」
+  // 的分工是刻意的：热路径只碰原子，名字这种结构化数据才上锁。
+  Ctx->SetCurrentName(current);
   DUZ_LOG("PrepareOperation mode=%d folder=%d pos=%d name=%s", (int)askExtractMode,
           (int)isFolder,
           position ? (int)*position : -1,
-          CurrentName.empty() ? "(none)" : CurrentName.c_str());
+          current.empty() ? "(none)" : current.c_str());
   return S_OK;
 }
 
@@ -479,8 +548,9 @@ Z7_COM7F_IMF(DuzExtractCallback::MessageError(const wchar_t* message)) {
 }
 
 Z7_COM7F_IMF(DuzExtractCallback::SetOperationResult(Int32 opRes, Int32 encrypted)) {
+  const std::string name = Ctx ? Ctx->CurrentNameSnapshot() : std::string();
   DUZ_LOG("SetOperationResult opRes=%d enc=%d name=%s", (int)opRes, (int)encrypted,
-          CurrentName.empty() ? "(none)" : CurrentName.c_str());
+          name.empty() ? "(none)" : name.c_str());
   if (opRes == NArchive::NExtract::NOperationResult::kOK) return S_OK;
 
   // 「密码不对」有三种表现，都要认出来，否则 Dart 那边换不了下一个候选。
@@ -572,6 +642,25 @@ Z7_COM7F_IMF(DuzExtractCallback::SetOperationResult(Int32 opRes, Int32 encrypted
   // 到这里这个条目的输出已经在盘上了（7-Zip 在调用我们之前跑过
   // CloseReparseAndFile），而它已经被判为坏的 —— 清掉。
   RemoveFailedOutput();
+  return S_OK;
+}
+
+HRESULT DuzExtractCallback::Report(UInt64 done) {
+  if (!Ctx) return S_OK;
+  ++ReportCalls;
+  Ctx->NoteDone(done);
+  if (ReportCalls <= 8 || (ReportCalls % 500) == 0) {
+    const std::string name = Ctx->CurrentNameSnapshot();
+    DUZ_LOG("Report #%llu done=%llu total=%llu name=%s", ReportCalls,
+            (unsigned long long)done,
+            (unsigned long long)Ctx->progTotal.load(std::memory_order_relaxed),
+            name.empty() ? "(none)" : name.c_str());
+  }
+  if (Ctx->CancelRequested()) {
+    DUZ_LOG("Report: 收到取消请求，中止");
+    Cancelled = true;
+    return E_ABORT;
+  }
   return S_OK;
 }
 
@@ -922,18 +1011,24 @@ int32_t duz_verify_password(duz_ctx* ctx, const char* pwd) {
   return DUZ_ERR_UNSUPPORTED;
 }
 
-int32_t duz_extract_all(duz_ctx* ctx, const char* outDir, duz_progress_cb cb,
-                        void* userData) {
-  if (!ctx || !outDir || !outDir[0] || !ctx->AnyArchiveOpen()) return DUZ_ERR_ARG;
+}  // extern "C"（先收起来：RunExtract 是个 C++ 成员函数，不能挂在 C 语言链接下）
 
-  const CArc& arc = ctx->arcLink.Arcs.Back();
+// 解压线程主体。跑在**自己的线程**上，所以这里的所有局部都只属于这一条线程；
+// 唯一跨线程的东西是 ctx 里那几个原子与那把名字锁，以及结尾发布的结局。
+void duz_ctx::RunExtract(const char* outDir) {
+  int32_t code = DUZ_OK;
+  std::string msg;
+  bool cancelled = false;
+  bool uncertain = false;
+
+  try {
+  const CArc& arc = arcLink.Arcs.Back();
   IInArchive* archive = arc.Archive;
 
-  DUZ_LOG("== duz_extract_all 进入 outDir=%s packTotal=%llu arcs=%u cb=%p", outDir,
-          (unsigned long long)ctx->packTotal, (unsigned)ctx->arcLink.Arcs.Size(),
-          (void*)cb);
+  DUZ_LOG("== duz_extract 进入 outDir=%s packTotal=%llu arcs=%u", outDir,
+          (unsigned long long)packTotal, (unsigned)arcLink.Arcs.Size());
 
-  DuzExtractCallback* spec = new DuzExtractCallback(ctx, cb, userData);
+  DuzExtractCallback* spec = new DuzExtractCallback(this);
   CMyComPtr<IFolderArchiveExtractCallback> specRef = spec;
 
   CArchiveExtractCallback* ecs = new CArchiveExtractCallback;
@@ -970,8 +1065,7 @@ int32_t duz_extract_all(duz_ctx* ctx, const char* outDir, duz_progress_cb cb,
 
   DUZ_LOG("Init 之前");
   ecs->Init(nt, nullptr, &arc, spec, false /*stdOut*/, false /*testMode*/,
-            outDirFs, UStringVector() /*removePathParts*/, false,
-            ctx->packTotal);
+            outDirFs, UStringVector() /*removePathParts*/, false, packTotal);
   DUZ_LOG("Init 之后");
 
   CArchiveExtractCallback_Closer closer(ecs);
@@ -986,23 +1080,33 @@ int32_t duz_extract_all(duz_ctx* ctx, const char* outDir, duz_progress_cb cb,
   DUZ_LOG("archive->Extract 调用");
   HRESULT res = archive->Extract(nullptr, (UInt32)(Int32)-1, 0, aec);
   DUZ_LOG("archive->Extract 返回 res=0x%08X", (unsigned)res);
+  // 被中止时那个**写了一半的条目**必须删掉，而且要赶在 closer.Close() 之前 ——
+  // E_ABORT 是在条目写入中途 unwind 的，此刻 7-Zip 连那个同名文件的句柄都还开着，
+  // 而 `CArchiveExtractCallback::Close()` 只做截断/改时间戳，**不删文件**。放任
+  // 不管的话输出目录里会躺着一个「名字对、长度不对」的截断文件，正是
+  // RemoveFailedOutput 那段注释里说的「静默给出错误数据」。POSIX 上先 unlink 再
+  // 关句柄是安全的（这一支只在 Android 编，见 DUZ_HAS_7ZIP）。
+  if (spec->Cancelled || res == E_ABORT) spec->RemoveFailedOutput();
+
   const HRESULT res2 = closer.Close();
   DUZ_LOG("closer.Close() 返回 res2=0x%08X", (unsigned)res2);
   if (res == S_OK) res = res2;
 
-  int32_t code = DUZ_OK;
-  std::string msg;
-  if (spec->Cancelled) {
-    code = DUZ_ERR_EXTRACT;
-    msg = "已取消";
-  } else if (res == E_ABORT) {
-    code = DUZ_ERR_EXTRACT;
-    msg = "已取消";
+  if (spec->Cancelled || res == E_ABORT) {
+    // **取消不是错误**：rc 留在 DUZ_OK，只把 cancelled 那一位置起来。用户按的
+    // 是「停止」，不是「这个包坏了」—— 把它当失败会让批次处理器记一条失败日志、
+    // 计一次失败数。快照里那两个字段是分开的正是为了这件事（见 duz_engine.h）。
+    cancelled = true;
+    msg = spec->RemovedCount > 0 ? "已停止，写到一半的那个文件已删除" : "已停止";
+    if (spec->RemoveFailedCount > 0) {
+      msg += "；另有 1 个写到一半的文件未能删除，请手动清理输出目录";
+    }
   } else if (spec->SawWrongPassword) {
     code = DUZ_ERR_PASSWORD;
     // 猜出来的那一档（7z）留活口：错密码和坏数据在里面长得一模一样，硬写
     // 「密码错误」等于把另一种可能说死。ZIP / RAR5 是 7-Zip 亲口报的，照旧。
     msg = spec->SawEncryptedDataError ? "密码不对，或加密数据已损坏" : "密码错误";
+    uncertain = spec->SawEncryptedDataError;
   } else if (spec->FailedCount > 0) {
     code = DUZ_ERR_EXTRACT;
     msg = spec->FirstError.empty() ? "解压过程中有条目失败" : spec->FirstError;
@@ -1013,29 +1117,101 @@ int32_t duz_extract_all(duz_ctx* ctx, const char* outDir, duz_progress_cb cb,
 
   // 接上失败清理的战果。**必须如实说**：文案在讲「失败了」，可目录里到底还剩
   // 什么、坏的那份清掉没有，只有这几句能告诉用户 —— 他没有任何别的渠道看出来。
-  if (spec->RemovedCount > 0) {
-    msg += "，已删除 " + std::to_string(spec->RemovedCount) + " 个损坏文件";
-  }
-  if (spec->RemoveFailedCount > 0) {
-    msg += "，另有 " + std::to_string(spec->RemoveFailedCount) +
-           " 个损坏文件未能删除，请手动清理输出目录";
+  // （取消那一条上面已经写了，别重复计一遍。）
+  if (!cancelled) {
+    if (spec->RemovedCount > 0) {
+      msg += "，已删除 " + std::to_string(spec->RemovedCount) + " 个损坏文件";
+    }
+    if (spec->RemoveFailedCount > 0) {
+      msg += "，另有 " + std::to_string(spec->RemoveFailedCount) +
+             " 个损坏文件未能删除，请手动清理输出目录";
+    }
   }
 
-  // 第三个参数是**说法**，不是策略：它只让 Dart 那边的文案别替用户断定「密码
-  // 不对」。`SawEncryptedDataError` 只在 `SawWrongPassword` 为真时被置位，而上面
-  // 的判定链把 `SawWrongPassword` 排在 `FailedCount` 之前，所以它为真时 code 必然
-  // 是 DUZ_ERR_PASSWORD —— 这条不变量是 duz_engine.h 里那个契约的落点。
-  if (code != DUZ_OK) {
-    SetOpenError(code, msg.c_str(), spec->SawEncryptedDataError);
-  }
-  DUZ_LOG("== duz_extract_all 退出 code=%d uncertain=%d Report回调=%llu 失败条目=%u",
-          (int)code, (int)(code == DUZ_ERR_PASSWORD && spec->SawEncryptedDataError),
+  DUZ_LOG("== RunExtract 退出 code=%d cancelled=%d uncertain=%d "
+          "Report回调=%llu 失败条目=%u",
+          (int)code, cancelled ? 1 : 0, uncertain ? 1 : 0,
           (unsigned long long)spec->ReportCalls, (unsigned)spec->FailedCount);
-  return code;
+
+  } catch (...) {
+    // `std::thread` 里漏出去的异常会 `std::terminate` **整个进程**，所以这一层
+    // 必须兜住 —— 它是「解压崩了也不该带着 Dart 一起死」的最后一道闸。
+    code = DUZ_ERR_EXTRACT;
+    cancelled = false;
+    uncertain = false;
+    msg = "解压内部异常";
+    DUZ_LOG("RunExtract: 捕获到异常，本次解压中止");
+  }
+
+  // 结局在这儿发布，等 poll（或 close）来取并 join。
+  //
+  // **这一层绝不能调 SetOpenError**：它写的是 thread_local，而此刻跑的是这条
+  // 解压线程 —— Dart 在**调用线程**上读那三件套，读到的只会是别的值。把结局
+  // 搬过去这件事由 duz_extract_poll 在 join 之后做（见那边的说明），这也正是
+  // 新架构下唯一还需要 thread_local 的地方。
+  finRc = code;
+  finCancelled = cancelled;
+  finUncertain = uncertain;
+  finMsg = msg;
+  threadDone.store(true, std::memory_order_release);
+}
+
+extern "C" {
+
+int32_t duz_extract_start(duz_ctx* ctx, const char* outDir) {
+  if (!ctx || !outDir || !ctx->AnyArchiveOpen()) return DUZ_ERR_ARG;
+  if (ctx->started) return DUZ_ERR_ARG;  // 一个 ctx 只解一次（见 duz_engine.h）
+  ctx->started = true;
+
+  // 路径**按值**捕进 lambda：Dart 递下来的那份缓冲随时可能失效，而这条线程
+  // 要活到解压结束。ctx 是裸指针，但它的生存期由 duz_close 保证 —— 而
+  // duz_close 会先 join 这条线程（见下）。
+  std::string dir(outDir);
+  ctx->worker = std::thread([ctx, dir] { ctx->RunExtract(dir.c_str()); });
+  return DUZ_OK;
+}
+
+int32_t duz_extract_poll(duz_ctx* ctx, duz_progress_snapshot* out,
+                         char* nameBuf, int32_t nameBufLen) {
+  if (!ctx || !out) return DUZ_ERR_ARG;
+  if (nameBuf && nameBufLen > 0) nameBuf[0] = '\0';
+
+  // `joined` 只让这件事发生一次；之后的每次 poll 都是幂等的（同样的 rc）。
+  if (ctx->threadDone.load(std::memory_order_acquire) && !ctx->joined) {
+    if (ctx->worker.joinable()) ctx->worker.join();
+    ctx->joined = true;
+    // 把失败原因搬进**调用线程**的 thread_local：于是 Dart 侧
+    // `_readLastError()` / `_readLastErrorUncertain()` 一个字都不用改，与
+    // `duz_open` 失败时完全同源。**必须紧挨着 join 之后**，中间不能有 await
+    // 能插进来的位置 —— 这是 dart 侧那句「三件套紧挨着读」的镜像。
+    if (ctx->finRc != DUZ_OK) {
+      SetOpenError(ctx->finRc, ctx->finMsg.c_str(), ctx->finUncertain);
+    }
+  }
+
+  ctx->CopyNameInto(nameBuf, nameBufLen);
+
+  out->done = ctx->progDone.load(std::memory_order_relaxed);
+  out->total = ctx->progTotal.load(std::memory_order_relaxed);
+  out->running = ctx->threadDone.load(std::memory_order_acquire) ? 0 : 1;
+  out->cancelled = ctx->finCancelled ? 1 : 0;
+  out->rc = ctx->finRc;
+  return DUZ_OK;
+}
+
+void duz_extract_cancel(duz_ctx* ctx) {
+  if (!ctx) return;
+  // 幂等，可从任意线程调：解压线程在下一个进度点看到它就会 unwind。
+  ctx->cancelFlag.store(1, std::memory_order_seq_cst);
 }
 
 void duz_close(duz_ctx* ctx) {
   if (!ctx) return;
+  // **先收线程、再拆归档**，顺序反了就是 use-after-free —— 那条线程正拿着
+  // `arcLink` 里的 archive 在解压。Dart 若在出错路径上没 poll 到最后一次，join
+  // 就落在这里；所以随时 duz_close 都安全（见 duz_engine.h 的生命周期那一段）。
+  ctx->cancelFlag.store(1, std::memory_order_seq_cst);
+  if (ctx->worker.joinable()) ctx->worker.join();
   ctx->arcLink.Close();
   delete ctx;
 }

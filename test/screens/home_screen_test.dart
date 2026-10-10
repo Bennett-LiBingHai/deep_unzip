@@ -371,19 +371,26 @@ void main() {
       expect(state.extracting, isTrue);
       expect(label(), '停止解压');
 
-      // 点一下 = 请求停止。**不是暂停** —— 这一档不可恢复，当前包解完就收摊，
+      // 点一下 = 停止。**不是暂停** —— 这一档不可恢复，当前包被真正打断，
       // 队列里剩下的直接丢掉，所以按钮写的就是「停止」这两个字。从前这里
       // 是「暂停 / 继续」两颗交替，用户明确要求去掉：弹窗里那颗「继续」已经
       // 承担了「接着跑」的意思，主按钮再留一个「继续」就重了。
       await tester.tap(find.byType(PrimaryButton));
       await pumpFrames(tester, 4);
 
-      // 停止的粒度是「当前包解完之后」，所以按下这一刻批次还没结束，按钮也
-      // 不变 —— 它只是不再重复发请求（`stopExtract` 开头就挡了回去）。
-      expect(state.extracting, isTrue, reason: '当前包还在解，不能硬杀');
-      expect(label(), '停止解压');
+      // **取消真的送到引擎了**：不再是「只置一个标志、等当前包解完」。
+      expect(engine.cancelCalls, 1);
 
-      // 放行第一个包 —— 引擎到这里才走完一轮，批次的收尾逻辑这才轮得到跑。
+      // 但**不是瞬间**：原生侧要在下一个进度点才 unwind，这期间按钮不变
+      // —— 它只是不再重复发请求（`stopExtract` 开头就挡了回去）。
+      expect(state.extracting, isTrue, reason: '引擎还没 unwind 完');
+      expect(label(), '停止解压');
+      await tester.tap(find.byType(PrimaryButton));
+      await pumpFrames(tester, 2);
+      expect(engine.cancelCalls, 1, reason: '重复点不该重复发取消');
+
+      // 放行 —— 引擎到这里才走完一轮，且是**以「被中止」收场**，批次的收尾
+      // 逻辑这才轮得到跑。
       blocked.complete();
       await pumpFrames(tester);
 
@@ -396,8 +403,9 @@ void main() {
       // 而实际是把已经解好的重解一遍、撒出 `_1` 目录。
       expect(find.text('已停止'), findsOneWidget);
       expect(find.text('全部解压完成'), findsNothing,
-          reason: '只解了一个包却写「全部完成」是假话');
-      expect(find.textContaining('已完成 1/2 个压缩包'), findsOneWidget);
+          reason: '一个包都没解完却写「全部完成」是假话');
+      // **被中止的那个包不算「已完成」**：磁盘上只有半棵树，算进去是假话。
+      expect(find.textContaining('已完成 0/2 个压缩包'), findsOneWidget);
       expect(label(), '更换目标');
 
       await drainTimers(tester);

@@ -337,6 +337,7 @@ class ExtractOutcome {
     required this.unpackedBytes,
     required this.elapsed,
     this.nested = const [],
+    this.cancelled = false,
   });
 
   /// 实际落盘的目标目录（重名时可能被加了 `_1` 后缀，以这个为准）。
@@ -360,6 +361,18 @@ class ExtractOutcome {
   /// 已按 [ScanItem] 的既有不变量排好序（文件在前、子目录在后、自然序）。
   final List<ScanItem> nested;
 
+  /// 这次解压是被用户中止的，**不是失败**。
+  ///
+  /// 这是**这次解压的属性**（与 [nested] 一样由后端如实报告），不是某个条目
+  /// 的属性：中止的粒度是条目/块边界，已解好的完整文件都留着，写到一半的那
+  /// 一个由原生侧删掉（见 `packages/deep_unzip_engine/src/duz_engine.h`）。
+  ///
+  /// **别再往上当返回值传。** `app_state.dart` 里那条试密码的 `verify` 闭包把
+  /// 「outcome 非空」直接当作密码验证通过 —— 返回值式取消走到那里，弹窗会认定
+  /// 「这个密码对」并记一次密码库命中，是静默假绿。上一层就转成
+  /// `ExtractCancelled` 异常，那个类型刻意**不继承** `EngineException`。
+  final bool cancelled;
+
   /// 有没有发现嵌套包。UI 上「递归」这一行的计数用它。
   bool get hasNested => nested.isNotEmpty;
 
@@ -369,6 +382,7 @@ class ExtractOutcome {
         unpackedBytes: unpackedBytes,
         elapsed: elapsed,
         nested: items,
+        cancelled: cancelled,
       );
 }
 

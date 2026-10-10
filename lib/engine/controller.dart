@@ -32,6 +32,19 @@ import 'worker.dart';
 /// 进度条不会停在半路。
 const Duration kProgressThrottle = Duration(milliseconds: 125);
 
+/// [EngineController.dispose] 给 worker 自己收尾的宽限期。
+///
+/// 为什么不能像以前那样直接 `kill(immediate)`：解压现在跑在 **C++ 自己的
+/// 线程**上，而 join 它的只能是 `duz_close` —— 那要 worker isolate 活到任务
+/// 收尾才跑得到。硬杀会把那条线程变成孤儿：还在往盘上写，却没人 join、
+/// 没人释放归档句柄。
+///
+/// 2 秒的依据：worker 侧从收到 `CmdShutdown` 到跑完 `finally` 只剩几步
+/// Dart 代码（真正慢的「等 7-Zip 在下一个进度点 unwind」在 `duz_close` 的
+/// join 里，而那是原生侧的事，不受 isolate 调度影响）。宽限期是兜底而不是
+/// 常态 —— 超时说明 worker 真的卡住了（比如脚本跑飞），那时硬杀是唯一选择。
+const Duration kShutdownGrace = Duration(seconds: 2);
+
 /// 一次扫描的最终结果。
 typedef ScanOutcome = ({ScanSummary summary, Duration elapsed});
 
@@ -74,9 +87,12 @@ class EngineController {
 
   ReceivePort? _inbox;
   ReceivePort? _errors;
+  ReceivePort? _exits;
   Isolate? _isolate;
   SendPort? _toWorker;
   final Completer<void> _ready = Completer<void>();
+  /// worker isolate 真的结束了。`dispose()` 靠它把宽限期缩短成「一退出就走」。
+  final Completer<void> _exited = Completer<void>();
   bool _disposed = false;
 
   int _nextJobId = 1;
@@ -138,11 +154,19 @@ class EngineController {
       }
     });
 
+    // 退出端口：`dispose()` 的宽限期靠它提前结束（见 [_shutdown]）。
+    final exits = ReceivePort();
+    _exits = exits;
+    exits.listen((_) {
+      if (!_exited.isCompleted) _exited.complete();
+    });
+
     _isolate = await Isolate.spawn(
       entryPoint,
       inbox.sendPort,
       debugName: 'duz_worker',
       onError: errors.sendPort,
+      onExit: exits.sendPort,
       errorsAreFatal: false,
     );
 
@@ -156,8 +180,21 @@ class EngineController {
     }
   }
 
-  /// 硬杀 worker。任务中途调用是安全的：worker 只读文件或写新文件，
-  /// 被杀不会破坏已有数据（解压的临时文件清理在 P1 处理）。
+  /// 收掉 worker。
+  ///
+  /// **本方法是同步的**（`_disposed` 立刻置位、在飞任务立刻以异常结束、端口
+  /// 立刻关掉），但收掉那条 isolate 本身是**两段式**的：
+  ///
+  /// 1. 先 `CmdCancel` + `CmdShutdown` 请它自己收尾 —— 收到 `CmdShutdown` 的
+  ///    worker 会等在飞任务跑完再关端口（见 `worker.dart`），而解压那条路上
+  ///    「任务跑完」就是 `duz_close`，**只有它能 join C++ 那条解压线程**。
+  /// 2. 宽限期（[kShutdownGrace]）过了才 `kill(immediate)` 硬杀。
+  ///
+  /// 以前是无条件硬杀。那在同步 FFI 时代没问题（杀掉的只是被堵住的 Dart 栈），
+  /// 现在却会留下一条还在写盘的孤儿线程 —— 没人 join、没人释放归档句柄。
+  ///
+  /// 硬杀本身仍留在末尾兜底：worker 真卡住时（比如用户脚本跑飞），那是唯一
+  /// 的出路。所以调用方**不必**等 [_shutdown]，它的返回值只给测试用。
   void dispose() {
     if (_disposed) return;
     _disposed = true;
@@ -183,13 +220,44 @@ class EngineController {
     }
     _pingWaiters.clear();
 
+    final worker = _toWorker;
+    final isolate = _isolate;
+
     _inbox?.close();
     _errors?.close();
+    _exits?.close();
     _inbox = null;
     _errors = null;
+    _exits = null;
     _toWorker = null;
-    _isolate?.kill(priority: Isolate.immediate);
     _isolate = null;
+
+    if (isolate == null) return;
+    unawaited(_shutdown(worker, isolate));
+  }
+
+  /// [dispose] 的第二段。单独抽出来只为让它是个 async 函数 —— `dispose` 自己
+  /// 必须同步返回（调用方是 `state.dispose(); controller.dispose();` 这种序列）。
+  Future<void> _shutdown(SendPort? worker, Isolate isolate) async {
+    // 顺序要紧：先取消，于是那条在飞的解压会尽快往原生侧送 cancel；紧接着的
+    // shutdown 才不会被一个还要跑几分钟的解压拖住。
+    worker?.send(const CmdCancel());
+    worker?.send(const CmdShutdown());
+
+    // 用可取消的 Timer 而不是 `Future.delayed`：后者在 worker 早早退出的正常
+    // 情况下仍会留下一个跑满 2 秒的定时器，而 widget 测试会把「测试结束时还
+    // 挂着的定时器」当成失败。
+    final grace = Completer<void>();
+    final timer = Timer(kShutdownGrace, () {
+      if (!grace.isCompleted) grace.complete();
+    });
+    await Future.any([_exited.future, grace.future]);
+    timer.cancel();
+
+    if (!_exited.isCompleted) {
+      // 宽限期到了它还没退出 —— 硬杀是唯一出路。
+      isolate.kill(priority: Isolate.immediate);
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -209,7 +277,7 @@ class EngineController {
 
   /// 扫描一个目录，等到扫描结束。
   ///
-  /// 取消**不是**异常：`cancelScan()` 之后这个 Future 正常完成，只是
+  /// 取消**不是**异常：`cancel()` 之后这个 Future 正常完成，只是
   /// `summary.warnings` 里会多一条「已取消」。
   Future<ScanOutcome> scan({
     required String rootPath,
@@ -279,9 +347,9 @@ class EngineController {
   /// 注意 `code == DUZ_ERR_PASSWORD` 时值得换下一个候选密码重试，
   /// 而不是把它当成「这个包坏了」。
   ///
-  /// **取消在解压期间不生效**（见 [CmdExtract] 的说明）：`cancelScan()` 发的
-  /// 信号要等这次解压跑完才会被 worker 处理。所以别在 UI 上把「暂停」按钮
-  /// 接到它上面假装能停 —— 那是个谎言。
+  /// **取消在解压期间生效**：解压跑在原生侧自己的线程上，这里只是轮询，所以
+  /// [cancel] 发的信号在下一轮轮询就会被送到引擎。被中止时这个 Future 正常
+  /// 返回一个 `cancelled: true` 的 [ExtractOutcome]（不是抛异常）。
   ///
   /// [recursive] 为真时，返回值的 [ExtractOutcome.nested] 会带上「刚解出来的
   /// 内容里又发现的压缩包」，层级已经抬到 `depth + 1`。**解不解它们由调用方
@@ -326,10 +394,14 @@ class EngineController {
     return c.future;
   }
 
-  /// 请求中止当前任务。没有任务在跑时是空操作。
+  /// 请求中止当前任务（扫描或解压）。没有任务在跑时是空操作。
   ///
-  /// 扫描能立即响应；**解压不能**（见 [extract] 的说明）。
-  Future<void> cancelScan() async {
+  /// 名字里不再带 `Scan`：它两件事都能中止了。扫描在下一个条目边界响应，
+  /// 解压在下一轮轮询把取消送到原生侧 —— 两条路都是「尽快」，不是「立刻」。
+  ///
+  /// **取消不是异常**：被中止的那个 Future 正常完成（扫描多一条「已取消」
+  /// 的 warning，解压的 outcome 带 `cancelled: true`）。
+  Future<void> cancel() async {
     await _ready.future;
     // 只能在这个 await **之后**检查：dispose 可能刚好在这期间跑完。
     _ensureAlive();

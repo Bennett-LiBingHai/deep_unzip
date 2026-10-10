@@ -80,6 +80,18 @@ class FakeEngine extends EngineController {
   /// 命令传下去了」这条线，也就是防自噬那一半。
   final List<Set<String>> skipDirsSeen = [];
 
+  /// [cancel] 被调了几次。
+  ///
+  /// 底座的 `cancel()` 会 `await _ready.future` 再往那条 worker isolate 发
+  /// 命令 —— 假引擎压根没起 worker，直接调它只会挂死。所以这里**只记数**，
+  /// 不碰底座。钉的是「按下停止真的把取消送下去了」这条线。
+  int cancelCalls = 0;
+
+  @override
+  Future<void> cancel() async {
+    cancelCalls++;
+  }
+
   @override
   Future<ScanOutcome> scan({
     required String rootPath,
@@ -117,12 +129,17 @@ class FakeEngine extends EngineController {
     limitsSeen.add(limits);
     availableBytesSeen.add(availableBytes);
     rounds++;
+    // 与真引擎同构：**开局那一刻**记下取消计数，收工时比对。开局之前发生的
+    // 取消不算数（那条包已经解完了），开工之后发生的才算 —— 这正是
+    // `worker.dart` 里 `shouldCancel: () => epoch != _cancelEpoch` 的语义。
+    final cancelBaseline = cancelCalls;
     await behavior?.call(this, outDir);
     return ExtractOutcome(
       outDir: outDir,
       entryCount: 1,
       unpackedBytes: 1024,
       elapsed: const Duration(milliseconds: 5),
+      cancelled: cancelCalls != cancelBaseline,
       nested: nestedFor[outDir] ?? const [],
     );
   }
