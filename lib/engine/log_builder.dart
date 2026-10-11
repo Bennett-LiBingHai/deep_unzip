@@ -135,6 +135,10 @@ String passwordTag({required bool uncertain}) =>
 /// [passwordSource] 只在**成功**那条路上有意义（失败与跳过都另有话说，
 /// 见下面的 tag 表）：这个包是被哪个密码打开的。没用到密码（绝大多数包）传
 /// `null`，那一格就不出标签。
+///
+/// [sourceDeleted] / [sourceDeleteFailed] 同理，也只在成功那条路上有意义 ——
+/// 只有成功才会去删源包（见 `app_state.dart` 的批次循环）。默认 false 让既有
+/// 调用点零改动。
 LogEntry buildExtractLog({
   required ScanItem item,
   required DateTime now,
@@ -142,6 +146,8 @@ LogEntry buildExtractLog({
   EngineException? error,
   String? skippedReason,
   PasswordSource? passwordSource,
+  bool sourceDeleted = false,
+  bool sourceDeleteFailed = false,
 }) {
   assert(
     (outcome != null ? 1 : 0) +
@@ -179,6 +185,11 @@ LogEntry buildExtractLog({
           if (passwordSource != null) passwordSource.label,
           if (item.flags.contains(ArchiveFlag.fakeExtension)) '伪后缀',
           '${o.entryCount} 项',
+          // 开了「自动删除源压缩包」时，让这一条如实说出去：删了就说删了，
+          // 没删净更要说（「说好删了却没删」比不删更糟）。两者互斥：有没删净的
+          // 就报那一句，全部删净才报「已删源」。没开这颗开关时两个都是 false，
+          // 这一格一个标签都不出。
+          if (sourceDeleteFailed) '源未删净' else if (sourceDeleted) '已删源',
         ],
       // 三种失败要分得开：
       // - 密码错 → 换下一个候选密码还有救（P4 会自动试）

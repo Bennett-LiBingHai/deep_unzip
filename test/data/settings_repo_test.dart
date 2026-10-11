@@ -26,6 +26,7 @@ void main() {
       expect(data.toggles, kDefaultToggles);
       expect(data.maxDepth, kDefaultMaxDepth);
       expect(data.maxLogs, kDefaultMaxLogs);
+      expect(data.sniffWindow, kDefaultSniffWindow);
       expect(data.limitPreset, kDefaultLimitPreset);
       expect(data.limits, LimitThresholds.standard);
     });
@@ -77,7 +78,7 @@ void main() {
   group('往返', () {
     // 名字里**不写开关的条数**：这张表加过一次（`pwdAutoSave`），以后再加
     // 还得改一次名字，而名字跟断言没关系 —— 要钉的是「原样回来」。
-    test('开关 + 深度 + 日志封顶 + 自定义阈值原样回来', () async {
+    test('开关 + 深度 + 日志封顶 + 搜索窗口 + 自定义阈值原样回来', () async {
       // 这份 map 必须**逐个列出全部开关**：`load` 只认 `kDefaultToggles` 里
       // 那些键，漏写一个就会被补成出厂默认 —— `expect(back.toggles == saved)`
       // 于是失败在「少写了一个」而不是「存坏了」。等于用一次红灯逼着加开关的人
@@ -89,9 +90,11 @@ void main() {
           'pwdPrompt': false,
           'pwdAutoSave': false,
           'errorPause': true,
+          'autoDeleteSource': false,
         },
         maxDepth: 10,
         maxLogs: 1000,
+        sniffWindow: 4 << 20,
         limitPreset: 3, // 3 == kLimitPresets.length，即「自定义」
         limits: LimitThresholds(
           maxEntries: 12345,
@@ -107,6 +110,7 @@ void main() {
       expect(back.toggles, saved.toggles);
       expect(back.maxDepth, 10);
       expect(back.maxLogs, 1000);
+      expect(back.sniffWindow, 4 << 20);
       expect(back.limitPreset, 3);
       expect(back.limits.maxEntries, 12345);
       expect(back.limits.maxEntryBytes, 2 << 30);
@@ -174,6 +178,24 @@ void main() {
       }
     });
 
+    test('搜索窗口越界 → 夹回区间，但**不吸附**', () async {
+      // 与 `maxLogs` 同一条规矩：窗口是自由输入，区间内的值原样保留。
+      // **下界不是「填到这儿会坏」** —— 自解压包那条路不读这一项，
+      // 所以夹回下界也退不掉任何既有能力（见 `persist.dart` 的注释）。
+      for (final (raw, expected) in [
+        (2 << 20, 2 << 20),
+        (kMinSniffWindow, kMinSniffWindow),
+        (kMaxSniffWindow, kMaxSniffWindow),
+        (0, kMinSniffWindow),
+        (-5, kMinSniffWindow),
+        (64 << 20, kMaxSniffWindow),
+      ]) {
+        SharedPreferences.setMockInitialValues({'sniffWindow': raw});
+        final data = await repo.load();
+        expect(data.sniffWindow, expected, reason: '$raw 应收敛成 $expected');
+      }
+    });
+
     test('档位下标越界 → 夹回合法区间', () async {
       SharedPreferences.setMockInitialValues({'limitPreset': 99});
       expect((await repo.load()).limitPreset, kLimitPresets.length);
@@ -224,8 +246,13 @@ void main() {
           reason: '「递归解压」那颗 2026-10 删了，不该再有键写下去');
       expect(prefs.getBool('toggle.pwdAutoSave'), isTrue,
           reason: '手输密码自动入库那颗，默认开');
+      expect(prefs.getBool('toggle.autoDeleteSource'), isFalse,
+          reason: '解压成功后自动删除源压缩包，出厂关 —— 这是不可逆的删除，'
+              '默认必须是不删');
       expect(prefs.getInt('maxDepth'), kDefaultMaxDepth);
       expect(prefs.getInt('maxLogs'), kDefaultMaxLogs);
+      expect(prefs.getInt('sniffWindow'), kDefaultSniffWindow,
+          reason: '前置数据搜索窗口，默认 1 MB');
       expect(prefs.getInt('limitPreset'), kDefaultLimitPreset);
       expect(prefs.getInt('limit.entries'), LimitThresholds.standard.maxEntries);
       expect(prefs.getInt('limit.ratio'), LimitThresholds.standard.maxRatio);

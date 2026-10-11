@@ -9,10 +9,14 @@
 /// 2. **文件头签名**：[_kSignaturesAtZero]（压缩包，绝大多数文件在这里就定了）、
 ///    [_kSignaturesOffset]（tar / lzh 的固定偏移）、[_kSignaturesExtra]（软件包与
 ///    磁盘映像那一批）。
-/// 3. **兜底**：`MZ` 自解压文件在前 1 MiB 内重扫签名；其余文件从文件尾反向
-///    找 ZIP EOCD 并反推前置数据长度。两级窗口（先 1 KiB 后 128 KiB）是为了
-///    别让「一个都不认识的目录」付出 128 KiB × N 的读放大。最后才看头窗口
-///    之外的两处：0x8000 的 ISO / UDF 卷描述符，和文件尾的 DMG 页脚。
+/// 3. **兜底**：`MZ` 自解压文件在前 [kEmbeddedScanBytes] 内重扫签名；其余
+///    文件从文件尾反向找 ZIP EOCD 并反推前置数据长度。两级窗口（先 1 KiB 后
+///    128 KiB）是为了别让「一个都不认识的目录」付出 128 KiB × N 的读放大。
+///    再看头窗口之外的两处：0x8000 的 ISO / UDF 卷描述符，和文件尾的 DMG 页脚。
+/// 4. **向前搜签名**（排最后，也最贵）：在前 [kDefaultSniffWindowBytes] 字节里
+///    找 7z / RAR5 / RAR4，命中后**按各自的块头 CRC 校验**。这是给「一张完整
+///    图片打头、压缩包整段追加在后面」那种分享包准备的 —— 它没有可见的后缀
+///    线索，签名也不在偏移 0。窗口大小可设（见 `SettingsData.sniffWindow`）。
 ///
 /// ## 不做的事
 ///
@@ -35,7 +39,16 @@ import 'zip_dir.dart';
 const int kSniffHeadBytes = 512;
 
 /// `MZ` 自解压文件向前重扫签名的最大距离。
+///
+/// **写死、不随设置变化**，这一点是刻意的：这条 PE 自解压的路自成一体，
+/// 够不着 [`kDefaultSniffWindowBytes`] 那个可调窗口，所以把窗口调到多小
+/// 都不会让「自解压包还认得出」这件事倒退。
 const int kEmbeddedScanBytes = 1024 * 1024;
+
+// 「向前搜签名」那个窗口的三个常量（`kDefaultSniffWindowBytes` /
+// `kMinSniffWindowBytes` / `kMaxSniffWindowBytes`）定义在 `models.dart` ——
+// `ScanOptions` 的默认值要引用它，而这个文件已经 import 了 `models.dart`，
+// 放这边会变成互相 import。
 
 /// ZIP EOCD 反向扫描的第一级窗口。绝大多数 zip 没有注释，EOCD 就压在
 /// 最后 22 字节里，1 KiB 足够。
@@ -394,6 +407,90 @@ bool _matchesAt(Uint8List buf, int offset, _Signature s) {
   return null;
 }
 
+/// 参与「向前搜」的三种格式。**不含 ZIP** —— 追加式 ZIP 由 [_findZipByTail]
+/// 从尾部 EOCD 反推，在这儿再搜一遍只是白花一次 CRC。
+const Set<SniffFormat> _kPrependedFormats = {
+  SniffFormat.sevenZ,
+  SniffFormat.rar4,
+  SniffFormat.rar5,
+};
+
+/// 向前搜「追加式」压缩包的签名：7z / RAR5 / RAR4，命中后按格式校验块头。
+///
+/// 这是给「一张完整图片打头、压缩包整段追加在后面」那类分享包准备的 —— 它
+/// 没有可见的后缀线索，签名也不在偏移 0。返回首个**校验通过**的候选。
+///
+/// ## 为什么校验不能省
+///
+/// 在一个 1 MB 窗口里裸搜 `37 7A BC AF 27 1C` 必然误报（[_findZipByTail] 的
+/// 注释警告过同一件事），所以三种格式都得把签名后面的块头过一遍：
+///
+/// - **7z**：`CrcCalc(p + 12, 20) == Get32(p + 8)`（`7zIn.cpp` 的 `TestStartCrc`）
+/// - **RAR5**：`CrcCalc(buf + 4, size - 4) == Get32(buf)`（`Rar5Handler.cpp` 的
+///   `ReadHeader`），块长由 `buf + 4` 处最多 3 字节的 vint 推出来
+/// - **RAR4**：`Get16(h) == CrcCalc(h + 2, headerSize - 2) & 0xFFFF` 且
+///   `h[2] == 0x73`（`NBlockType::kArchiveHeader`，`RarHeader.h`）
+///
+/// 块头读不全（候选太靠近窗口末尾）时**放弃该候选**，不猜 —— 这是本函数唯一
+/// 的固有限制：前置数据长到让块头横跨窗口边界就认不出，那种情况退回 `unknown`。
+({int offset, SniffFormat format})? _scanVerifiedSignatures(Uint8List buf) {
+  for (var i = 1; i < buf.length; i++) {
+    if (_kFirstByteMask[buf[i]] == 0) continue;
+    for (final s in _kSignaturesAtZero) {
+      if (!_kPrependedFormats.contains(s.format)) continue;
+      if (!_matchesAt(buf, i, s)) continue;
+      if (_verifyBlockHeader(buf, i, s.format)) {
+        return (offset: i, format: s.format);
+      }
+    }
+  }
+  return null;
+}
+
+/// 按格式校验签名后面的块头。[off] 是签名起点。
+bool _verifyBlockHeader(Uint8List buf, int off, SniffFormat format) {
+  switch (format) {
+    case SniffFormat.sevenZ:
+      // 32 字节：sig6 + ver2 + StartHeaderCRC4 + StartHeader20。
+      if (off + 32 > buf.length) return false;
+      return _crc32(buf, off + 12, off + 32) == _get32(buf, off + 8);
+    case SniffFormat.rar5:
+      return _verifyRar5(buf, off);
+    case SniffFormat.rar4:
+      return _verifyRar4(buf, off);
+    default:
+      return false;
+  }
+}
+
+/// RAR5：marker 8 字节之后是块头 —— 4 字节 CRC32，再是块长的 vint。
+bool _verifyRar5(Uint8List buf, int markerOff) {
+  final h = markerOff + 8; // 块头起点
+  if (h + 4 > buf.length) return false;
+  // 先得读得出块长，才知道这个块有多长、CRC 要覆盖到哪。
+  final head = _readVint(buf, h + 4, 3);
+  if (head == null || head.value < 2) return false;
+
+  // size 含那 4 字节 CRC 自己，与 `Rar5Handler.cpp` 的 `_bufSize` 同一个口径。
+  final end = h + 4 + head.len + head.value;
+  if (end > buf.length) return false;
+  return _crc32(buf, h + 4, end) == _get32(buf, h);
+}
+
+/// RAR4：marker 7 字节之后是 13 字节的主头（加密时 14 字节，多一个版本字节）。
+bool _verifyRar4(Uint8List buf, int markerOff) {
+  final h = markerOff + 7; // 主头起点
+  if (h + 13 > buf.length) return false;
+  if (buf[h + 2] != 0x73) return false; // NBlockType::kArchiveHeader
+  if (_crc16Low(buf, h, 13)) return true;
+  // 主头整体加密时多一个字节，CRC 也跟着多覆盖一个。
+  return h + 14 <= buf.length && _crc16Low(buf, h, 14);
+}
+
+/// RAR4 的头校验：前 2 字节存的是 CRC32 的低 16 位。
+bool _crc16Low(Uint8List buf, int h, int headerSize) =>
+    _get16(buf, h) == (_crc32(buf, h + 2, h + headerSize) & 0xFFFF);
+
 // ---------------------------------------------------------------------------
 // 纯函数：容器标记检测
 // ---------------------------------------------------------------------------
@@ -519,6 +616,7 @@ Future<SniffResult> sniffFile(
   String path, {
   String? declaredExt,
   bool honorContainerSkip = true,
+  int windowBytes = kDefaultSniffWindowBytes,
 }) async {
   final ext = declaredExt ?? extensionOf(path);
 
@@ -586,7 +684,7 @@ Future<SniffResult> sniffFile(
     }
 
     // 第 3 级之三：ISO / UDF（卷描述符在 0x8000）与 DMG（签名在文件尾）。
-    // 放最后：前面都认不出才值得多花这两次读 —— 而 ZIP 的尾部探测已经证明
+    // 放这里：前面都认不出才值得多花这两次读 —— 而 ZIP 的尾部探测已经证明
     // 这个文件不是 ZIP 了，剩下的才是它们。
     final deep = await _sniffDeep(raf, size);
     if (deep != null) {
@@ -594,6 +692,19 @@ Future<SniffResult> sniffFile(
         format: deep,
         confidence: SniffConfidence.medium,
         declaredExt: ext,
+        header: _preview(head),
+      );
+    }
+
+    // 第 4 级：向前搜「图片等文件后面追加的压缩包」。排在最后是因为它最贵
+    // （要读前 [windowBytes] 字节），而前面几步已经把绝大多数文件分完了。
+    final window = await _scanWindow(raf, size, windowBytes);
+    if (window != null) {
+      return SniffResult(
+        format: window.format,
+        confidence: window.confidence,
+        declaredExt: ext,
+        baseOffset: window.offset,
         header: _preview(head),
       );
     }
@@ -634,6 +745,27 @@ Future<({int offset, SniffFormat format, SniffConfidence confidence})?>
   final buf = await readFully(raf, 0, len);
   if (buf.length <= kSniffHeadBytes) return null;
   return _scanAnywhere(buf);
+}
+
+/// 前 [windowBytes] 字节里向前搜 7z / RAR5 / RAR4 的签名，逐个做块头 CRC 校验。
+///
+/// 与 [_scanEmbedded] 是两条**不一样**的路：那条给 PE 自解压壳用（裸搜、无校验、
+/// `medium`），这条给「追加在图片后面」的包用（带校验、`high`）。刻意不合并 ——
+/// 既有测试钉着前者的置信度与偏移，而后者要求校验，两者的取舍正好相反。
+Future<({int offset, SniffFormat format, SniffConfidence confidence})?>
+    _scanWindow(RandomAccessFile raf, int size, int windowBytes) async {
+  final len = size < windowBytes ? size : windowBytes;
+  if (len <= kSniffHeadBytes) return null; // 文件头已经覆盖过全部内容了
+  final buf = await readFully(raf, 0, len);
+  if (buf.length <= kSniffHeadBytes) return null;
+  final hit = _scanVerifiedSignatures(buf);
+  if (hit == null) return null;
+  // CRC 验过的，比 medium 强 —— 这正是它与 [_scanEmbedded] 的区别。
+  return (
+    offset: hit.offset,
+    format: hit.format,
+    confidence: SniffConfidence.high,
+  );
 }
 
 /// 从文件尾反向找 ZIP EOCD，并**校验**推出来的起点确实是中央目录。
@@ -753,6 +885,62 @@ int _u32le(Uint8List b, int o) =>
 Uint8List _preview(Uint8List head) => head.length <= kHexPreviewBytes
     ? head
     : Uint8List.sublistView(head, 0, kHexPreviewBytes);
+
+// ---------------------------------------------------------------------------
+// 校验用的字节小工具
+// ---------------------------------------------------------------------------
+
+// 7-Zip 的 `CrcCalc` 就在这几个格式的块头里用着，而 `engine/` 不得 import 外部
+// 包（见 `models.dart` 开头的纪律），所以表驱动手写一份。表只建一次。
+Uint32List? _crcTable;
+Uint32List get _kCrcTable => _crcTable ??= _buildCrcTable();
+
+Uint32List _buildCrcTable() {
+  final table = Uint32List(256);
+  for (var i = 0; i < 256; i++) {
+    var c = i;
+    for (var k = 0; k < 8; k++) {
+      c = (c & 1) != 0 ? 0xEDB88320 ^ (c >> 1) : c >> 1;
+    }
+    table[i] = c;
+  }
+  return table;
+}
+
+/// CRC32（多项式 `0xEDB88320`）。覆盖 `[start, end)`。
+///
+/// 与 7-Zip 的 `CrcCalc` 同构：初值全 1、末尾取反。返回 `int`（Dart 的 int 是
+/// 64 位有符号，`& 0xFFFFFFFF` 保证与 C 侧的 `UInt32` 对齐后再比较）。
+int _crc32(Uint8List buf, int start, int end) {
+  final table = _kCrcTable;
+  var crc = 0xFFFFFFFF;
+  for (var i = start; i < end; i++) {
+    crc = table[(crc ^ buf[i]) & 0xFF] ^ (crc >> 8);
+  }
+  return (crc ^ 0xFFFFFFFF) & 0xFFFFFFFF;
+}
+
+int _get32(Uint8List b, int o) =>
+    (b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24)) & 0xFFFFFFFF;
+
+int _get16(Uint8List b, int o) => b[o] | (b[o + 1] << 8);
+
+/// RAR5 的 vint：逐字节，低 7 位是数据、最高位是续读位。
+///
+/// 读不出来（越界 / `maxBytes` 个字节都还带续读位）返回 null —— 对应
+/// `Rar5Handler.cpp` 的 `ReadVarInt` 在那里返回 0 表示失败。
+({int len, int value})? _readVint(Uint8List b, int o, int maxBytes) {
+  var value = 0;
+  var shift = 0;
+  for (var i = 0; i < maxBytes; i++) {
+    if (o + i >= b.length) return null;
+    final byte = b[o + i];
+    value |= (byte & 0x7F) << shift;
+    if ((byte & 0x80) == 0) return (len: i + 1, value: value);
+    shift += 7;
+  }
+  return null;
+}
 
 // ---------------------------------------------------------------------------
 // 展示格式化（供 FormatDetectModal 用）

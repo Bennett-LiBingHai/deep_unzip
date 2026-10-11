@@ -17,6 +17,7 @@ import '../engine/output_paths.dart';
 import '../engine/progress_meter.dart';
 import '../engine/protocol.dart';
 import '../engine/scanner.dart';
+import '../engine/source_cleanup.dart';
 import '../models/archive_file.dart';
 import '../models/log_entry.dart';
 import '../models/password_entry.dart';
@@ -439,6 +440,23 @@ class AppState extends ChangeNotifier {
     _persistSettings();
   }
 
+  int _sniffWindow = kDefaultSniffWindow;
+  int get sniffWindow => _sniffWindow;
+
+  /// 改「前置数据搜索窗口」（字节）。
+  ///
+  /// 它只喂给嗅探层那条**新增**的「图片后面追加的压缩包」搜索，
+  /// **够不着** PE 自解压那条既有的路 —— 所以调小不会让任何今天能认出的
+  /// 东西认不出（见 `models.dart` 的 [kDefaultSniffWindowBytes]）。
+  ///
+  /// 界外由 `coerceSniffWindow` 夹回 [kMinSniffWindow]–[kMaxSniffWindow]，
+  /// 与 [setMaxDepth] 同一个写法。
+  void setSniffWindow(int value) {
+    _sniffWindow = coerceSniffWindow(value);
+    _notify();
+    _persistSettings();
+  }
+
   // ---- 炸弹防护阈值 ----
 
   LimitThresholds _limits = LimitThresholds.standard;
@@ -541,6 +559,7 @@ class AppState extends ChangeNotifier {
 
     _maxDepth = coerceMaxDepth(s.settings.maxDepth);
     _maxLogs = coerceMaxLogs(s.settings.maxLogs);
+    _sniffWindow = coerceSniffWindow(s.settings.sniffWindow);
     // 档位下标收敛到合法区间；超界的归到「自定义」那档而不是 0。
     _limitPreset = s.settings.limitPreset.clamp(0, kLimitPresets.length);
     _limits = s.settings.limits;
@@ -569,6 +588,7 @@ class AppState extends ChangeNotifier {
       toggles: Map.of(_settings),
       maxDepth: _maxDepth,
       maxLogs: _maxLogs,
+      sniffWindow: _sniffWindow,
       limitPreset: _limitPreset,
       limits: _limits,
     )));
@@ -709,6 +729,7 @@ class AppState extends ChangeNotifier {
       // 快照下来，嵌套扫描（解压期发现的新包）要用同一份，见 [_scanOptions]。
       final options = ScanOptions(
         detectFakeExtension: setting('fakeExtDetect'),
+        sniffWindowBytes: _sniffWindow,
       );
       _scanOptions = options;
       final pending = start(engine, options);
@@ -1294,6 +1315,10 @@ class AppState extends ChangeNotifier {
     // 弹窗来回的过程中被用户改（比如他想「先关掉别问了」），读到一半变了的话，
     // 同一批里会出现「问了三个、第四个开始不问了」这种没法解释的序列。
     final pauseOnError = setting('errorPause');
+    // 「解压成功后要不要删源包」同理锁定成局部量。它决定的是**不可逆**的删除，
+    // 同一批里绝不能出现「前三个删了、第四个开始不删」—— 那意味着用户手里的
+    // 磁盘状态取决于他在解压途中什么时候去拨的开关。
+    final autoDeleteSource = setting('autoDeleteSource');
 
     _extracting = true;
     _completeDetail = '';
@@ -1321,6 +1346,9 @@ class AppState extends ChangeNotifier {
     _notify();
 
     var failed = 0;
+    // 这一批里删掉/没删净的源包个数，给总结卡片与 toast 用（见 `_summarize`）。
+    var sourcesDeleted = 0;
+    var sourcesFailed = 0;
     // 顶层就被深度拦下的那些，与嵌套里被拦下的一样计入 `skipped` —— 两边
     // 在日志与总结卡片上要长得一样，用户不必去分辨是「哪一层」拦的。
     // （它们不进 `_batchTotal`：那份分母是「这一批要处理的包」，而它们是
@@ -1486,19 +1514,42 @@ class AppState extends ChangeNotifier {
           );
           final outcome = unlocked.outcome;
           _doneCount++;
+
+          // 身份要读**源文件的前 64 KiB**（`cycles.dart` 的 `archiveIdentity`）。
+          // 所以它必须排在下面那次删除**之前** —— 删了源包，嵌套包的身份指纹就
+          // 读不到，自引用检测（`a.zip` 里套 `a.zip`）当场失效。先把身份算出来。
+          final needIdentity = recursive && outcome.hasNested;
+          if (needIdentity) identity ??= await archiveIdentity(item.entryPath);
+
+          // 能走到这一行就是「成功」。取消 / 失败 / 被闸门拦下 / 跳过在批次循环
+          // 里各有自己的分支，天然到不了这里 —— 那三种收场一律不删源包。
+          var sourceDeleted = false;
+          var sourceDeleteFailed = false;
+          if (autoDeleteSource) {
+            final r = removeSourceFiles(item.parts);
+            sourceDeleted = r.deleted > 0;
+            sourceDeleteFailed = r.failed > 0;
+            if (sourceDeleted) sourcesDeleted++;
+            if (sourceDeleteFailed) sourcesFailed++;
+          }
+
           _addLog(buildExtractLog(
             item: item,
             outcome: outcome,
             // 密码是从哪来的。没用到密码就是 null，那一格不出标签。
             passwordSource: unlocked.source,
+            sourceDeleted: sourceDeleted,
+            sourceDeleteFailed: sourceDeleteFailed,
             now: DateTime.now(),
           ));
-          if (recursive && outcome.hasNested) {
-            identity ??= await archiveIdentity(item.entryPath);
+          if (needIdentity) {
             skipped += _enqueueNested(
               queue: queue,
               outcome: outcome,
-              parentIdentity: identity,
+              // `needIdentity` 为真时上面那行 `??=` 必然已经把它赋成了非空。
+              // 这里用 `!` 而不是让类型系统推：两个 `if` 各判一次，流分析跨不过
+              // 去（它不是同一个条件）。
+              parentIdentity: identity!,
               parentAncestors: task.ancestors,
               maxDepth: maxDepth,
             );
@@ -1664,12 +1715,19 @@ class AppState extends ChangeNotifier {
         manualSkips: _manualSkips,
         elapsed: elapsed,
         cancelled: cancelled,
+        sourcesDeleted: sourcesDeleted,
+        sourcesFailed: sourcesFailed,
       );
       if (failed == 0 && !cancelled) {
         _progress = 1.0;
       }
       _notify();
-      showToast(_completeDetail, type: failed > 0 ? 'warn' : 'ok');
+      // 源包没删净也该是黄条 —— 那是一句要用户动手的话（手动清理），
+      // 与「有包没解开」同等的分量。
+      showToast(
+        _completeDetail,
+        type: (failed > 0 || sourcesFailed > 0) ? 'warn' : 'ok',
+      );
       // 整批收尾 —— 逐包日志到这里全记完了，一次写出去（见 [_persistLogs]）。
       _persistLogs();
 
@@ -1776,6 +1834,11 @@ class AppState extends ChangeNotifier {
   ///
   /// [done] 是**处理过的包数**（成 / 败 / 跳过都算），所以真正解开的个数是
   /// 它减掉失败与跳过 —— 别拿 [done] 当「成功数」用。
+  ///
+  /// [sourcesDeleted] / [sourcesFailed] 只在开了「自动删除源压缩包」时才非零。
+  /// **只在末尾追加**，既有那几段的形状一个字不动 —— 一堆既有用例断言的是
+  /// `contains`，加段不会碰它们。[sourcesFailed] 要单独报：那是「说好删了却
+  /// 没删」的文件，用户得知道还剩哪些要自己动手。
   String _summarize({
     required int total,
     required int done,
@@ -1784,6 +1847,8 @@ class AppState extends ChangeNotifier {
     required bool cancelled,
     int skipped = 0,
     int manualSkips = 0,
+    int sourcesDeleted = 0,
+    int sourcesFailed = 0,
   }) {
     final autoSkips = skipped - manualSkips;
     final parts = <String>[
@@ -1793,6 +1858,8 @@ class AppState extends ChangeNotifier {
       if (failed > 0) '$failed 个失败',
       if (manualSkips > 0) '手动跳过 $manualSkips 个',
       if (autoSkips > 0) '$autoSkips 个自动跳过',
+      if (sourcesDeleted > 0) '已删源包 $sourcesDeleted 个',
+      if (sourcesFailed > 0) '$sourcesFailed 个源未删净',
     ];
     return parts.join(' · ');
   }

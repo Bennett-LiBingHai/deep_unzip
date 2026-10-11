@@ -190,23 +190,34 @@ class FormatDetectModal extends StatelessWidget {
     );
   }
 
+  /// 字段行。左边的标签取自然宽度，右边的值占满剩下的宽度并**允许折行**。
+  ///
+  /// 「处理方式」那一行会写成 `按 RAR 压缩包 解压（前面有 885788 字节前置数据）`，
+  /// 比另外三行都长得多，窄屏上单行放不下。从前这里是裸的两个 `Text` 加
+  /// `spaceBetween`，值一长就溢出成黄黑条纹 —— `Expanded` + `TextAlign.end`
+  /// 让它在标签右边折行，右边缘仍然对齐，短值看上去与从前一模一样。
+  /// 折成两行时标签停在第一行（`CrossAxisAlignment.start`），不居中飘到中间。
   Widget _row(String k, String v, {bool isFake = false}) {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 6),
       child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text(k,
               style: const TextStyle(
                   fontSize: 12,
                   color: AppTheme.textDim,
                   fontFamily: 'monospace')),
-          Text(v,
-              style: TextStyle(
-                  fontSize: 12,
-                  fontFamily: 'monospace',
-                  fontWeight: FontWeight.w600,
-                  color: isFake ? AppTheme.neonRed : AppTheme.neonCyan)),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Text(v,
+                textAlign: TextAlign.end,
+                style: TextStyle(
+                    fontSize: 12,
+                    fontFamily: 'monospace',
+                    fontWeight: FontWeight.w600,
+                    color: isFake ? AppTheme.neonRed : AppTheme.neonCyan)),
+          ),
         ],
       ),
     );

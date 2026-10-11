@@ -154,6 +154,8 @@ const _cmdSamples = <WorkerCmd>[
     options: ScanOptions(
       detectFakeExtension: false,
       pruneDirs: {'node_modules', '.git', 'Android/data'},
+      // 与两个开关同一条规矩：给非默认值，否则「填满」是假的。
+      sniffWindowBytes: 2 << 20,
     ),
     skipDirs: {'/sdcard/Download/duz_out'},
     depth: 3,

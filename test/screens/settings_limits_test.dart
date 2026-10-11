@@ -6,6 +6,7 @@ import 'package:deep_unzip/screens/about_screen.dart';
 import 'package:deep_unzip/screens/settings_screen.dart';
 import 'package:deep_unzip/theme/app_theme.dart';
 import 'package:deep_unzip/widgets/custom_button.dart';
+import 'package:deep_unzip/widgets/modals/auto_delete_source_modal.dart';
 import 'package:deep_unzip/widgets/modals/value_input_modal.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -407,6 +408,74 @@ void main() {
     expect(state.setting('customOutput'), isTrue);
   });
 
+  /// 「解压成功后自动删除源压缩包」那一行的开关。
+  Finder autoDeleteToggle(WidgetTester tester) => find.descendant(
+        of: find.ancestor(
+          of: find.text('解压成功后自动删除源压缩包'),
+          matching: find.byType(Row),
+        ),
+        matching: find.byType(NeonToggle),
+      );
+
+  testWidgets('自动删除源压缩包：出厂关、说明写全，开启要走一次确认卡', (tester) async {
+    await pumpSettings(tester);
+
+    final row = find.ancestor(
+      of: find.text('解压成功后自动删除源压缩包'),
+      matching: find.byType(Row),
+    );
+    final texts = tester
+        .widgetList<Text>(find.descendant(of: row, matching: find.byType(Text)))
+        .map((t) => t.data)
+        .whereType<String>()
+        .toList();
+    expect(texts, hasLength(2), reason: '这一行该只有「名字 + 说明」两个文本');
+    expect(texts[1], contains('原样保留'),
+        reason: '关掉之后的行为也要交代 —— 这是本页所有 desc 的规矩');
+    expect(texts[1], contains('取消'),
+        reason: '「失败/取消/跳过不删」是最容易误解的一条，必须写明');
+
+    expect(tester.widget<NeonToggle>(autoDeleteToggle(tester)).value, isFalse,
+        reason: '不可逆的删除，出厂必须是不删');
+
+    // 拨开 → 先弹确认卡，这时还没真的开。
+    await tester.tap(autoDeleteToggle(tester));
+    await tester.pumpAndSettle();
+    expect(find.byType(AutoDeleteSourceModal), findsOneWidget);
+    expect(state.setting('autoDeleteSource'), isFalse,
+        reason: '确认之前不该生效');
+
+    await tester.tap(find.text('开启'));
+    await tester.pumpAndSettle();
+    expect(find.byType(AutoDeleteSourceModal), findsNothing);
+    expect(state.setting('autoDeleteSource'), isTrue);
+
+    // 再拨回去是**直接关**，不弹 —— 关掉不造成任何后果。
+    await tester.tap(autoDeleteToggle(tester));
+    await tester.pumpAndSettle();
+    expect(find.byType(AutoDeleteSourceModal), findsNothing,
+        reason: '只在「开」的方向弹确认');
+    expect(state.setting('autoDeleteSource'), isFalse);
+  });
+
+  testWidgets('自动删除源压缩包：确认卡上取消 / 滑走都算没开', (tester) async {
+    await pumpSettings(tester);
+
+    await tester.tap(autoDeleteToggle(tester));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('取消'));
+    await tester.pumpAndSettle();
+    expect(state.setting('autoDeleteSource'), isFalse, reason: '取消 = 不开启');
+
+    // 手势滑走（点遮罩）同样算取消 —— 不可逆的操作，手滑关掉不该等于同意。
+    await tester.tap(autoDeleteToggle(tester));
+    await tester.pumpAndSettle();
+    await tester.tapAt(const Offset(400, 20));
+    await tester.pumpAndSettle();
+    expect(find.byType(AutoDeleteSourceModal), findsNothing);
+    expect(state.setting('autoDeleteSource'), isFalse);
+  });
+
   testWidgets('「支持的格式」默认折叠，只露出一个计数头', (tester) async {
     await pumpSettings(tester, height: 9000);
 
@@ -571,5 +640,107 @@ void main() {
     // 悄悄夹成 64 会让用户以为自己填的数生效了。
     expect(state.maxDepth, kDefaultMaxDepth);
     expect(find.byType(TextField), findsOneWidget, reason: '没救回来就不该关弹窗');
+  });
+
+  // ---------------------------------------------------------------------------
+  // 前置数据搜索窗口（2026-10 新增）
+  // ---------------------------------------------------------------------------
+  //
+  // 「图片后面追加的压缩包」靠向前搜签名认出来，这条搜索要读多深就是这一项。
+  // 语义（默认 1 MB、256 KB–8 MB、不吸附）由 `settings_repo_test` / `sniff_test`
+  // 钉着；这里管的是**用户实际看到的那几颗字**，以及一条这页特有的规矩：
+  // 得点明「自解压包那条路不受影响」—— 否则用户会以为把这个窗口调小是在拿
+  // 既有能力冒险（其实不是）。这句话现在挂在**弹窗的副标题**上，不再挂在
+  // 那一行的说明里（那一行只留一句「有多深」，摆不下第二层意思）。
+
+  /// 「前置数据搜索窗口」那一行。
+  Finder sniffRow() => find.ancestor(
+        of: find.text('前置数据搜索窗口'),
+        matching: find.byType(Row),
+      );
+
+  /// 那一行的三个文本：`[名字, 说明, chip 上的值]`。
+  List<String> sniffRowTexts(WidgetTester tester) {
+    final texts = tester
+        .widgetList<Text>(
+            find.descendant(of: sniffRow(), matching: find.byType(Text)))
+        .map((t) => t.data)
+        .whereType<String>()
+        .toList();
+    expect(texts, hasLength(3),
+        reason: '这一行该有「名字 + 说明 + 值」三个文本，实际是 $texts');
+    return texts;
+  }
+
+  /// 打开搜索窗口的输入框。返回时弹窗开着。
+  Future<void> openSniffWindow(WidgetTester tester) async {
+    await tester.tap(find.text(sniffRowTexts(tester).last));
+    await tester.pumpAndSettle();
+    expect(find.byType(TextField), findsOneWidget, reason: '弹窗没打开');
+  }
+
+  testWidgets('搜索窗口这一行：默认 1 MB、带笔、说明说的是「藏在文件后面」',
+      (tester) async {
+    await pumpSettings(tester);
+
+    final texts = sniffRowTexts(tester);
+    expect(texts[0], '前置数据搜索窗口');
+    expect(texts[1], contains('图片'),
+        reason: '要说清这一项管的是哪种包 —— 用户不会知道「前置数据」是什么');
+    expect(texts[2], '1.0 MB');
+    expect(pencilIn('前置数据搜索窗口'), findsOneWidget,
+        reason: '自由输入的行才带笔');
+  });
+
+  testWidgets('搜索窗口：那句「不影响自解压包」在弹窗上', (tester) async {
+    await pumpSettings(tester);
+    await openSniffWindow(tester);
+
+    // 这句必须有一个落点。用户最怕的是「我把它调小，是不是把以前认得出来的
+    // 东西弄得认不出来了」—— 答案是不会，但只有说出来才算数。设置页那一行
+    // 只摆得下一句「有多深」，所以第二层意思收进弹窗副标题里。
+    expect(find.textContaining('自解压包那条路不受影响'), findsOneWidget);
+  });
+
+  testWidgets('搜索窗口：预填当前值，填 8 MB 就是 8 MB', (tester) async {
+    await pumpSettings(tester);
+    await openSniffWindow(tester);
+
+    expect(tester.widget<TextField>(find.byType(TextField)).controller!.text,
+        '1.0 MB',
+        reason: '预填的是**展示形态**（用户看到的那一行），不是裸字节数');
+
+    await tester.enterText(find.byType(TextField), '8 MB');
+    await tester.pump();
+    expect(find.text('= 8.0 MB'), findsOneWidget, reason: '实时预览没跟上输入');
+
+    await tester.tap(find.text('确定'));
+    await tester.pumpAndSettle();
+
+    expect(find.byType(TextField), findsNothing, reason: '确定之后弹窗该关掉');
+    expect(state.sniffWindow, 8 << 20);
+    expect(sniffRowTexts(tester).last, '8.0 MB', reason: '行上的值没跟着刷新');
+  });
+
+  testWidgets('搜索窗口填到界外：说清范围，不给提交', (tester) async {
+    await pumpSettings(tester);
+    await openSniffWindow(tester);
+
+    // 下界与别处**同形不同义**：不是「填到这儿会坏」，而是「再小没意义」。
+    // 弹窗上只给范围，那一层意思由弹窗自己的副标题承担。
+    await tester.enterText(find.byType(TextField), '64 KB');
+    await tester.pump();
+    expect(find.text('最小 256 KB'), findsOneWidget, reason: '越界要在预览行上直说');
+
+    // `warnIfMissed: false` 的理由同上：置灰靠 `IgnorePointer`。
+    await tester.tap(find.text('确定'), warnIfMissed: false);
+    await tester.pumpAndSettle();
+
+    expect(state.sniffWindow, kDefaultSniffWindow, reason: '悄悄夹值会让人以为生效了');
+    expect(find.byType(TextField), findsOneWidget, reason: '没救回来就不该关弹窗');
+
+    await tester.enterText(find.byType(TextField), '16 MB');
+    await tester.pump();
+    expect(find.text('最大 8.0 MB'), findsOneWidget);
   });
 }

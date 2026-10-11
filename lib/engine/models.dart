@@ -140,7 +140,7 @@ const Map<SniffFormat, Set<String>> kFormatExtensions = {
 
 /// 嗅探置信度。只有 `medium` 及以上才允许入队解压。
 enum SniffConfidence {
-  /// 4 字节及以上强签名，位于偏移 0。
+  /// 4 字节及以上强签名，或**经块头 CRC 校验**的候选（那种不在偏移 0）。
   high,
 
   /// 2 字节签名，或签名位于非 0 偏移（tar 的 ustar、SFX 内嵌数据）。
@@ -395,6 +395,7 @@ class ScanOptions {
   const ScanOptions({
     this.detectFakeExtension = true,
     this.pruneDirs = kDefaultPruneDirs,
+    this.sniffWindowBytes = kDefaultSniffWindowBytes,
   });
 
   /// 认出的伪后缀包要不要**拦下来问一句**（对应设置项 `fakeExtDetect`，
@@ -416,6 +417,11 @@ class ScanOptions {
 
   /// 遍历时直接剪枝的目录名。避免走进回收站、系统目录、依赖缓存。
   final Set<String> pruneDirs;
+
+  /// 向前搜签名的窗口（字节）。只喂给 `sniffFile` 那条新增的
+  /// 「图片后面追加的包」搜索，**不影响** PE 自解压那条既有的路
+  /// （见 [kDefaultSniffWindowBytes] 的说明）。对应设置项 `sniffWindow`。
+  final int sniffWindowBytes;
 }
 
 /// 默认剪枝的目录名（不区分大小写比较）。
@@ -428,6 +434,23 @@ const Set<String> kDefaultPruneDirs = {
   'Android/obb',
   '.thumbnails',
 };
+
+/// 向前搜签名的窗口（字节），给「图片等文件后面追加的压缩包」用。
+///
+/// 定义放在这里而不是 `sniff.dart`：`ScanOptions` 的默认值要引用它，而
+/// `models.dart` 是全 `engine/` 的地基（它只 import `dart:*`）—— 放进
+/// `sniff.dart` 会让两个文件互相 import。
+///
+/// 出厂默认 1 MB。上界对齐 7-Zip 客户端自己的 `kMaxCheckStartPosition`
+/// （`OpenArchive.cpp:45` 的 `1 << 23`）：**不比参考客户端搜得更远**，顺带
+/// 给「每个认不出的文件多读这么多字节」封一个顶。
+///
+/// 下界不是「调到这儿会坏」，而是「再小对分享包的封面就没意义了」——
+/// 自解压包那条路（`sniff.dart` 的 `kEmbeddedScanBytes`）**不读这一项**，
+/// 所以这个设置怎么填都动不了既有能力。
+const int kDefaultSniffWindowBytes = 1024 * 1024;
+const int kMinSniffWindowBytes = 256 * 1024;
+const int kMaxSniffWindowBytes = 8 * 1024 * 1024;
 
 /// 扫描结果的一条，与 UI 的 `ArchiveFile` 一一对应（等长、同序）。
 ///

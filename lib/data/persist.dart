@@ -27,6 +27,9 @@ library;
 
 import '../engine/cycles.dart';
 import '../engine/limits.dart';
+import '../engine/models.dart' show kDefaultSniffWindowBytes,
+    kMinSniffWindowBytes,
+    kMaxSniffWindowBytes;
 import '../models/log_entry.dart';
 import '../models/password_entry.dart';
 
@@ -83,6 +86,15 @@ const Map<String, bool> kDefaultToggles = {
   // 落地在 `AppState._maybeAutoImportPassword`。
   'pwdAutoSave': true,
   'errorPause': true,
+  // 开着 = 每**解压成功**一个包就把它的源文件及其全部分卷删掉（省空间、不留双份）。
+  // 这是本软件唯一的**不可逆删除**：没有回收站、没有备份。默认关。
+  //
+  // 只在「成功」那一刻删 —— 取消 / 失败 / 被闸门拦下 / 跳过在批次循环里各有
+  // 自己的分支，天然到不了那个收敛点（落地在 `AppState._runExtractBatch`）。
+  // 开关在**批次开始时锁成局部量**（同 `pauseOnError`），否则会出现「前三个包
+  // 删了、第四个开始不删」这种同一批内自相矛盾的行为。
+  // 删除对象是 `ScanItem.parts`（扫描器认定的分卷全集），不是按后缀猜出来的。
+  'autoDeleteSource': false,
 };
 
 /// 改过名的开关：新键 → 它曾经用过的旧键（按新→旧排序，取第一个有值的）。
@@ -180,6 +192,24 @@ int coerceMaxDepth(int? raw) =>
 int coerceMaxLogs(int? raw) =>
     raw == null ? kDefaultMaxLogs : raw.clamp(kMinMaxLogs, kMaxMaxLogs);
 
+/// 向前搜签名的窗口。三个边界都借用 `engine/sniff.dart` 那边的常量，
+/// 不在这里另写一份 —— 「用户能填多少」与「嗅探器真正接受多少」是同一批数。
+///
+/// 这一项的可调范围有个特点：**下界不是「填到这儿会坏」，而是「再小就没意义」**。
+/// 自解压包那条路（`kEmbeddedScanBytes`）不读这一项，所以无论填多少，今天能
+/// 认出的东西明天照样认得出 —— 见 [kDefaultSniffWindowBytes] 的说明。
+const int kDefaultSniffWindow = kDefaultSniffWindowBytes;
+const int kMinSniffWindow = kMinSniffWindowBytes;
+const int kMaxSniffWindow = kMaxSniffWindowBytes;
+
+/// 把磁盘上读回来的窗口夹进 [kMinSniffWindow]–[kMaxSniffWindow]。
+///
+/// 与 [coerceMaxLogs] 一样**不吸附**：窗口是自由输入，磁盘上那个数就是用户
+/// 自己填的，没有一张档位表可以让它「最近」到哪儿去。越界只可能是手改文件、
+/// 或更早的版本留下的残值 —— 夹回边界是唯一说得过去的解释。
+int coerceSniffWindow(int? raw) =>
+    raw == null ? kDefaultSniffWindow : raw.clamp(kMinSniffWindow, kMaxSniffWindow);
+
 /// 炸弹防护默认停在 `kLimitPresets` 里「标准」那档。
 ///
 /// 字面量 `1` 而不是 `kLimitPresets.length - 2`：const 表达式里取不了
@@ -194,10 +224,14 @@ class SettingsData {
     this.limitPreset = kDefaultLimitPreset,
     this.limits = LimitThresholds.standard,
     this.maxLogs = kDefaultMaxLogs,
+    this.sniffWindow = kDefaultSniffWindow,
   });
 
   final Map<String, bool> toggles;
   final int maxDepth;
+
+  /// 向前搜签名的窗口（字节）。对应「智能识别」组那一行，键名 `sniffWindow`。
+  final int sniffWindow;
 
   /// 日志保留条数。**权威在 `AppState._maxLogs`**，这个字段只是把它带过
   /// 磁盘这一趟：`LogRepo` 不再自己封顶（见那边的注释），内存里留多少条

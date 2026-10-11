@@ -421,7 +421,8 @@ Future<void> _processFiles(
   for (final p in work) {
     if (!splitScan.consumed.contains(p)) need.add(p);
   }
-  await _sniffInto(st, need, sniffed, ignoreContainers: ignoreContainers);
+  await _sniffInto(st, need, sniffed,
+      options: options, ignoreContainers: ignoreContainers);
 
   // ---- 4. 家族校验 ----
   // 首卷看不出是压缩包 ⇒ 整组否决，分片退回普通文件。必须在产出阶段之前
@@ -440,7 +441,8 @@ Future<void> _processFiles(
     }
   }
   if (rejected.isNotEmpty) {
-    await _sniffInto(st, rejected, sniffed, ignoreContainers: ignoreContainers);
+    await _sniffInto(st, rejected, sniffed,
+        options: options, ignoreContainers: ignoreContainers);
   }
 
   final familyByEntry = {for (final f in families) f.entryPath: f};
@@ -467,10 +469,14 @@ Future<void> _processFiles(
 }
 
 /// 嗅探一批路径，结果写进 [out]。IO 异常不吞掉整次扫描，记进 unreadable。
+///
+/// [options] 只用来取嗅探窗口那一项（[ScanOptions.sniffWindowBytes]）——
+/// 其余选项在这儿用不上，但它们本来就是一起走的，不必为此单拆一个参数。
 Future<void> _sniffInto(
   _ScanState st,
   List<String> paths,
   Map<String, SniffResult> out, {
+  required ScanOptions options,
   bool ignoreContainers = false,
 }) async {
   if (paths.isEmpty) return;
@@ -487,6 +493,7 @@ Future<void> _sniffInto(
         path,
         declaredExt: _declaredExtFor(path),
         honorContainerSkip: !ignoreContainers,
+        windowBytes: options.sniffWindowBytes,
       );
     } on FileSystemException {
       // 权限不足 / 文件在扫描途中被删除。`PathNotFoundException` 也是

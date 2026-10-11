@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../theme/app_theme.dart';
 import '../providers/app_state.dart';
+import '../engine/format.dart';
 import '../engine/limits.dart';
 import '../app_info.dart';
 import '../data/builtin_extractors.dart';
@@ -9,9 +10,11 @@ import '../models/extractor.dart';
 import 'about_screen.dart';
 import '../widgets/glass_card.dart';
 import '../widgets/custom_button.dart';
+import '../widgets/modals/auto_delete_source_modal.dart';
 import '../widgets/modals/limit_value_modal.dart';
 import '../widgets/modals/log_limit_modal.dart';
 import '../widgets/modals/max_depth_modal.dart';
+import '../widgets/modals/sniff_window_modal.dart';
 
 /// 设置页面
 class SettingsScreen extends StatelessWidget {
@@ -55,6 +58,18 @@ class SettingsScreen extends StatelessWidget {
                 value: state.setting('customOutput'),
                 onToggle: () => state.toggleSetting('customOutput'),
               ),
+              // 这是本软件唯一会**删用户自己的文件**的开关，所以图标用红色
+              // （与「错误时暂停」「清空日志」同一套颜色语义：红 = 会造成后果）。
+              // 开启要过一次确认卡，见 `_toggleAutoDeleteSource`。
+              _settingItem(
+                icon: Icons.delete_sweep_outlined,
+                iconColor: AppTheme.neonRed,
+                title: '解压成功后自动删除源压缩包',
+                desc: '解压成功后删除源文件及其全部分卷，连带解出的内层包；关闭则原样保留。失败、取消或跳过的一律不删',
+                toggle: true,
+                value: state.setting('autoDeleteSource'),
+                onToggle: () => _toggleAutoDeleteSource(context, state),
+              ),
               _settingItem(
                 icon: Icons.layers_outlined,
                 iconColor: AppTheme.neonGreen,
@@ -78,6 +93,23 @@ class SettingsScreen extends StatelessWidget {
                 toggle: true,
                 value: state.setting('fakeExtDetect'),
                 onToggle: () => state.toggleSetting('fakeExtDetect'),
+              ),
+              // 「图片后面追加的压缩包」是靠向前搜签名认出来的，这条搜索要读
+              // 文件开头多少个字节，就是这一项。它**只**喂那条搜索 —— 自解压包
+              // （MZ 壳）走的是另一条写死 1 MB 的路，两边互不影响。所以把这个
+              // 窗口调小**不会**让今天认得的东西明天认不出，设置页要说清这一点，
+              // 否则用户会以为自己是在冒险。
+              _settingItem(
+                icon: Icons.travel_explore_outlined,
+                iconColor: AppTheme.neonCyan,
+                title: '前置数据搜索窗口',
+                desc: '压缩包被隐藏在图片等文件后面时，向前搜索的深度',
+                trailing: _valueChip(
+                  label: formatBytes(state.sniffWindow),
+                  color: AppTheme.neonCyan,
+                  editable: true,
+                  onTap: () => _editSniffWindow(context, state),
+                ),
               ),
               // 这颗开关**不决定「要不要自动试密码库」**（那件事一直做），
               // 它决定的是「试不出来之后问不问」。名字跟着后者走 —— 原先叫
@@ -140,16 +172,19 @@ class SettingsScreen extends StatelessWidget {
               // 这一行不只是「看一眼版本」：开源许可全文只能从这里到达，而那是
               // LGPL / BSD 要求分发时必须能拿到的东西（见 `about_screen.dart`）。
               GestureDetector(
-                onTap: () => Navigator.of(context).push(
-                  MaterialPageRoute(builder: (_) => const AboutScreen()),
-                ),
+                onTap: () => Navigator.of(
+                  context,
+                ).push(MaterialPageRoute(builder: (_) => const AboutScreen())),
                 child: _settingItem(
                   icon: Icons.info_outline,
                   iconColor: AppTheme.neonCyan,
                   title: '关于 $kAppName',
                   desc: '版本 · 隐私说明 · 第三方组件与许可全文',
-                  trailing: const Icon(Icons.chevron_right,
-                      size: 18, color: AppTheme.textDim),
+                  trailing: const Icon(
+                    Icons.chevron_right,
+                    size: 18,
+                    color: AppTheme.textDim,
+                  ),
                 ),
               ),
             ]),
@@ -426,6 +461,25 @@ class SettingsScreen extends StatelessWidget {
     if (value != null) state.setLimit(field, value);
   }
 
+  /// 拨「解压成功后自动删除源压缩包」这颗开关。
+  ///
+  /// **只在「开」的方向弹确认卡**：打开之后每次解压成功都会真的删掉用户的源
+  /// 压缩包（不可逆），值得挡一道；关掉不造成任何后果，弹窗只会碍事。
+  ///
+  /// `context` **只在 await 之前**用，await 回来只碰 `state` —— 否则会踩
+  /// `use_build_context_synchronously`（弹窗期间用户可能已经离开这一页）。
+  Future<void> _toggleAutoDeleteSource(
+    BuildContext context,
+    AppState state,
+  ) async {
+    if (state.setting('autoDeleteSource')) {
+      state.toggleSetting('autoDeleteSource'); // 关：不弹
+      return;
+    }
+    final ok = await AutoDeleteSourceModal.show(context: context);
+    if (ok) state.toggleSetting('autoDeleteSource');
+  }
+
   /// 打开递归深度的输入框。自由填写，界外的值弹窗自己拦（不给提交）。
   ///
   /// 与 [_editMaxLogs] 连界外提示都是同一套做法 —— 拦在弹窗里、**不夹值**：
@@ -438,6 +492,17 @@ class SettingsScreen extends StatelessWidget {
     if (value != null) state.setMaxDepth(value);
   }
 
+  /// 打开「前置数据搜索窗口」的输入框。自由填写，界外的值弹窗自己拦（不给提交）。
+  ///
+  /// 与 [_editMaxDepth] 同构，只是单位是字节 —— 用户填 `1 MB` 而不是 `1048576`。
+  Future<void> _editSniffWindow(BuildContext context, AppState state) async {
+    final value = await SniffWindowModal.show(
+      context: context,
+      current: state.sniffWindow,
+    );
+    if (value != null) state.setSniffWindow(value);
+  }
+
   /// 打开日志条数的输入框。自由填写，界外的值弹窗自己拦（不给提交）。
   Future<void> _editMaxLogs(BuildContext context) async {
     final value = await LogLimitModal.show(
@@ -447,7 +512,8 @@ class SettingsScreen extends StatelessWidget {
     if (value != null) state.setMaxLogs(value);
   }
 
-  Widget _buildExtractorSection(BuildContext context) => const _SupportedFormats();
+  Widget _buildExtractorSection(BuildContext context) =>
+      const _SupportedFormats();
 }
 
 /// 「支持的格式」：只读清单，默认折叠。
@@ -498,8 +564,11 @@ class _SupportedFormatsState extends State<_SupportedFormats> {
             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
             child: Row(
               children: [
-                const Icon(Icons.inventory_2_outlined,
-                    size: 16, color: AppTheme.neonCyan),
+                const Icon(
+                  Icons.inventory_2_outlined,
+                  size: 16,
+                  color: AppTheme.neonCyan,
+                ),
                 const SizedBox(width: 10),
                 Expanded(
                   child: Column(
@@ -542,10 +611,7 @@ class _SupportedFormatsState extends State<_SupportedFormats> {
         if (_expanded) ...[
           const SizedBox(height: 8),
           for (final e in all)
-            Padding(
-              padding: const EdgeInsets.only(bottom: 8),
-              child: _item(e),
-            ),
+            Padding(padding: const EdgeInsets.only(bottom: 8), child: _item(e)),
         ],
       ],
     );

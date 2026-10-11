@@ -346,6 +346,44 @@ void main() {
 
       expect(log.tags, ['分片 ×2', '密码库', '1 项']);
     });
+
+    test('删了源包 → 追加「已删源」；没删净 → 「源未删净」顶掉它', () {
+      ExtractOutcome out() => const ExtractOutcome(
+            outDir: '/sdcard/a',
+            entryCount: 1,
+            unpackedBytes: 1,
+            elapsed: Duration.zero,
+          );
+
+      // 默认：两个都 false，一个标签都不加（既有调用点零改动的那条保证）。
+      expect(
+        buildExtractLog(item: item(), outcome: out(), now: now).tags,
+        ['1 项'],
+      );
+
+      expect(
+        buildExtractLog(
+          item: item(),
+          outcome: out(),
+          sourceDeleted: true,
+          now: now,
+        ).tags,
+        ['1 项', '已删源'],
+      );
+
+      // 「说好删了却没删」比不删更糟，两者同时成立时报那一句 —— 让用户知道
+      // 还剩文件要自己动手，而不是看到「已删源」以为干净了。
+      expect(
+        buildExtractLog(
+          item: item(),
+          outcome: out(),
+          sourceDeleted: true,
+          sourceDeleteFailed: true,
+          now: now,
+        ).tags,
+        ['1 项', '源未删净'],
+      );
+    });
   });
 
   group('buildExtractLog —— 失败', () {

@@ -298,7 +298,7 @@ void main() {
       await state.selectFilePath(p.join(root.path, '没有这个.zip'));
 
       expect(state.archives, isEmpty);
-      expect(state.logs.single.status, LogStatus.failed);
+      expect(state.logs.first.status, LogStatus.failed);
       expect(state.toastType, 'warn');
     });
   });
@@ -1040,6 +1040,36 @@ void main() {
       expect(state.maxDepth, kMaxMaxDepth, reason: '上界就是实现层那道硬顶');
     });
 
+    t('setSniffWindow 同样是自由输入：区间内原样，界外才夹', () {
+      final state = booted();
+
+      state.setSniffWindow(2 << 20);
+      expect(state.sniffWindow, 2 << 20);
+
+      state.setSniffWindow(kMinSniffWindow - 1);
+      expect(state.sniffWindow, kMinSniffWindow,
+          reason: '下界不是「填到这儿会坏」—— 自解压包那条路不读这一项');
+
+      state.setSniffWindow(kMaxSniffWindow + 1);
+      expect(state.sniffWindow, kMaxSniffWindow,
+          reason: '上界对齐 7-Zip 客户端自己的向前搜索上限');
+    });
+
+    t('扫描时把当前的搜索窗口交给引擎', () async {
+      final root = tempRoot('as_window');
+      put(root, 'a.zip', realZip({'x': 'y'}));
+
+      final engine = FakeEngine();
+      final state = AppState(engine: engine);
+      addTearDown(state.dispose);
+
+      state.setSniffWindow(3 << 20);
+      await state.selectFolderPath(root.path);
+
+      expect(engine.scanOptionsSeen.single.sniffWindowBytes, 3 << 20,
+          reason: '设置页那一行必须真的随扫描命令流到 sniffFile 手上');
+    });
+
     t('toggleSetting 翻转指定 key，未登记的 key 读作 false', () {
       final state = booted();
       final before = state.setting('errorPause');
@@ -1670,6 +1700,183 @@ void main() {
       await state.selectFolderPath(root.path);
 
       expect(engine.skipDirsSeen.single, isEmpty);
+    });
+  });
+
+  group('解压成功后自动删除源压缩包', () {
+    /// 开着那颗开关的 `AppState`。`FakeEngine` 不产出任何输出文件，所以磁盘上
+    /// 只有源包 —— 删没删一眼可辨。
+    AppState armed(FakeEngine engine) {
+      final state = AppState(engine: engine);
+      addTearDown(state.dispose);
+      state.toggleSetting('autoDeleteSource');
+      return state;
+    }
+
+    t('默认关着 → 解完源包原样留着', () async {
+      final root = tempRoot('as_delsrc_off');
+      final src = put(root, 'a.zip', realZip({'x': 'y'}));
+
+      final engine = FakeEngine();
+      final state = AppState(engine: engine);
+      addTearDown(state.dispose);
+
+      await state.selectFolderPath(root.path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(File(src).existsSync(), isTrue, reason: '出厂不删，用户没开就不该动他的文件');
+      expect(state.completeDetail, isNot(contains('已删源包')));
+      expect(state.logs.first.tags, isNot(contains('已删源')));
+    });
+
+    t('开着 + 成功 → 源包没了，日志挂「已删源」、总结报「已删源包」', () async {
+      final root = tempRoot('as_delsrc_on');
+      final src = put(root, 'a.zip', realZip({'x': 'y'}));
+
+      final engine = FakeEngine();
+      final state = armed(engine);
+
+      await state.selectFolderPath(root.path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(File(src).existsSync(), isFalse, reason: '解压成功就该把源包删掉');
+      expect(state.logs.first.status, LogStatus.success);
+      expect(state.logs.first.tags, contains('已删源'));
+      expect(state.completeDetail, contains('已删源包 1 个'));
+      expect(state.toastType, 'ok', reason: '全删净了，不该是黄条');
+    });
+
+    t('失败 → 源包必须还在（不能把丢数据的失败当省空间）', () async {
+      final root = tempRoot('as_delsrc_fail');
+      final src = put(root, 'a.zip', realZip({'x': 'y'}));
+
+      final engine = FakeEngine()
+        ..behavior = (e, outDir) async {
+          throw EngineException('包坏了');
+        };
+      final state = armed(engine);
+
+      await state.selectFolderPath(root.path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(File(src).existsSync(), isTrue,
+          reason: '失败等于什么都没解出来，删源包就是纯丢数据');
+      expect(state.logs.first.status, LogStatus.failed);
+      expect(state.logs.first.tags, isNot(contains('已删源')));
+      expect(state.completeDetail, isNot(contains('已删源包')));
+    });
+
+    t('中途停止 → 源包必须还在', () async {
+      final root = tempRoot('as_delsrc_stop');
+      final src = put(root, 'a.zip', realZip({'x': 'y'}));
+      put(root, 'b.zip', realZip({'x': 'y'}));
+
+      final gate = Completer<void>();
+      final engine = FakeEngine()
+        ..behavior = (e, outDir) async {
+          if (e.rounds == 1) await gate.future;
+        };
+      final state = armed(engine);
+
+      await state.selectFolderPath(root.path);
+      state.startExtract();
+      await settle();
+
+      state.stopExtract();
+      gate.complete();
+      await drainExtract(state);
+
+      expect(File(src).existsSync(), isTrue,
+          reason: '被中止的包只在磁盘上留了半棵树，源包不能跟着删');
+      expect(state.outcome, BatchOutcome.stopped);
+      expect(state.completeDetail, isNot(contains('已删源包')));
+    });
+
+    t('分卷包 → 所有分卷一起删掉', () async {
+      final root = tempRoot('as_delsrc_split');
+      final zip = realZip({'hello.txt': 'world'});
+      final half = zip.length ~/ 2;
+      final v1 = put(root, '备份.rar.001', zip.sublist(0, half));
+      final v2 = put(root, '备份.rar.002', zip.sublist(half));
+
+      final engine = FakeEngine();
+      final state = armed(engine);
+
+      await state.selectFolderPath(root.path);
+      expect(state.lastScan!.items.single.split!.parts, hasLength(2),
+          reason: '前提：它得先被扫成一个两片的包，否则这条测的不是分卷');
+
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(File(v1).existsSync(), isFalse);
+      expect(File(v2).existsSync(), isFalse, reason: '缺一片这个包就废了，必须一起删');
+      expect(state.completeDetail, contains('已删源包 1 个'),
+          reason: '一个逻辑包只删一次，报的是包数不是卷数');
+    });
+
+    t('嵌套解出来的内层包也删', () async {
+      final root = tempRoot('as_delsrc_nested');
+      final payload = tempRoot('as_delsrc_nested_payload');
+      final outer = put(root, 'nested.zip', realZip({'readme.txt': 'x'}));
+      final innerPath = put(payload, 'inner.zip', realZip({'deep.txt': 'y'}));
+
+      final engine = FakeEngine()
+        ..nestedFor[resolveOutputDir(outer)] = [
+          ScanItem(
+            entryPath: innerPath,
+            parts: [innerPath],
+            sniff: const SniffResult(
+              format: SniffFormat.zip,
+              confidence: SniffConfidence.high,
+              declaredExt: 'zip',
+            ),
+            sizeBytes: 100,
+            flags: const {},
+            depth: 1,
+          ),
+        ];
+      final state = armed(engine);
+
+      await state.selectFolderPath(root.path);
+      state.startExtract();
+      await drainExtract(state);
+
+      expect(engine.rounds, 2, reason: '前提：内层包真的被解了一次');
+      expect(File(outer).existsSync(), isFalse, reason: '外层包解成功 → 删');
+      expect(File(innerPath).existsSync(), isFalse, reason: '内层包解成功 → 也删');
+      expect(state.completeDetail, contains('已删源包 2 个'));
+    });
+
+    t('开关在批次开始时锁定：途中改它不影响这一批剩下的包', () async {
+      final root = tempRoot('as_delsrc_lock');
+      final a = put(root, 'a.zip', realZip({'x': 'y'}));
+      final b = put(root, 'b.zip', realZip({'x': 'y'}));
+
+      final gate = Completer<void>();
+      final engine = FakeEngine()
+        ..behavior = (e, outDir) async {
+          if (e.rounds == 1) await gate.future;
+        };
+      final state = armed(engine);
+
+      await state.selectFolderPath(root.path);
+      state.startExtract();
+      await settle();
+
+      // 第一个包还卡在半路，用户去把它关掉。
+      expect(state.setting('autoDeleteSource'), isTrue);
+      state.toggleSetting('autoDeleteSource');
+
+      gate.complete();
+      await drainExtract(state);
+
+      expect(File(a).existsSync(), isFalse, reason: '锁定的值是「开」');
+      expect(File(b).existsSync(), isFalse,
+          reason: '同一批里行为必须一致 —— 前半删后半不删是没法解释的');
     });
   });
 
@@ -3407,8 +3614,8 @@ void main() {
       expect(state.limits.maxEntries, 4242);
       expect(state.passwords.single.value, '从磁盘读回来的');
       expect(state.passwords.single.hitCount, 5);
-      expect(state.logs.single.name, '上次那个包.zip');
-      expect(state.logs.single.status, LogStatus.failed);
+      expect(state.logs.first.name, '上次那个包.zip');
+      expect(state.logs.first.status, LogStatus.failed);
     });
 
     t('档位不越界、深度夹回区间、日志封顶夹回 —— 读回来的坏值不能让设置页崩', () {
@@ -3536,6 +3743,10 @@ void main() {
       expect(store.lastSettings!.limits.maxEntries, 777);
       expect(store.lastSettings!.limitPreset, kLimitPresets.length,
           reason: '手改一项就落到「自定义」，这一条也要跟着存');
+
+      state.setSniffWindow(6 << 20);
+      expect(store.lastSettings!.sniffWindow, 6 << 20,
+          reason: '搜索窗口也是数值型设置，与深度、条数走同一条落盘路');
     });
 
     t('增删密码 → 交出整库快照', () {

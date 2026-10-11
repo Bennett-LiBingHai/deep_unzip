@@ -17,6 +17,99 @@ Uint8List head(List<int> magic, {int total = 512, int at = 0}) {
   return b;
 }
 
+// ---------------------------------------------------------------------------
+// 「图片后面追加压缩包」的夹具
+// ---------------------------------------------------------------------------
+//
+// 7z / RAR5 / RAR4 的签名都在偏移 0，所以这些夹具**故意**把签名垫在一段
+// 「像图片的前置数据」后面，逼着 `sniffFile` 走那条「向前搜签名 + 块头 CRC
+// 校验」的新路。
+//
+// CRC 用本文件自己的一份表算，**不复用被测代码里的那份** —— 复用的话，我要是
+// 把规则记错了，夹具就照着错的规则造，两边一起绿、真样本照样认不出。这里独立
+// 算一遍，才让「夹具」与「实现」互相印证。
+
+Uint32List? _fixtureCrcTable;
+
+Uint32List get _fixtureCrc => _fixtureCrcTable ??= () {
+      final t = Uint32List(256);
+      for (var i = 0; i < 256; i++) {
+        var c = i;
+        for (var k = 0; k < 8; k++) {
+          c = (c & 1) != 0 ? 0xEDB88320 ^ (c >> 1) : c >> 1;
+        }
+        t[i] = c;
+      }
+      return t;
+    }();
+
+/// 标准 CRC32（多项式 0xEDB88320），覆盖 `[start, end)`。
+int fixtureCrc32(List<int> b, int start, int end) {
+  final t = _fixtureCrc;
+  var crc = 0xFFFFFFFF;
+  for (var i = start; i < end; i++) {
+    crc = t[(crc ^ b[i]) & 0xFF] ^ (crc >> 8);
+  }
+  return (crc ^ 0xFFFFFFFF) & 0xFFFFFFFF;
+}
+
+/// 一段「像图片」的前置数据：PNG 签名 + 填充。
+///
+/// 填充刻意**避开 0**，也避开任何签名的首字节序列 —— 全 0 的字节在 `_scanWindow`
+/// 与深探测里都可能撞上别的判据，那种夹具测出来的不是我们想测的东西。
+List<int> imagePrefix(int length) {
+  final b = List<int>.filled(length, 0);
+  if (length >= 8) {
+    b.setRange(0, 8, [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+  }
+  for (var i = 8; i < length; i++) {
+    b[i] = (i * 37 + 11) & 0xFF;
+  }
+  return b;
+}
+
+/// 7z 签名头 32 字节：`sig6 + ver2 + StartHeaderCRC4 + StartHeader20`，
+/// CRC 按 `7zIn.cpp` 的 `TestStartCrc` 算（覆盖 12..31 那 20 字节）。
+List<int> sevenZBlock() {
+  final b = List<int>.filled(32, 0);
+  b.setRange(0, 6, [0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C]);
+  b[7] = 4; // version minor；major 是 0
+  // StartHeader 的内容本身随便填 —— 校验只看 CRC。
+  for (var i = 12; i < 32; i++) {
+    b[i] = 0x40 + i;
+  }
+  b.setRange(8, 12, le32(fixtureCrc32(b, 12, 32)));
+  return b;
+}
+
+/// RAR5：marker 8 字节 + 块头 —— 4 字节 CRC32，再是块长的 vint，再是块体。
+///
+/// 块长取最小合法值 2（`Rar5Handler.cpp` 的 `size < 2` 会拒），块体写成
+/// 「归档主头」：type=1、flags=0。
+List<int> rar5Block() {
+  const marker = [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00];
+  final head = [0x02, 0x01, 0x00]; // 单字节 vint(2) + 2 字节块体
+  return [...marker, ...le32(fixtureCrc32(head, 0, head.length)), ...head];
+}
+
+/// RAR4：marker 7 字节 + 13 字节主头（`kArchiveHeaderSize`）。
+///
+/// 头里前 2 字节存的是 CRC32 的低 16 位，覆盖 `[2, 13)`；`h[2]` 是块类型，
+/// 合法值 0x73（`NBlockType::kArchiveHeader`）。[type] 用来造反例。
+List<int> rar4Block({int type = 0x73}) {
+  const marker = [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00];
+  final h = List<int>.filled(13, 0);
+  h[2] = type;
+  h[5] = 13; // blockSize 低字节；高字节留 0
+  for (var i = 7; i < 13; i++) {
+    h[i] = i;
+  }
+  final crc = fixtureCrc32(h, 2, 13) & 0xFFFF;
+  h[0] = crc & 0xFF;
+  h[1] = (crc >> 8) & 0xFF;
+  return [...marker, ...h];
+}
+
 void main() {
   group('extensionOf', () {
     test('取最后一段后缀并小写化', () {
@@ -738,6 +831,105 @@ void main() {
       final r = await sniffFile(path, declaredExt: 'jpg');
       expect(r.declaredExt, 'jpg');
       expect(r.isExtensionSpoofed, isTrue);
+    });
+
+    // ---- 第 4 级：向前搜「图片等文件后面追加的压缩包」 --------------------
+
+    test('PNG 后面追加 RAR5 → 认出 rar5、high、baseOffset 指向追加点', () async {
+      const prefix = 9000;
+      final path = writeTempFile(
+        dir,
+        '提弗炸卸_差分.png',
+        [...imagePrefix(prefix), ...rar5Block()],
+      );
+
+      final r = await sniffFile(path);
+      expect(r.format, SniffFormat.rar5);
+      expect(r.confidence, SniffConfidence.high,
+          reason: '块头 CRC 验过的，比 MZ 那条裸搜的 medium 强');
+      expect(r.baseOffset, prefix);
+      expect(r.isArchive, isTrue);
+      expect(r.declaredExt, 'png');
+      expect(r.isExtensionSpoofed, isTrue, reason: '这顺带点亮伪后缀弹窗');
+    });
+
+    test('PNG 后面追加 7z → 认出 sevenZ', () async {
+      const prefix = 7000;
+      final path = writeTempFile(
+        dir,
+        'photo.jpg',
+        [...imagePrefix(prefix), ...sevenZBlock()],
+      );
+
+      final r = await sniffFile(path);
+      expect(r.format, SniffFormat.sevenZ);
+      expect(r.confidence, SniffConfidence.high);
+      expect(r.baseOffset, prefix);
+      expect(r.isArchive, isTrue);
+      expect(r.isExtensionSpoofed, isTrue);
+    });
+
+    test('追加点在窗口之外 → 认不出；把窗口调大 → 认得出', () async {
+      const window = 1024;
+      const prefix = window + 512; // 追加点落在窗口外
+      final path = writeTempFile(
+        dir,
+        'over_window.png',
+        [...imagePrefix(prefix), ...rar5Block()],
+      );
+
+      final miss = await sniffFile(path, windowBytes: window);
+      expect(miss.format, SniffFormat.unknown,
+          reason: '窗口只读到 $window 字节，追加点在 $prefix');
+
+      final hit = await sniffFile(path, windowBytes: prefix + 64);
+      expect(hit.format, SniffFormat.rar5);
+      expect(hit.baseOffset, prefix);
+    });
+
+    test('伪造的签名（块头 CRC 对不上）不误判', () async {
+      // 裸搜一个 1 MB 窗口必然撞上这两串字节；能挡住它们的只有块头校验。
+      final fake7z = [0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C, ...List.filled(64, 0xEE)];
+      final fakeRar5 = [
+        0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00, ...List.filled(64, 0xEE),
+      ];
+      final path = writeTempFile(
+        dir,
+        'noise.png',
+        [...imagePrefix(8000), ...fake7z, ...fakeRar5],
+      );
+
+      final r = await sniffFile(path);
+      expect(r.format, SniffFormat.unknown,
+          reason: '签名只是候选，块头 CRC 才是判据');
+      expect(r.isArchive, isFalse);
+    });
+
+    test('RAR4 主头（我们自算的 CRC16）→ 认出 rar4', () async {
+      const prefix = 6000;
+      final path = writeTempFile(
+        dir,
+        'x.png',
+        [...imagePrefix(prefix), ...rar4Block()],
+      );
+
+      final r = await sniffFile(path);
+      expect(r.format, SniffFormat.rar4);
+      expect(r.confidence, SniffConfidence.high);
+      expect(r.baseOffset, prefix);
+      // 如实说明：本机造不出真 RAR4 样本（RAR 7 没有 -ma4），这条是
+      // 「我们的编码器 ↔ 我们的校验器」自洽，不是对厂商样本的验证。
+    });
+
+    test('RAR4 块类型不是 0x73 → 认不出（CRC 本身是对的）', () async {
+      final path = writeTempFile(
+        dir,
+        'x2.png',
+        [...imagePrefix(6000), ...rar4Block(type: 0x74)],
+      );
+      final r = await sniffFile(path);
+      expect(r.format, SniffFormat.unknown,
+          reason: '类型字节先于 CRC 被检查，这条把那个检查单独钉住');
     });
   });
 

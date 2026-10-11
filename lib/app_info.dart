@@ -17,7 +17,7 @@ library;
 const String kAppName = 'DeepUnzip';
 
 /// 与 `pubspec.yaml` 的 `version:` 前半段一致（不含 `+构建号`）。
-const String kAppVersion = '1.0.0';
+const String kAppVersion = '1.0.2';
 
 /// 一句话说明这个 app 是干什么的。
 const String kAppTagline = '纯本地解压工具 · 不联网、不收集个人信息';

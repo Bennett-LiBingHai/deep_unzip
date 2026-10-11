@@ -80,6 +80,13 @@ class FakeEngine extends EngineController {
   /// 命令传下去了」这条线，也就是防自噬那一半。
   final List<Set<String>> skipDirsSeen = [];
 
+  /// 依次收到的扫描选项。
+  ///
+  /// 钉的是「设置页改的『前置数据搜索窗口』真的随命令流到了引擎」这条线 ——
+  /// 真实的 `sniffFile` 跑在 worker isolate 里，这里只记一笔再交给
+  /// `super.scan`（扫描本体照跑真的，见文件头）。
+  final List<ScanOptions> scanOptionsSeen = [];
+
   /// [cancel] 被调了几次。
   ///
   /// 底座的 `cancel()` 会 `await _ready.future` 再往那条 worker isolate 发
@@ -100,6 +107,7 @@ class FakeEngine extends EngineController {
     int depth = 0,
   }) {
     skipDirsSeen.add(skipDirs);
+    scanOptionsSeen.add(options);
     return super.scan(
       rootPath: rootPath,
       options: options,

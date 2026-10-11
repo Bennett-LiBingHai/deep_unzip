@@ -13,6 +13,7 @@
 /// | `toggle.<名>` | bool | 每颗开关一个键，逐个独立存（表在 `persist.dart`） |
 /// | `maxDepth` | int | 递归深度，自由输入 `0`–64（`0` = 不递归）；每进一层子目录或解一层嵌套包各算一层 |
 /// | `maxLogs` | int | 日志保留条数，`{100,300,500,1000}` |
+/// | `sniffWindow` | int | 向前搜签名的窗口（字节），默认 1 MB |
 /// | `limitPreset` | int | 炸弹档位下标，或「自定义」 |
 /// | `limit.<字段>` | int | 自定义时那四个阈值 |
 ///
@@ -33,6 +34,7 @@ class SettingsRepo {
   static const String _limitPrefix = 'limit.';
   static const String _keyMaxDepth = 'maxDepth';
   static const String _keyMaxLogs = 'maxLogs';
+  static const String _keySniffWindow = 'sniffWindow';
   static const String _keyLimitPreset = 'limitPreset';
 
   Future<SettingsData> load() async {
@@ -53,6 +55,7 @@ class SettingsRepo {
 
     final maxDepth = coerceMaxDepth(prefs.getInt(_keyMaxDepth));
     final maxLogs = coerceMaxLogs(prefs.getInt(_keyMaxLogs));
+    final sniffWindow = coerceSniffWindow(prefs.getInt(_keySniffWindow));
     final preset = _coercePreset(prefs.getInt(_keyLimitPreset));
 
     // 预设档位时**以预设为准**，不信磁盘上那四个数：它们可能来自一个更早的
@@ -74,6 +77,7 @@ class SettingsRepo {
       toggles: toggles,
       maxDepth: maxDepth,
       maxLogs: maxLogs,
+      sniffWindow: sniffWindow,
       limitPreset: preset,
       limits: limits,
     );
@@ -86,6 +90,7 @@ class SettingsRepo {
     }
     await prefs.setInt(_keyMaxDepth, data.maxDepth);
     await prefs.setInt(_keyMaxLogs, data.maxLogs);
+    await prefs.setInt(_keySniffWindow, data.sniffWindow);
     await prefs.setInt(_keyLimitPreset, data.limitPreset);
     for (final field in LimitField.values) {
       await prefs.setInt('$_limitPrefix${field.name}', field.read(data.limits));
